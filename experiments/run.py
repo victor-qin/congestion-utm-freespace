@@ -401,6 +401,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "22.7 GB at 8, sampled across the process tree at only 50 flights. Size "
                         "this against the RAM you have, not the cores; an OOM-killed worker hangs "
                         "the sweep rather than failing it")
+    p.add_argument("--colgen-work-stealing", action="store_true", default=None,
+                   help="colgen: with --colgen-workers, an idle pricing worker takes the last "
+                        "unsent flight of the busiest worker and keeps it for later sweeps. "
+                        "Answer-neutral; balances the slowest worker at high worker counts")
     p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="colgen: seed each flight's column with STEPS retimed copies of itself "
                         "before the first LP (default 20; 0 disables). Pure clock translation, so "
@@ -489,6 +493,7 @@ def _colgen_overrides(args) -> dict:
             ("gap_metric", args.colgen_gap_metric),
             ("max_air_overrun_hops", args.colgen_max_air_overrun),
             ("n_pricing_workers", args.colgen_workers),
+            ("pricing_work_stealing", args.colgen_work_stealing),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),

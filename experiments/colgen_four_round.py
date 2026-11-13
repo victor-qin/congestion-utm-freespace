@@ -7,10 +7,12 @@ the final IP. Each round's callback record (``iteration_wall_s``, ``stage_s``) a
 sweep's outer pricing time are saved, which is what the per-round "how much can faster
 pricing shorten a round" breakdown reads. ``--rows-only`` sets ``iteration_ip_search=False``
 so the per-round IP step adds its eager rows without searching. Round sums exclude startup;
-``--profile`` adds timer wrappers inside the pricing workers.
+``--profile`` adds timer wrappers inside the pricing workers. ``--full`` instead runs the same
+cohort to convergence under the capture's own limits, final IP included.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
-        --profile [--rows-only] [--workers N] [--gurobi-threads N] [--lock FILE]
+        --profile [--rows-only] [--work-stealing] [--full] [--workers N] [--gurobi-threads N]
+        [--lock FILE]
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from collections import defaultdict
 from dataclasses import fields, replace
 import fcntl
 import functools
+import gc
 import hashlib
 import inspect
 import json
@@ -103,8 +106,11 @@ def instrument(*, timing: bool = True) -> None:
     def one(*args: Any, **kwargs: Any) -> Any:
         """Attach nonfunctional stage measurements to an existing result record."""
         before = {key: value.copy() for key, value in TIMERS.items()}
+        started = time.monotonic()
         result = original_one(*args, **kwargs)
         record = result[6]
+        # System-wide clock, comparable across workers: idle gaps show dispatch waits.
+        record['experiment_interval'] = (started, time.monotonic())
         record['experiment_profile'] = {
             key: [value[0] - before.get(key, [0, 0])[0],
                   value[1] - before.get(key, [0, 0])[1]]
@@ -116,16 +122,36 @@ def instrument(*, timing: bool = True) -> None:
         graph = pricing_pool._WORKER['graphs'][int(args[1])]
         cache = getattr(graph._search_cache, 'cpu_completion', None)
         if cache is not None:
-            values = getattr(cache, 'delay_values', getattr(cache, 'air_values', {}))
-            record['experiment_cache'] = dict(
-                keys=len(values), scalars=sum(map(len, values.values())),
-                hits=getattr(cache, 'hits', None), misses=getattr(cache, 'misses', None),
-                scalar_hits=getattr(cache, 'scalar_hits', None),
-                scalar_misses=getattr(cache, 'scalar_misses', None),
-            )
+            # Size of the retained unweighted air seconds: lanes cached, values held.
+            values = cache.air_values
+            record['experiment_cache'] = dict(keys=len(values),
+                                              scalars=sum(map(len, values.values())))
         return result
 
     pricing_pool._price_one = one
+
+
+def record_gc_pauses(events: list[dict[str, Any]], floor_s: float = 0.05) -> None:
+    """Append every parent garbage collection lasting ``floor_s`` or more to ``events``.
+
+    A worker waiting on the parent for its next flight idles through such a pause, so
+    ``t_end`` (``time.monotonic``, comparable with the workers' flight intervals on one
+    host) locates it against the per-flight timeline.
+    """
+    started: list[float] = []
+
+    def callback(phase: str, info: dict[str, Any]) -> None:
+        """Time one collection from its start to its stop callback."""
+        if phase == 'start':
+            started[:] = [time.monotonic()]
+        elif started:
+            end = time.monotonic()
+            if end - started[0] >= floor_s:
+                events.append(dict(t_end=end, s=end - started[0],
+                                   generation=info['generation'], collected=info['collected']))
+            started.clear()
+
+    gc.callbacks.append(callback)
 
 
 def worker_main(*args: Any, **kwargs: Any) -> None:
@@ -164,6 +190,10 @@ def main() -> None:
                         help='Gurobi Threads for the master LP and IPs.')
     parser.add_argument('--rows-only', action='store_true',
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
+    parser.add_argument('--work-stealing', action='store_true',
+                        help='Idle pricing workers take unsent flights (pricing_work_stealing).')
+    parser.add_argument('--full', action='store_true',
+                        help="Solve to convergence and the final IP under the capture's limits.")
     args = parser.parse_args()
     args.source = args.source.resolve()
     args.out = args.out.resolve()
@@ -192,8 +222,10 @@ def main() -> None:
     params = ColGenParams(**{f.name: getattr(payload['params'], f.name)
                             for f in fields(ColGenParams) if hasattr(payload['params'], f.name)})
     params = replace(params, solver='gurobi', pricing_device='cpu', pricing_gpu_backend=None,
-                     n_pricing_workers=args.workers, max_iterations=4,
-                     iteration_ip_search=not args.rows_only)
+                     n_pricing_workers=args.workers,
+                     max_iterations=params.max_iterations if args.full else 4,
+                     iteration_ip_search=not args.rows_only,
+                     pricing_work_stealing=args.work_stealing)
     # The per-round step, and so --rows-only, only runs with a positive per-round IP limit.
     assert params.iteration_ip_time_limit_s > 0, params.iteration_ip_time_limit_s
     rounds: list[dict[str, Any]] = []
@@ -243,7 +275,7 @@ def main() -> None:
                                   elapsed_s=value.get('elapsed_s'))), flush=True)
             if callback is not None:
                 callback(value)
-            if args.mode == 'solve' and len(rounds) == 4:
+            if args.mode == 'solve' and not args.full and len(rounds) == 4:
                 raise PricingPrefixComplete
 
         kwargs['on_iteration'] = record
@@ -262,6 +294,9 @@ def main() -> None:
         warmup_s = time.perf_counter() - start
         if args.profile:
             instrument()
+        gc_pauses: list[dict[str, Any]] = []
+        if args.profile or args.resources:
+            record_gc_pauses(gc_pauses)
         if args.profile or args.resources:
             pricing_pool._worker_main = worker_main
         solver.price_sweep, solver.ColGenSolver.solve = observe_sweep, observe_solve
@@ -306,7 +341,8 @@ def main() -> None:
                    profile=args.profile, resources=args.resources,
                    mode=args.mode, params=encode(params),
                    requests_sha256=digest(requests), warmup_s=warmup_s, elapsed_s=elapsed,
-                   rounds=rounds, parent_timers=dict(TIMERS), **outcome)
+                   rounds=rounds, parent_timers=dict(TIMERS), parent_gc_pauses=gc_pauses,
+                   **outcome)
     (args.out/'summary.json').write_text(json.dumps(summary, indent=2, default=str)+'\n')
     (args.out/'rounds.pkl').write_bytes(pickle.dumps(dict(requests=requests, cfg=cfg, params=params,
             static_terminals=payload['static_terminals'], initial=initial, snapshots=snapshots),
@@ -315,8 +351,8 @@ def main() -> None:
 
 
 if __name__ == '__main__':
-    # Hashed-key iteration order must match the archived runs. Launchers such as the
-    # SuperCloud runner reserve PYTHON* variables, so pin the seed by re-executing once.
+    # Hashed-key iteration order must match the archived runs. Re-executing once pins the seed
+    # however the module is launched, without relying on the caller to set PYTHONHASHSEED.
     if os.environ.get('PYTHONHASHSEED') != '0':
         # orig_argv keeps the exact invocation (interpreter flags, -m or a file path).
         os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]],

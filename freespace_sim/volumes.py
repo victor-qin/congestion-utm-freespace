@@ -434,6 +434,42 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
     return pts
 
 
+def lattice_subdivision(
+    p0: Vec | tuple[float, float, float],
+    p1: Vec | tuple[float, float, float],
+    segment_len_m: float,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Split one corner-to-corner edge into the builder's sub-segments.
+
+    The same scalar arithmetic as :func:`build_reservation_from_corners`' loop (which keeps
+    its own inline copy: it is A*'s hot path), so the points are bit-identical to the ones it
+    stamps into its centreline and boxes.  Callers that need the geometry of one lattice
+    hop without building a reservation (colgen's per-hop wall verdicts and its canonical
+    centreline) use this instead of restating it.  A nominal lattice edge can be a few ulps
+    longer than ``segment_len_m`` and so split into two sub-segments.
+
+    Parameters
+    ------------
+    - p0 (Vec): edge start (x, y, z), read as floats.
+    - p1 (Vec): edge end (x, y, z), read as floats.
+    - segment_len_m (float): the maximum sub-segment length (``cfg.corridor_segment_len_m``).
+
+    Return
+    --------
+    - output (list[tuple[tuple[float, float, float], tuple[float, float, float]]]): the
+      ``(start, end)`` points of each sub-segment, in order.
+    """
+    ax, ay, az = float(p0[0]), float(p0[1]), float(p0[2])
+    dx, dy, dz = float(p1[0]) - ax, float(p1[1]) - ay, float(p1[2]) - az
+    nsub = max(1, math.ceil(math.sqrt(dx * dx + dy * dy + dz * dz) / segment_len_m))
+    pieces = []
+    for k in range(1, nsub + 1):
+        f0, f1 = (k - 1) / nsub, k / nsub
+        pieces.append(((ax + f0 * dx, ay + f0 * dy, az + f0 * dz),
+                       (ax + f1 * dx, ay + f1 * dy, az + f1 * dz)))
+    return pieces
+
+
 def build_reservation_from_corners(
     corners: list[Vec], origin: Vec, dest: Vec, t_depart: float, g_delay: float, cfg: SimConfig,
     *, origin_term=None, dest_term=None, corridor_t0: float | None = None,

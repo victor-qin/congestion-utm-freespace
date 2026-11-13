@@ -236,6 +236,11 @@ class ColGenParams:
     # improvement (none until the final IP) for the search time.
     # `iteration_ip_time_limit_s > 0` then only switches the step on.
     iteration_ip_search: bool = True
+    # CPU worker pool only: a worker that runs out of its own flights takes the last
+    # unsent flight of the busiest worker, which then belongs to it for the rest of the
+    # solve (see `pricing_pool._Dispatch`). Answer-neutral -- results never depend on
+    # which worker prices a flight -- but ownership then depends on timing.
+    pricing_work_stealing: bool = False
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -353,7 +358,7 @@ class ColGenParams:
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
 
         for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
-                     "seed_nominal_routes"):
+                     "seed_nominal_routes", "pricing_work_stealing"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if not self.iteration_ip_search and not self.iteration_ip_eager:

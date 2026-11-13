@@ -27,6 +27,9 @@ from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.types import FlightRequest, Terminal, vec
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 njit = pytest.importorskip("numba", reason="the compiled kernel needs numba").njit
 dp_kernel = pytest.importorskip("freespace_sim.planner.colgen.dp_kernel")
@@ -807,6 +810,55 @@ def _reference_candidates(
     return recorded
 
 
+
+@pytest.fixture(params=[False, True], ids=["ordinary-memory", "poisoned-empty-memory"])
+def poison_workspace(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check stale-memory independence using bounded, calibrated poisoned allocations.
+
+    Parameters
+    ------------
+    - request (pytest.FixtureRequest): selects ordinary or poisoned empty memory.
+    - monkeypatch (pytest.MonkeyPatch): restores the local driver and allocation policy.
+
+    Return
+    --------
+    - output (None): installs test-local poisoning only for the selected parameter.
+    """
+    if not request.param:
+        return
+    # Poisoning touches every allocated page. Use the existing calibrated initial
+    # budget instead of forcing physical writes across the default 2^26-label arena.
+    # Explicit capacities, retry growth and correctness ceilings stay unchanged.
+    monkeypatch.setattr(dp_kernel, "FLAT_LABEL_ARENA", False)
+    original = dp_kernel.price_dag
+
+    class PoisonNumpy:
+        """Delegate NumPy operations except host-only uninitialized allocations."""
+
+        def __getattr__(self, name: str) -> object:
+            """Retain every ordinary NumPy operation used by the Python driver."""
+            return getattr(np, name)
+
+        def empty(self, *args, **kwargs) -> np.ndarray:
+            """Fill each otherwise-uninitialized buffer with deterministic poison."""
+            result = np.empty(*args, **kwargs)
+            if np.issubdtype(result.dtype, np.floating):
+                result.fill(np.nan)
+            elif np.issubdtype(result.dtype, np.unsignedinteger):
+                result.fill(np.iinfo(result.dtype).max)
+            else:
+                result.fill(-1234567)
+            return result
+
+    # Clone only the Python coordinator: Numba helpers keep their real NumPy module.
+    copied = types.FunctionType(
+        original.__code__, dict(original.__globals__, np=PoisonNumpy()),
+        original.__name__, original.__defaults__, original.__closure__,
+    )
+    copied.__kwdefaults__ = original.__kwdefaults__
+    monkeypatch.setattr(dp_kernel, "price_dag", copied)
+
+
 def _kernel_candidates(
     graph, cfg, view, model, forbidden=frozenset(), *, incumbent=None, benefit=100.0,
     keep_roots=None, **kwargs,
@@ -1109,7 +1161,7 @@ def test_kernel_and_reference_restrict_roots_identically(monkeypatch):
 
 @pytest.mark.parametrize("candidate_capacity", [1, 1 << 12])
 def test_kernel_certifies_the_same_sinks_in_the_same_order_as_the_reference(
-    monkeypatch: pytest.MonkeyPatch, candidate_capacity: int,
+    monkeypatch: pytest.MonkeyPatch, candidate_capacity: int, poison_workspace,
 ) -> None:
     """The pause protocol reproduces the reference's mid-sweep incumbent, step for step.
 
@@ -1302,7 +1354,7 @@ def test_the_bootstrap_reaches_the_real_search_only_as_an_incumbent(monkeypatch)
 
 @pytest.mark.parametrize("budget", ["labels", "states"])
 def test_kernel_survives_a_budget_restart_with_the_same_answer(
-    monkeypatch: pytest.MonkeyPatch, budget: str,
+    monkeypatch: pytest.MonkeyPatch, budget: str, poison_workspace,
 ) -> None:
     """A pool too small to finish is re-run from scratch, and must re-run identically.
 
@@ -2002,7 +2054,7 @@ def test_compiled_path_returns_the_reference_column(
     check(column, forbidden)
 
 
-def test_compiled_path_respects_the_pricing_deadline():
+def test_compiled_path_respects_the_pricing_deadline(monkeypatch, poison_workspace):
     """An expired deadline raises `PricingTimeout` rather than running to completion.
 
     An `@njit(nogil=True)` function cannot read a clock, and with geometric budget growth
@@ -2023,9 +2075,20 @@ def test_compiled_path_respects_the_pricing_deadline():
             incumbent=None, deadline=time.monotonic() - 1.0, model=model,
         )
 
+    # Exercise the actual native cancellation branch, then a fresh uncancelled call.
+    cancelled, proposals = _kernel_candidates(
+        graph, cfg, view, model, cancel=np.ones(1, dtype=np.uint8),
+    )
+    assert cancelled.status == dp_kernel.STATUS_CANCELLED
+    assert not proposals
+    resumed, proposals = _kernel_candidates(graph, cfg, view, model)
+    assert resumed.ok
+    expected = _reference_sink_set(graph, cfg, view, params, monkeypatch, model)
+    assert set(proposals) == expected
+
 
 @pytest.mark.parametrize("overrun", [0, 1, 3, 6, 9])
-def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
+def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun, poison_workspace):
     """The route-length bound is the only knob shaping the corridor, so sweep it.
 
     `max_air_overrun_hops` sizes `max_air_hops`, which is simultaneously the ceiling, the
@@ -2037,16 +2100,19 @@ def test_compiled_path_matches_the_reference_across_hop_ceilings(overrun):
     cfg = _cfg()
     graph, params = _terminal_graph(cfg, overrun=overrun)
     model = cost_model(cfg, params)
-    view = DualView(_random_duals(graph, cfg, 606), cfg)
+    # Keep the original high-budget oracle; exercise changed prices on bounded cases.
+    price_seeds = (606, 607, 606) if overrun <= 3 else (606,)
+    for price_seed in price_seeds:
+        view = DualView(_random_duals(graph, cfg, price_seed), cfg)
 
-    rc, column = _compiled_or_fail(
-        graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
-    )
-    ref_rc, ref_column = pricing._best_column(
-        graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
-    )
-    assert column == ref_column
-    assert rc == ref_rc
+        rc, column = _compiled_or_fail(
+            graph, view, 0.0, cfg, 100.0, frozenset(), incumbent=None, model=model
+        )
+        ref_rc, ref_column = pricing._best_column(
+            graph, view, 0.0, cfg, 100.0, frozenset(), seed=False, incumbent=None, model=model
+        )
+        assert column == ref_column
+        assert rc == ref_rc
 
 
 def test_prepared_topology_is_built_once_per_graph():

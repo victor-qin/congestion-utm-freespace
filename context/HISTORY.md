@@ -224,8 +224,65 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   Files:
   `freespace_sim/planner/colgen/{master,solver,params}.py`, `analysis/colgen/benchmark.py`.
 
+- 2026-11-11T19:40Z [TOOL] SuperCloud Gurobi needs no WLS licence or copied `.lic`: the site token server is `GRB_LICENSE_FILE=/state/partition1/llgrid/pkg/gurobi/gurobi1201/gurobi.lic` (`flexlm.supercloud.mit.edu`). It licensed the env's gurobipy 13.0.2 on compute nodes despite the file's `VERSION=12`/2025 expiry, and WLS would fail there because compute nodes have no internet. Without it, the pip wheel's 2000-variable licence fails only at `optimize()`. `--gurobi` jobs export it. `doctor` checks it on the login node with a 3000-variable solve; compute nodes were verified by colgen job 6219869. Files: `experiments/supercloud.py`; the pattern came from the user's uncommitted cluster-side edit of `experiments/batch/supercloud_runner.sh`, which is not in the repo.
+
 - 2026-11-11T22:00Z [TOOL] PR #150: a new `ColGenParams` field inserted mid-class broke loading an
   archived pricing capture (`bootstrap_method` read back as `20000`): the frozen-slot dataclass
   pickles values by position. Append new fields at the end (see the "Append fields" comment) and
   load captures through `hasattr`-filtered construction. Files:
   `freespace_sim/planner/colgen/params.py`, `experiments/colgen_four_round.py`.
+
+- 2026-11-11T21:21Z [TOOL] PR #149: agent harnesses end a timed-out tool call with SIGTERM. Its default action kills Python without running `except`/`finally` cleanup, so a submit killed mid-upload left a snapshot ref with no job. CLI code that agents run must turn SIGTERM into KeyboardInterrupt in `main`, and hold it (`signal.pthread_sigmask`) across steps that must finish together (sbatch + ledger write). Test it with a real subprocess and `send_signal`. Separately, a race test whose fake I/O returned instantly passed 30/30 with its lock removed; put a delay inside the critical section. Files: `experiments/supercloud.py`, `tests/test_supercloud.py`.
+
+- 2026-11-11T22:40Z [TOOL] PR (follow-up to #150): a pricing pool that feeds workers from the parent
+  idles whenever the parent pauses. With per-flight `time.monotonic` intervals, all 44 workers of a
+  1,537-flight solve stopped together mid-sweep for ~8 s: a generation-2 garbage collection of the
+  parent heap (8.54 s; 19 collections, 27 s over four rounds). The static split hid most of it
+  behind pipe buffers. `run_sweep` now holds the collector off while it dispatches and merges, and
+  each worker's first send is the head of its queue. Before attributing a sweep's wall-minus-work
+  gap, time flights and parent GC (`experiments/colgen_four_round.py --resources` records both).
+  Files: `freespace_sim/planner/colgen/pricing_pool.py`, `experiments/colgen_four_round.py`.
+
+- 2026-11-11T22:40Z [TOOL] Same PR: per-flight pricing time predicts the next round poorly
+  (Pearson 0.47–0.80 on a captured run), so re-planning ownership from measured times gained ≤4%
+  at 44 workers in replay, against ~16% for run-time tail stealing. Steal only the far end of
+  pricing-order queues: longest-first queues collapsed the prefix completed by a mid-sweep
+  deadline to almost nothing. Allocation wins are platform-specific: label `np.empty` cut macOS
+  pricing 15.8% and worker memory 3x but Linux job peak memory not at all (lazy calloc). On Linux each
+  spawned worker reported `ru_maxrss` ~4.7 GB (about the parent's size) while the whole 45-process
+  job peaked at 28 GB, so summed worker peaks are meaningless there; use Slurm MaxRSS. Files:
+  `freespace_sim/planner/colgen/{pricing_pool,dp_kernel}.py`.
+
+- 2026-11-12T00:10Z [CODE/TOOL] PR #151 review: a parent send to a BUSY pool worker can block. A
+  worker reads its pipe only between messages, and a macOS socketpair held just 234 small
+  `("release", …)` messages before `send()` blocked; the first stealing version sent one per steal
+  to an owner still inside its up-front batch, which deadlocks the parent against that worker on
+  large cohorts with few workers. Send only small, bounded messages to a busy worker (≤2 chunks of
+  ids); anything that scales with a sweep goes to idle workers or after the merge. Files:
+  `freespace_sim/planner/colgen/pricing_pool.py`, `tests/test_colgen_pricing_pool.py`.
+
+- 2026-11-12T00:30Z [TOOL] Parent GC policy (`gc.freeze`): CPython 3.12 (SuperCloud) starts every
+  interpreter with `gc.get_freeze_count() == 375` (immortal tuples, even under `-I -S`); 3.14 (Mac)
+  starts at 0. A "leave GC alone if anything is already frozen" guard therefore passed every Mac
+  test and silently never engaged on SuperCloud, wasting two A/B runs. Assert "frozen beyond the
+  entry count", run GC tests on 3.12 too, and check `parent_gc_pauses` before trusting an arm.
+  Also: xeon-p8 nodes differ ~20% in single-thread speed (identical setup 116 vs 144 s), so compare
+  A/B arms within a node class (bucket by `solve_lp`) or by GC seconds, never by raw wall sums.
+  CPython 3.14 (incremental collector) reacts differently: with the heap frozen, allocation-heavy
+  parent code outside a GC-off window paid 774 collections of ~15 ms (11.9 s vs ~0 unfrozen) until
+  #151's review fix moved the per-sweep message build under `gc.disable()`. Measure any parent GC
+  change on BOTH interpreters, counting every collection, not just pauses of 50 ms or more.
+  `gc.freeze()` also pins any garbage alive at that moment: GPU pricing's per-solve cycles were
+  carried through every later solve (6→42 flight graphs alive) until `solve` collected first.
+  Files: `freespace_sim/planner/colgen/{solver,pricing_pool}.py`, `tests/test_colgen_solver.py`.
+
+- 2026-11-12T11:45Z [TOOL] PR (cut colgen route checking): two traps when shortcutting pricing's
+  canonicalization. (1) The pre-check delay (hex-centre polyline) and the canonical delay (the
+  builder's resampled centreline) differ in their last bits on ~50% of routes (Nov 8 replay,
+  round 2). Reduced costs are ~1e4, so one ulp exceeds `_SCORE_EPS` (1e-12) and tie-breaks read
+  the canonical bits: a shortcut must reproduce the canonical number, never reuse the provisional
+  one. (2) `column_claims` stores whatever rows it returns in the graph's certificate cache,
+  reused rows included, so a checker that calls it again reads its own input back and always
+  agrees. An oracle must hide answer-neutral caches that store returned values
+  (`pricing._without_claim_certificates`). Files: `freespace_sim/planner/colgen/pricing.py`,
+  `freespace_sim/planner/colgen/network.py`.

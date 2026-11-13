@@ -94,3 +94,21 @@ There is an extremely high-bar for transferring things from `.agent/CONTINUITY.m
 ## Repository
 - Files in `context/` and `analysis/` do not need to be maintained.
 - If reusing a script from `context/` and `analysis/`, double check for correcteness before using them, especially with files in `freespace_sim/`.
+
+## SuperCloud (remote runs)
+- Prefer this machine for small runs: tests, debugging, profiling, quick benchmarks, and any single run that finishes in under ~30 min and fits in this machine's memory (128 GB, 20 cores). Local runs start immediately. SuperCloud jobs wait in a queue and recompile numba from scratch, so small runs are slower there.
+- Send big runs to MIT SuperCloud: a run that would take more than ~30 min here, needs more memory than this machine has, or needs CUDA (V100), and batches of independent runs (seeds, sweeps) that would otherwise run one after another here.
+- One tool does it all: `uv run python -m experiments.supercloud {doctor,submit,status,fetch,cancel,list}`. `submit` ships your worktree exactly as it is on disk (uncommitted edits included) and keeps that code as `refs/supercloud/<run_id>`; nothing is committed to your branch. Gitignored files (`results/`, `*.parquet`, …) are not shipped, and a file over 20 MB stops the submit.
+- Submit: `uv run python -m experiments.supercloud submit --name <label> --cores N --hours H [--gpus G] [--gurobi] [--env NAME=VALUE] -- experiments.run ... --no-progress`. Only `experiments.run`, `pytest` and `experiments.colgen_four_round` (fixed-input per-round colgen profile; its `--source` option is refused so the job always runs the shipped snapshot) may run.
+- Cores also buy memory (xeon-p8: 4 GB per core); size runs with the table in `experiments/batch/supercloud_array.sh`. GPU jobs: about 20 cores per GPU.
+- Filing jobs, per the SuperCloud docs ([submitting jobs](https://mit-supercloud.github.io/supercloud-docs/submitting-jobs/), [filesystem](https://mit-supercloud.github.io/supercloud-docs/filesystem/), [limits](https://mit-supercloud.github.io/supercloud-docs/resource-limit-enforcement-and-increases/)):
+  - Memory comes only with cores ("request more cores"). Size from a measured run: `sstat -j <job>.batch --format=MaxRSS` while it runs, `sacct -j <job> -o JobID,AllocCPUS,MaxRSS --units=G` after.
+  - Timing and benchmark runs need the whole node; the docs ask for exclusive mode for performance tests. Here that means `--cores 48` on xeon-p8, so no other job shares the node's memory bandwidth. Runs whose timing doesn't matter request only what they need.
+  - Keep concurrently busy processes and threads at or below `--cores`. The job pins OMP/BLAS/numba threads to 1; set worker and solver thread counts explicitly. A colgen pricing pool and Gurobi take turns, so each may approach the core count on its own.
+  - Prefer fewer, larger jobs over many small ones. Batch-job wall limit: 4 days. Heavy intermediate I/O goes to `$TMPDIR` (node-local, deleted at job end); keep files ≥1 MB and under ~1,000 per directory.
+  - `--env` may not set `PATH`, `HOME`, `GRB_*` (use `--gurobi`), `LD_*`, `DYLD_*`, or the `PYTHON*` variables that change which code loads (`PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, …). Others are fine, e.g. `--env PYTHONHASHSEED=0`.
+- `--gurobi` uses SuperCloud's full academic licence; pair it with `--colgen-solver gurobi`, and set solver threads with `--env COLGEN_GUROBI_THREADS=N`.
+- Caps are in `~/.config/congestion-utm/supercloud.toml` and belong to the user. Never edit that file; if a submit is refused, ask the user.
+- `fetch <run_id>` copies results and the Slurm log to the main checkout's `results/supercloud/<run_id>/`. Cite remote results by run id.
+- `submit` and `doctor --gpu` can take minutes (lock wait, upload, GPU queue): give them a tool timeout of at least 15 minutes. A submit queued a job only if it printed `submitted run … as job …`. After an interrupted or failed submit, check `list` and `status` before retrying, and run `doctor` (add `--gpu` to test a V100 node) if the cause is unclear.
+- Codex agents need network access to `txe1-login.mit.edu`, read access to `~/.ssh`, and write access to the main checkout's `.git/` (snapshot refs), its `results/supercloud/` (ledger) and `~/.config/congestion-utm/` (submit lock).

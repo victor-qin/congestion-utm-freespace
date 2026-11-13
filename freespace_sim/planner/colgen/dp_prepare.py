@@ -254,7 +254,7 @@ def _role_mask(fg: FlightGraph, source: Cell, target: Cell) -> int:
 
     The lazy oracle already stores exactly this mask, so ask it for the packed value when
     it is present and fall back to four ``hop_allowed_for_role`` calls otherwise --
-    ``forbidden_hops`` is a plain frozenset on a transported graph, where only the public
+    ``forbidden_hops`` is a plain frozenset on a hand-built graph, where only the public
     path works. The two agree by construction: ``_LazyForbiddenHops.allows`` is itself a
     bit test against the same mask, which the parity test asserts arc for arc.
 
@@ -1052,6 +1052,30 @@ def visit_row_ids(rows: PreparedRows, cell_index: int, visit_step: int, offsets)
 # ------------------------------------------------------------------- completion envelope
 
 
+@dataclass(slots=True)
+class _FixedCompletion:
+    """Price-independent completion-bound inputs, kept on a graph across pricing calls.
+
+    Everything here is a function of the graph, ``SimConfig`` and objective alone, so a
+    later invocation with new duals, exclusions or incumbent reuses it unchanged. Air
+    seconds are stored UNWEIGHTED; the current model weighs them on every use.
+
+    Attributes
+    ------------
+    - cfg (SimConfig): the config the geometry was derived under; a mismatch rebuilds.
+    - model (CostModel): the objective in force when built; a mismatch rebuilds.
+    - geometry (tuple[Any, ...]): destination options, origin fold bounds by lane,
+      destination fold bound and exactness, reference time, detour flag, lane tie.
+    - air_values (dict[int | None, tuple[float, ...]]): per origin lane, the air-detour
+      lower bound in seconds for 1, 2, ... total hops, extended lazily.
+    """
+
+    cfg: SimConfig
+    model: CostModel
+    geometry: tuple[Any, ...]
+    air_values: dict[int | None, tuple[float, ...]] = field(default_factory=dict)
+
+
 class PricingPreparation:
     """Invocation-local prices and root data shared by pricing's successive searches.
 
@@ -1137,6 +1161,8 @@ class PricingPreparation:
             self.fg, self.cfg, self.view, benefit=self.benefit, pi_f=self.pi_f,
             model=self.model, forbidden_rows=self.forbidden_rows, incumbent=incumbent,
             deadline=deadline, _shared=self._completion,
+            # Exact class only: a subclass (the GPU preparation) keeps per-call bounds.
+            _persistent=type(self) is PricingPreparation,
         )
         if self._completion is None:
             self._completion = result
@@ -1239,6 +1265,8 @@ class CompletionEnvelopes:
         "_cfg",
         "_deadline",
         "_delay_values",
+        "_air_values",
+        "_fixed",
         "_delay_envelopes",
         "_destination_costs",
         "_initial_incumbent",
@@ -1273,6 +1301,7 @@ class CompletionEnvelopes:
         incumbent=None,
         deadline: float | None = None,
         _shared: CompletionEnvelopes | None = None,
+        _persistent: bool = False,
     ) -> None:
         """Capture the per-flight state ``completion_envelope``/``can_compete`` close over.
 
@@ -1288,6 +1317,8 @@ class CompletionEnvelopes:
         - incumbent: the seed incumbent every envelope's length is first frozen against, or
           ``None`` to acquire one mid-sweep.
         - deadline (float | None): optional wall-clock deadline checked while building.
+        - _shared (CompletionEnvelopes | None): this invocation's incumbent-independent memos.
+        - _persistent (bool): reuse fixed geometry/unweighted air seconds across calls.
 
         Return
         --------
@@ -1317,13 +1348,17 @@ class CompletionEnvelopes:
         self._envelopes: dict[tuple[int, int | None], tuple[tuple[float, ...], ...]] = {}
         self._delay_envelopes: dict[tuple[int, int | None], tuple[Any, int]] = {}
         self._delay_values: dict[tuple[int, int | None], list[float]] = {}
+        self._air_values: dict[int | None, list[float] | tuple[float, ...]] = {}
         self._destination_costs: dict[tuple[int, int], float] = {}
+        self._fixed: _FixedCompletion | None = None
 
         if _shared is not None:
             # These values do not depend on either stage's incumbent. In particular,
             # never share _delay_envelopes/_envelopes: their first-use length is a prune.
+            self._fixed = _shared._fixed
             self._destination_costs = _shared._destination_costs
             self._delay_values = _shared._delay_values
+            self._air_values = _shared._air_values
             self._destination_options = _shared._destination_options
             self._origin_fold_lb_by_lane = _shared._origin_fold_lb_by_lane
             self._destination_fold_lb = _shared._destination_fold_lb
@@ -1332,6 +1367,19 @@ class CompletionEnvelopes:
             self._detour_defined = _shared._detour_defined
             self.destination_lane_tie = _shared.destination_lane_tie
             return
+
+        if _persistent:
+            with fg._search_cache.lock:
+                fixed = fg._search_cache.cpu_completion
+                if fixed is not None and fixed.cfg == cfg and fixed.model == self._model:
+                    self._fixed = fixed
+            if self._fixed is not None:
+                (
+                    self._destination_options, self._origin_fold_lb_by_lane,
+                    self._destination_fold_lb, self._destination_fold_exact,
+                    self._reference_time_s, self._detour_defined, self.destination_lane_tie,
+                ) = self._fixed.geometry
+                return
 
         destination_options = _destination_options(fg)
         self._destination_options = destination_options
@@ -1379,6 +1427,16 @@ class CompletionEnvelopes:
             for lane_indices in destination_options.values()
             for lane_idx in lane_indices
         )
+
+        if _persistent:
+            self._fixed = _FixedCompletion(
+                cfg, self._model,
+                (self._destination_options, self._origin_fold_lb_by_lane,
+                 self._destination_fold_lb, self._destination_fold_exact,
+                 self._reference_time_s, self._detour_defined, self.destination_lane_tie),
+            )
+            with fg._search_cache.lock:
+                fg._search_cache.cpu_completion = self._fixed
 
     # -- incumbent ---------------------------------------------------------------------
 
@@ -1522,7 +1580,7 @@ class CompletionEnvelopes:
           the ``corridor_start`` step the bounds are measured from.
         """
 
-        from .pricing import _RECOMPUTE_EPS, _check_deadline
+        from .pricing import _RECOMPUTE_EPS, _air_detour_lb_s, _check_deadline
 
         key = departure_step, lane_idx
         cached = self._delay_envelopes.get(key)
@@ -1537,18 +1595,55 @@ class CompletionEnvelopes:
         # Scalar costs are fixed; only this stage's cutoff decides the prefix length.
         # Retain costs even beyond an earlier cutoff, and reapply the gate every time.
         values = self._delay_values.setdefault(key, [])
+        air_values: list[float] | tuple[float, ...] = ()
+        if self._fixed is not None:
+            air_values = self._air_values.get(lane_idx, ())
+            if not air_values:
+                air_values = self._fixed.air_values.get(lane_idx, ())
+                self._air_values[lane_idx] = air_values
+            origin_fold_s, origin_exact = self._origin_fold_lb_by_lane[lane_idx]
+            folding_exact = (
+                self._detour_defined and origin_exact and self._destination_fold_exact
+                and self._reference_time_s > 0.0
+            )
+            ground_s = (departure_step - fg.base_step) * self._cfg.dt_s
+            evaluate = self._model.evaluate
         incumbent = self._incumbent
+        deadline = self._deadline
+        # Hoist only invariant subexpressions; subtraction/addition association is unchanged.
+        benefit_minus_pi = self.benefit - self._pi_f
+        negative_credit = self._view.max_negative_credit
+        cutoff = None if incumbent is None else incumbent[0] - _RECOMPUTE_EPS
         for total_hops in range(1, max_total_hops + 1):
-            _check_deadline(self._deadline)
+            _check_deadline(deadline)
             if total_hops > len(values):
-                values.append(self.delay_lower_bound(departure_step, lane_idx, total_hops, 0))
+                # The two cached branches make the same `evaluate` calls as
+                # `pricing._arc_delay_lower_bound_s`, and share its air arithmetic, so a
+                # CostModel subclass that overrides `evaluate` still gets the uncached
+                # oracle's value bit for bit.
+                if self._fixed is None:
+                    values.append(self.delay_lower_bound(departure_step, lane_idx, total_hops, 0))
+                elif not folding_exact:
+                    values.append(evaluate(ground_s=ground_s))
+                else:
+                    if total_hops > len(air_values):
+                        if not isinstance(air_values, list):
+                            air_values = list(air_values)
+                            self._air_values[lane_idx] = air_values
+                        air_values.append(_air_detour_lb_s(
+                            origin_fold_s, total_hops, self._cfg.dt_s,
+                            self._destination_fold_lb, self._reference_time_s))
+                    values.append(evaluate(ground_s=ground_s,
+                                           air_detour_s=air_values[total_hops - 1]))
             delay_lb = values[total_hops - 1]
-            if incumbent is not None and (
-                self.benefit - self._pi_f - delay_lb + self._view.max_negative_credit
-                < incumbent[0] - _RECOMPUTE_EPS
-            ):
+            if cutoff is not None and benefit_minus_pi - delay_lb + negative_credit < cutoff:
                 break
             delay_lbs.append(delay_lb)
+
+        if self._fixed is not None:
+            with fg._search_cache.lock:
+                if len(air_values) > len(self._fixed.air_values.get(lane_idx, ())):
+                    self._fixed.air_values[lane_idx] = tuple(air_values)
 
         value = tuple(delay_lbs), corridor_start
         self._delay_envelopes[key] = value

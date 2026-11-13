@@ -258,6 +258,37 @@ def test_fast_certification_defers_when_translation_and_graph_disagree():
                                      frozenset(), model)
 
 
+@pytest.mark.parametrize("violation", ["config", "origin_cell", "dest_cell", "origin_lane",
+                                       "max_step"])
+def test_fast_certification_defers_every_structural_mismatch(violation):
+    """Each route check the reference makes is mirrored, so a mismatching route is deferred.
+
+    Every case breaks exactly one check on a route the fast path otherwise accepts.
+    """
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    path, lane, fg, used_cfg = seed.cell_path, None, graph, cfg
+    if violation == "config":
+        used_cfg = replace(cfg, max_ground_delay_s=cfg.max_ground_delay_s + cfg.dt_s)
+    elif violation == "origin_cell":
+        path = seed.cell_path[1:]
+    elif violation == "dest_cell":
+        path = seed.cell_path[:-1]
+    elif violation == "origin_lane":
+        lane = 0
+    else:
+        arrival = seed.departure_step + graph.takeoff_steps[0] + len(path) - 1
+        fg = replace(graph, max_step=arrival - 1)
+    accepted = pricing._Label(0., seed.departure_step, None, seed.cell_path, frozenset())
+    claims = pricing._path_claims(graph, cfg, accepted, None)
+    assert pricing._fast_canonical(pricing._Candidate(0., 0., accepted, None, claims, 0.), graph,
+                                   0., cfg, 1000., frozenset(), model) is not pricing._DEFER
+    label = pricing._Label(0., seed.departure_step, lane, path, frozenset())
+    candidate = pricing._Candidate(0., 0., label, None, claims, 0.)
+    assert pricing._fast_canonical(candidate, fg, 0., used_cfg, 1000., frozenset(),
+                                   model) is pricing._DEFER
+
+
 @pytest.mark.parametrize('dt,clock', [(4., 0.), (.1, 0.), (.1, 1_000_000.)])
 def test_shifted_incumbent_matches_canonical_claims_and_cost(dt, clock):
     cfg, params, original, _catalog, _seed = _context(dt_s=dt, nominal_speed_mps=120. / dt, max_ground_delay_s=8.)

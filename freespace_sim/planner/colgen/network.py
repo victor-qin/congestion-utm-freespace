@@ -925,7 +925,8 @@ class _FlightSearchCache:
         self.seed_model: Any | None = None
         self.seed_search_complete = False
         # `pricing._RouteGeometry`: per-graph constants of canonical certification (reference
-        # distance, endpoint-cylinder wall verdict), keyed by the config they were built with.
+        # distance, endpoint-cylinder wall verdict, whether the hop oracle's verdicts are exact,
+        # whether translation and graph agree on the endpoints), keyed by the config.
         self.route_geometry: Any | None = None
 
     def __reduce__(self):
@@ -1473,6 +1474,15 @@ def _static_hop_allowed_roles(
     return allowed_roles
 
 
+def _arc_role(first: bool, last: bool) -> int:
+    """The ``_ARC_*`` bit for an arc used as the path's first hop, last hop, both or neither."""
+    if first and last:
+        return _ARC_FIRST_LAST
+    if first:
+        return _ARC_FIRST
+    return _ARC_LAST if last else _ARC_INTERNAL
+
+
 class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
     """Generate and cache invariant outgoing spatial arcs one source at a time."""
 
@@ -1624,27 +1634,19 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         first: bool,
         last: bool,
     ) -> bool:
-        role = (
-            _ARC_FIRST_LAST
-            if first and last
-            else _ARC_FIRST
-            if first
-            else _ARC_LAST
-            if last
-            else _ARC_INTERNAL
-        )
         # ``role_mask`` subsumes a ``target not in self.outgoing(source)`` membership test that
         # would rescan a <=6-tuple on each of the two calls the pricing DP makes per arc.
-        return bool(self.role_mask(source, target) & role)
+        return bool(self.role_mask(source, target) & _arc_role(first, last))
 
     def allows_known(self, source: Cell, target: Cell, *, first: bool, last: bool) -> bool:
         """``allows`` for an arc already expanded, else ``False``; never expands or counts.
 
         For a caller that only needs a "certainly allowed" answer, such as pricing's
-        volume-free certification, which defers every ``False`` to the full check.  A source's
-        role entries are written before it is marked expanded, and an unexpanded arc simply
-        has no entry, so this unlocked read never returns ``True`` wrongly.  It neither expands
-        nor counts, so pricing can consult it without the oracle's ``arc_cache_stats`` moving.
+        volume-free certification, which defers every ``False`` to the full check.  Role
+        entries are written once, under the lock, when their source is expanded; an unexpanded
+        arc has none, so this unlocked read can only miss, never wrongly allow.  It neither
+        expands nor counts, so a repeated pricing call can consult it without re-touching the
+        oracle.
 
         Parameters
         ------------
@@ -1657,16 +1659,7 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         --------
         - output (bool): True only if the arc was expanded and is wall-safe in that role.
         """
-        role = (
-            _ARC_FIRST_LAST
-            if first and last
-            else _ARC_FIRST
-            if first
-            else _ARC_LAST
-            if last
-            else _ARC_INTERNAL
-        )
-        return bool(self._roles.get((source, target), 0) & role)
+        return bool(self._roles.get((source, target), 0) & _arc_role(first, last))
 
     def __contains__(self, raw_hop: object) -> bool:
         if not isinstance(raw_hop, tuple) or len(raw_hop) != 2:

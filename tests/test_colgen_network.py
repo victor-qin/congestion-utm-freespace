@@ -1019,6 +1019,9 @@ def test_resampled_endpoint_hop_with_separate_tags_is_not_falsely_forbidden():
     # Hop verdicts that cannot vouch for this route make pricing defer; the reference still
     # accepts it (check mode compares the two).
     late = _rewalled(fg, cfg, tuple(replace(wall, t_start=1.0) for wall in fg.static_walls))
+    late.outgoing_neighbors(path[0])  # expanded, so only the time guard can defer
+    assert late.forbidden_hops.allows_known(*path, first=True, last=True)
+    assert not pricing._route_geometry(late, cfg).hop_verdicts_exact
     foreign = replace(fg, corridor_cells=frozenset(fg.corridor_cells))  # not the oracle's own
     excluded = _rewalled(fg, cfg, fg.static_walls)
     excluded.outgoing_neighbors(path[0])

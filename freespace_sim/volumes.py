@@ -434,8 +434,11 @@ def fold_corners_to_columns(corners, origin, dest, origin_term, dest_term, cfg: 
     return pts
 
 
-def lattice_subdivision(p0, p1, segment_len_m: float) -> list[tuple[tuple[float, float, float],
-                                                                     tuple[float, float, float]]]:
+def lattice_subdivision(
+    p0: Vec | tuple[float, float, float],
+    p1: Vec | tuple[float, float, float],
+    segment_len_m: float,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
     """Split one corner-to-corner edge into the builder's sub-segments.
 
     The same scalar arithmetic as :func:`build_reservation_from_corners`' loop (which keeps

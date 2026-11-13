@@ -1587,7 +1587,9 @@ def _without_claim_certificates(fg: FlightGraph) -> Iterator[None]:
 
     ``column_claims`` stores whatever rows it returns, reused ones included; an oracle that
     read that store back would compare the reused rows with themselves.  The graph's lock is
-    held throughout so no other thread sees the empty store.  Debug-only (check mode).
+    held throughout so no other thread sees the empty store.  Debug-only (check mode).  The
+    check therefore always runs the full wall test, which a certificate hit skips; the two
+    agree because shipped walls are time-invariant.
 
     Parameters
     ------------

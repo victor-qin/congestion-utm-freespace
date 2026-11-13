@@ -287,8 +287,10 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   (`pricing._without_claim_certificates`). Files: `freespace_sim/planner/colgen/pricing.py`,
   `freespace_sim/planner/colgen/network.py`.
 
-- 2026-11-12T19:00Z [CODE/TOOL] The master's Gurobi `Threads` default is machine-dependent: 12
-  when the process may use at least 12 CPUs, else 1 (`COLGEN_GUROBI_THREADS` overrides). The
-  count changes the duals and the IP (exactly 2 threads is ~10% worse), so two colgen runs are
-  comparable only at equal `stats["gurobi_threads"]`; with no env var, a machine with fewer than
-  12 CPUs and one with more no longer run the same setting. Files: `freespace_sim/planner/colgen/master.py`.
+- 2026-11-13T19:30Z [CODE/TOOL] The master's Gurobi `Threads` default is machine-dependent: the
+  process's granted physical cores, capped at 32 (12 on macOS), and 1 below 4 cores
+  (`COLGEN_GUROBI_THREADS` overrides). The count changes the duals and the IP (exactly 2 threads
+  is ~10% worse), so colgen runs are comparable only at equal `stats["gurobi_threads"]`. Do not
+  "simplify" to Gurobi's `Threads=0`: it counts the whole node, not the Slurm grant, and ran 32
+  threads in a 4-core job (largest LP 80.3 s vs 18.3 s on a whole node). Files:
+  `freespace_sim/planner/colgen/master.py`.

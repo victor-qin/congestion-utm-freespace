@@ -7,6 +7,9 @@ import pytest
 from freespace_sim.planner.colgen import dp_prepare, pricing
 from freespace_sim.planner.colgen.objective import cost_model
 from tests.test_colgen_dp_kernel import GRAPH_SHAPES, _cfg, _random_duals
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 kernel = pytest.importorskip('freespace_sim.planner.colgen.bootstrap_kernel')
 

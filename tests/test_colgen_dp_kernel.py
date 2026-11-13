@@ -27,6 +27,9 @@ from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView
 from freespace_sim.types import FlightRequest, Terminal, vec
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 njit = pytest.importorskip("numba", reason="the compiled kernel needs numba").njit
 dp_kernel = pytest.importorskip("freespace_sim.planner.colgen.dp_kernel")

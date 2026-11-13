@@ -26,6 +26,7 @@ from ...volumes import (
     Volume4D,
     column_dwell_s,
     corridor_segment_volume,
+    lattice_subdivision,
     permanent_terminal_reservation,
     segment_overlaps_column,
     terminal_radius,
@@ -874,6 +875,7 @@ class _FlightSearchCache:
         "seed_delay_certified",
         "seed_model",
         "seed_search_complete",
+        "route_geometry",
     )
 
     def __init__(self) -> None:
@@ -922,6 +924,10 @@ class _FlightSearchCache:
         # an exception.
         self.seed_model: Any | None = None
         self.seed_search_complete = False
+        # `pricing._RouteGeometry`: per-graph constants of canonical certification (reference
+        # distance, endpoint-cylinder wall verdict, whether the hop oracle's verdicts are exact,
+        # whether translation and graph agree on the endpoints), keyed by the config.
+        self.route_geometry: Any | None = None
 
     def __reduce__(self):
         # A transported graph starts with a cold cache: the lock cannot be pickled and the
@@ -1379,18 +1385,13 @@ def _static_hop_allowed_roles(
     p0 = (float(source_xy[0]), float(source_xy[1]), float(z))
     p1 = (float(target_xy[0]), float(target_xy[1]), float(z))
 
-    # Reproduce ``build_reservation_from_corners`` scalar interpolation.  A
-    # nominal edge can be a few ulps long and split into differently tagged boxes.
-    dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
-    length = math.sqrt(dx * dx + dy * dy + dz * dz)
-    nsub = max(1, math.ceil(length / cfg.corridor_segment_len_m))
+    # The builder's own sub-segments.  A nominal edge can be a few ulps long and split into
+    # differently tagged boxes.  Pricing's canonical shortcut (``pricing._route_hops_clear``)
+    # trusts these verdicts for whole routes, so they must describe the builder's boxes exactly.
+    endpoints = lattice_subdivision(p0, p1, cfg.corridor_segment_len_m)
+    nsub = len(endpoints)
     subvolumes: list[Volume4D] = []
-    endpoints = []
-    for k in range(1, nsub + 1):
-        f0, f1 = (k - 1) / nsub, k / nsub
-        sa = (p0[0] + f0 * dx, p0[1] + f0 * dy, p0[2] + f0 * dz)
-        sb = (p0[0] + f1 * dx, p0[1] + f1 * dy, p0[2] + f1 * dz)
-        endpoints.append((sa, sb))
+    for k, (sa, sb) in enumerate(endpoints, start=1):
         subvolumes.append(
             corridor_segment_volume(
                 sa,
@@ -1471,6 +1472,15 @@ def _static_hop_allowed_roles(
         if not conflicts:
             allowed_roles |= role
     return allowed_roles
+
+
+def _arc_role(first: bool, last: bool) -> int:
+    """The ``_ARC_*`` bit for an arc used as the path's first hop, last hop, both or neither."""
+    if first and last:
+        return _ARC_FIRST_LAST
+    if first:
+        return _ARC_FIRST
+    return _ARC_LAST if last else _ARC_INTERNAL
 
 
 class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
@@ -1589,6 +1599,33 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         self.outgoing(source)
         return self._roles.get((source, target), 0)
 
+    def describes(self, fg: "FlightGraph") -> bool:
+        """Whether these verdicts were built for ``fg``'s own corridor, walls, endpoints and config.
+
+        ``dataclasses.replace`` can pair a graph with another graph's oracle.  A caller that
+        trusts these verdicts in place of the graph's own route checks confirms this first.
+
+        Parameters
+        ------------
+        - fg (FlightGraph): the graph the caller is certifying routes on.
+
+        Return
+        --------
+        - output (bool): True when corridor, walls, wall index and request are the graph's
+          objects and terminals, lanes and config compare equal.
+        """
+        return (
+            self._corridor is fg.corridor_cells
+            and self._walls is fg.static_walls
+            and self._wall_index is fg._wall_index
+            and self._request is fg.request
+            and self._origin_terminal == fg.origin_terminal
+            and self._dest_terminal == fg.dest_terminal
+            and self._origin_lanes == fg.origin_lanes
+            and self._dest_lanes == fg.dest_lanes
+            and self._cfg == fg._cfg
+        )
+
     def allows(
         self,
         source: Cell,
@@ -1597,18 +1634,32 @@ class _LazyForbiddenHops(AbstractSet[tuple[Cell, Cell]]):
         first: bool,
         last: bool,
     ) -> bool:
-        role = (
-            _ARC_FIRST_LAST
-            if first and last
-            else _ARC_FIRST
-            if first
-            else _ARC_LAST
-            if last
-            else _ARC_INTERNAL
-        )
         # ``role_mask`` subsumes a ``target not in self.outgoing(source)`` membership test that
         # would rescan a <=6-tuple on each of the two calls the pricing DP makes per arc.
-        return bool(self.role_mask(source, target) & role)
+        return bool(self.role_mask(source, target) & _arc_role(first, last))
+
+    def allows_known(self, source: Cell, target: Cell, *, first: bool, last: bool) -> bool:
+        """``allows`` for an arc already expanded, else ``False``; never expands or counts.
+
+        For a caller that only needs a "certainly allowed" answer, such as pricing's
+        volume-free certification, which defers every ``False`` to the full check.  Role
+        entries are written once, under the lock, when their source is expanded; an unexpanded
+        arc has none, so this unlocked read can only miss, never wrongly allow.  It neither
+        expands nor counts, so a repeated pricing call can consult it without re-touching the
+        oracle.
+
+        Parameters
+        ------------
+        - source (Cell): the arc's start cell.
+        - target (Cell): the arc's end cell.
+        - first (bool): whether the arc is the path's first hop.
+        - last (bool): whether the arc is the path's last hop.
+
+        Return
+        --------
+        - output (bool): True only if the arc was expanded and is wall-safe in that role.
+        """
+        return bool(self._roles.get((source, target), 0) & _arc_role(first, last))
 
     def __contains__(self, raw_hop: object) -> bool:
         if not isinstance(raw_hop, tuple) or len(raw_hop) != 2:
@@ -2027,6 +2078,7 @@ def column_claims(
     *,
     _intent=None,
     _validate: bool = True,
+    _claims: frozenset[RowKey] | None = None,
 ) -> frozenset[RowKey]:
     """Return the de-duplicated capacity rows claimed by ``column``.
 
@@ -2048,6 +2100,9 @@ def column_claims(
     - _intent: optional pre-built intent to reuse instead of re-translating the column.
     - _validate (bool): check route feasibility and use certified-claim caching. False
       constructs diagnostic claims only and neither reads nor writes that cache.
+    - _claims (frozenset[RowKey] | None): the row union the caller already built for this exact
+      column with the same window helpers (pricing's pre-check); every validation still runs,
+      only the collection is skipped.  ``None`` collects the rows here.
 
     Return
     --------
@@ -2204,16 +2259,73 @@ def column_claims(
                     )
 
     windows = _column_endpoint_steps(column, fg, cfg, arrival_step)
-    result = _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
-    with fg._search_cache.lock:
-        fg._search_cache.certified_claims[certificate_key] = (
-            column.departure_step, result,
-            tuple((w.start - column.departure_step, w.stop - column.departure_step) for w in windows),
-        )
-        fg._search_cache.certified_claims.move_to_end(certificate_key)
-        while len(fg._search_cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
-            fg._search_cache.certified_claims.popitem(last=False)
+    result = (
+        _collect_column_claims(column, fg, cfg, offsets, corridor_start_step, windows)
+        if _claims is None else _claims
+    )
+    _store_claim_certificate(
+        fg, certificate_key, column.departure_step, result,
+        tuple((w.start - column.departure_step, w.stop - column.departure_step) for w in windows),
+    )
     return result
+
+
+def _store_claim_certificate(
+    fg: FlightGraph,
+    key: tuple[Any, ...],
+    departure_step: int,
+    claims: frozenset[RowKey],
+    relative_windows: tuple[tuple[int, int], ...],
+) -> None:
+    """Insert one claim certificate as most recent, evicting beyond ``_MAX_CERTIFIED_COLUMNS``."""
+    cache = fg._search_cache
+    with cache.lock:
+        cache.certified_claims[key] = (departure_step, claims, relative_windows)
+        cache.certified_claims.move_to_end(key)
+        while len(cache.certified_claims) > _MAX_CERTIFIED_COLUMNS:
+            cache.certified_claims.popitem(last=False)
+
+
+def record_claim_certificate(
+    column: Column, fg: FlightGraph, cfg: SimConfig, claims: frozenset[RowKey]
+) -> None:
+    """Leave the claim-certificate cache as ``column_claims`` would after certifying ``column``.
+
+    For a caller that certified ``column`` by other means (pricing's volume-free path).  Later
+    ``column_claims`` calls then find the same certificates, in the same LRU order, as if the
+    route had gone through it: a same-departure or exactly translatable certificate is only
+    refreshed, anything else is replaced.
+
+    Parameters
+    ------------
+    - column (Column): the certified route; it must arrive by ``fg.max_step``.
+    - fg (FlightGraph): the graph whose cache holds the certificates.
+    - cfg (SimConfig): the graph's config, for the endpoint windows.
+    - claims (frozenset[RowKey]): the route's exact claim rows.
+
+    Return
+    --------
+    - output (None): updates ``fg._search_cache.certified_claims``.
+    """
+    path = tuple(tuple(cell) for cell in column.cell_path)
+    key = (column.flight_id, column.level, column.origin_lane_idx, column.dest_lane_idx, path)
+    cache = fg._search_cache
+    with cache.lock:
+        certificate = cache.certified_claims.get(key)
+        if certificate is not None:
+            cache.certified_claims.move_to_end(key)
+    if certificate is not None and certificate[0] == column.departure_step:
+        return
+    lane_steps = (0 if column.origin_lane_idx is None else
+                  fg.origin_lanes[column.origin_lane_idx].steps)
+    arrival = column.departure_step + fg.takeoff_steps[column.level] + lane_steps + len(path) - 1
+    windows = tuple(
+        (w.start - column.departure_step, w.stop - column.departure_step)
+        for w in _column_endpoint_steps(column, fg, cfg, arrival)
+    )
+    if certificate is not None and certificate[2] == windows:
+        return
+    _store_claim_certificate(fg, key, column.departure_step, claims, windows)
 
 
 __all__ = [

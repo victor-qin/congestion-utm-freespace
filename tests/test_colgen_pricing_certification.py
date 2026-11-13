@@ -10,13 +10,16 @@ import pytest
 from freespace_sim.planner.colgen import pricing, pricing_pool
 from freespace_sim.planner.colgen.network import StaticTerminalCatalog, build_flight_graph, column_claims
 from freespace_sim.planner.colgen.objective import cost_model
-from freespace_sim.planner.colgen.translate import column_to_intent
+from freespace_sim.planner.colgen.translate import column_to_intent, lattice_centerline
 from freespace_sim.config import SimConfig
 from freespace_sim.types import FlightRequest, Terminal, vec
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.translate import Column
 from freespace_sim.volumes import column_dwell_s
+from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
+
+pytestmark = pytest.mark.usefixtures("check_canonical")
 
 
 def _cfg(**overrides):
@@ -186,6 +189,106 @@ def test_final_tied_winner_remains_certified_after_more_than_eight_losers():
     assert pricing_pool._certified_result(result[1], (), graph, params, cfg)
 
 
+@pytest.mark.parametrize("fast", [True, False])
+def test_check_mode_rejects_reused_claims_that_differ_from_certification(monkeypatch, fast):
+    """The guard compares reused pre-check rows with a fresh certification, not with themselves.
+
+    Both the volume-free path and the reference reusing the rows store them as the route's
+    claim certificate; the check must not read that certificate back.
+    """
+    if not fast:
+        monkeypatch.setattr(pricing, "_fast_canonical", lambda *args, **kwargs: pricing._DEFER)
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    label = pricing._Label(0., seed.departure_step, seed.origin_lane_idx, seed.cell_path,
+                           frozenset())
+    wrong = seed.claims - {min(seed.claims, key=repr)}
+    candidate = pricing._Candidate(1000. - seed.delay_s, seed.delay_s, label, seed.dest_lane_idx,
+                                   wrong, 0.)
+    # A cached certificate would hand back the true rows and hide the bad ones.
+    graph._search_cache.certified_claims.clear()
+    with pytest.raises(AssertionError, match='canonical results differ'):
+        pricing._canonical_candidate(candidate, graph, pricing.DualView({}, cfg), 0., cfg, 1000.,
+                                     frozenset(), model)
+
+
+def test_fast_certification_leaves_claim_certificates_as_the_reference_does():
+    """Later reference certifications find the same certificates, in the same LRU order."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    view = pricing.DualView({}, cfg)
+    reference = build_flight_graph(graph.request, cfg, (), params)
+    pricing.seed_column(reference, cfg, model=model)
+    other = next(c for c in graph.corridor_cells if hg.hex_distance(c, seed.cell_path[1]) == 1
+                 and c not in seed.cell_path and hg.hex_distance(c, seed.cell_path[2]) == 1)
+    detour = (seed.cell_path[0], seed.cell_path[1], other, *seed.cell_path[2:])
+    for cell in detour:  # expanded, as a pricing search would have
+        graph.outgoing_neighbors(cell)
+    for path, departure in ((seed.cell_path, seed.departure_step),
+                            (seed.cell_path, seed.departure_step + 1),
+                            (detour, seed.departure_step),
+                            (seed.cell_path, seed.departure_step + 2)):
+        label = pricing._Label(0., departure, seed.origin_lane_idx, path, frozenset())
+        claims = pricing._path_claims(graph, cfg, label, seed.dest_lane_idx)
+        reused = pricing._Candidate(0., 0., label, seed.dest_lane_idx, claims, 0.)
+        assert pricing._fast_canonical(reused, graph, 0., cfg, 1000., frozenset(),
+                                       model) is not pricing._DEFER
+        pricing._reference_canonical(pricing._Candidate(0., 0., label, seed.dest_lane_idx),
+                                     reference, view, 0., cfg, 1000., frozenset(), model,
+                                     validate=True, reuse=False)
+        assert list(graph._search_cache.certified_claims.items()) == list(
+            reference._search_cache.certified_claims.items())
+
+
+def test_fast_certification_defers_when_translation_and_graph_disagree():
+    """A hand-built graph whose customer cell is not the request's goes to the reference."""
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    moved = replace(graph, origin_cell=seed.cell_path[1])
+    path = seed.cell_path[1:]
+    label = pricing._Label(0., seed.departure_step, None, path, frozenset())
+    claims = pricing._path_claims(moved, cfg, label, None)
+    candidate = pricing._Candidate(0., 0., label, None, claims, 0.)
+    # The graph's own checks pass; only the translation knows the true customer cell.
+    assert pricing._route_hops_clear(moved, path, pricing._route_geometry(moved, cfg))
+    assert pricing._fast_canonical(candidate, moved, 0., cfg, 1000., frozenset(),
+                                   model) is pricing._DEFER
+    with pytest.raises(ValueError, match="customer cell"):
+        pricing._canonical_candidate(candidate, moved, pricing.DualView({}, cfg), 0., cfg, 1000.,
+                                     frozenset(), model)
+
+
+@pytest.mark.parametrize("violation", ["config", "origin_cell", "dest_cell", "origin_lane",
+                                       "max_step"])
+def test_fast_certification_defers_every_structural_mismatch(violation):
+    """Each route check the reference makes is mirrored, so a mismatching route is deferred.
+
+    Every case breaks exactly one check on a route the fast path otherwise accepts.
+    """
+    cfg, params, graph, _catalog, seed = _context()
+    model = cost_model(cfg, params)
+    path, lane, fg, used_cfg = seed.cell_path, None, graph, cfg
+    if violation == "config":
+        used_cfg = replace(cfg, max_ground_delay_s=cfg.max_ground_delay_s + cfg.dt_s)
+    elif violation == "origin_cell":
+        path = seed.cell_path[1:]
+    elif violation == "dest_cell":
+        path = seed.cell_path[:-1]
+    elif violation == "origin_lane":
+        lane = 0
+    else:
+        arrival = seed.departure_step + graph.takeoff_steps[0] + len(path) - 1
+        fg = replace(graph, max_step=arrival - 1)
+    accepted = pricing._Label(0., seed.departure_step, None, seed.cell_path, frozenset())
+    claims = pricing._path_claims(graph, cfg, accepted, None)
+    assert pricing._fast_canonical(pricing._Candidate(0., 0., accepted, None, claims, 0.), graph,
+                                   0., cfg, 1000., frozenset(), model) is not pricing._DEFER
+    label = pricing._Label(0., seed.departure_step, lane, path, frozenset())
+    candidate = pricing._Candidate(0., 0., label, None, claims, 0.)
+    assert pricing._fast_canonical(candidate, fg, 0., used_cfg, 1000., frozenset(),
+                                   model) is pricing._DEFER
+
+
 @pytest.mark.parametrize('dt,clock', [(4., 0.), (.1, 0.), (.1, 1_000_000.)])
 def test_shifted_incumbent_matches_canonical_claims_and_cost(dt, clock):
     cfg, params, original, _catalog, _seed = _context(dt_s=dt, nominal_speed_mps=120. / dt, max_ground_delay_s=8.)
@@ -202,6 +305,10 @@ def test_shifted_incumbent_matches_canonical_claims_and_cost(dt, clock):
     assert column.claims == column_claims(column, fresh, cfg, _intent=intent)
     assert column.delay_s.hex() == model.intent_cost(intent, cfg).hex()
     assert rc.hex() == model.reduced_cost(benefit=1000., cost=column.delay_s, dual_cost=0., pi_f=0.).hex()
+    # Fast canonicalization measures the intent's own centreline without building volumes.
+    points = lattice_centerline(column.cell_path, cfg.flight_levels_m[0], cfg)
+    assert [tuple(map(float.hex, point)) for point in points] == [
+        tuple(float(v).hex() for v in point) for point, _t in intent.centerline]
 
 
 def test_shifted_missing_terminal_row_cannot_be_used_as_cutoff():
@@ -286,6 +393,15 @@ def test_sink_visit_reuse_preserves_claims_and_refreshes_departures(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pricing, "_visit_claims", count_visit)
+    original_fast = pricing._fast_canonical
+    fast = []
+
+    def record_fast(*args, **kwargs):
+        """Record whether canonicalization took the volume-free path."""
+        fast.append(original_fast(*args, **kwargs))
+        return fast[-1]
+
+    monkeypatch.setattr(pricing, "_fast_canonical", record_fast)
     view = pricing.DualView({}, cfg)
     certify = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
     lane_steps = 0 if seed.origin_lane_idx is None else graph.origin_lanes[seed.origin_lane_idx].steps
@@ -303,3 +419,6 @@ def test_sink_visit_reuse_preserves_claims_and_refreshes_departures(
     cold = pricing._sink_certifier(graph, view, 0., cfg, 1000., frozenset(), model)
     assert shifted == cold(None, seed.departure_step + 1, seed.origin_lane_idx,
                            seed.dest_lane_idx, arrival + 1, seed.cell_path)
+    # Every sink here is a plain accepted route, so none should fall back to volume building
+    # (check mode, on for this module, compares each fast answer with the reference).
+    assert len(fast) == 4 and all(result is not pricing._DEFER for result in fast)

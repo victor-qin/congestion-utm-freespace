@@ -248,3 +248,14 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `gc.freeze()` also pins any garbage alive at that moment: GPU pricing's per-solve cycles were
   carried through every later solve (6→42 flight graphs alive) until `solve` collected first.
   Files: `freespace_sim/planner/colgen/{solver,pricing_pool}.py`, `tests/test_colgen_solver.py`.
+
+- 2026-11-12T11:45Z [TOOL] PR (cut colgen route checking): two traps when shortcutting pricing's
+  canonicalization. (1) The pre-check delay (hex-centre polyline) and the canonical delay (the
+  builder's resampled centreline) differ in their last bits on ~50% of routes (Nov 8 replay,
+  round 2). Reduced costs are ~1e4, so one ulp exceeds `_SCORE_EPS` (1e-12) and tie-breaks read
+  the canonical bits: a shortcut must reproduce the canonical number, never reuse the provisional
+  one. (2) `column_claims` stores whatever rows it returns in the graph's certificate cache,
+  reused rows included, so a checker that calls it again reads its own input back and always
+  agrees. An oracle must hide answer-neutral caches that store returned values
+  (`pricing._without_claim_certificates`). Files: `freespace_sim/planner/colgen/pricing.py`,
+  `freespace_sim/planner/colgen/network.py`.

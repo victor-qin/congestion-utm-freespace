@@ -376,6 +376,8 @@ class _ImmutableFlightRequest(FlightRequest):
             self.dest_terminal,
             self.return_to_origin,
             self.turnaround_s,
+            self.parked_since_s,
+            self.pad_hold_after_s,
         )
 
 
@@ -408,6 +410,8 @@ def _snapshot_request(
         dest_terminal=dest_terminal,
         return_to_origin=req.return_to_origin,
         turnaround_s=req.turnaround_s,
+        parked_since_s=req.parked_since_s,
+        pad_hold_after_s=req.pad_hold_after_s,
     )
 
 

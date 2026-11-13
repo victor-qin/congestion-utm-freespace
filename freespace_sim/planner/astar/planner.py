@@ -53,6 +53,7 @@ from ..itinerary import reject_itinerary
 from .. import hexgrid as hg
 from ._packed import G_GEN, GEN_STEP, GEN_WRAP, aligned_2d
 from . import window as W
+from ..pad_hold import landing_hold_clear, landing_hold_hits, parked_ground_max_step
 from .compiled_hex_occupancy import (
     _FIELD_MASK,
     _S0_SHIFT,
@@ -160,8 +161,8 @@ def _deny(req, reason):
 def _absorb_many(services, ledger):
     """Feed already-committed reservations into EVERY service in ONE pass, grouped BY FLIGHT (volumes
     of one flight are committed contiguously — ``ledger.iter_committed`` guarantees this and points
-    back here), so the per-flight own-column drop in ``on_commit`` applies to pre-existing flights
-    exactly as it does to live commits — not volume-by-volume.
+    back here), so each service sees a pre-existing flight through ``on_commit`` exactly as it sees a
+    live commit — whole, not volume-by-volume.
 
     One pass, not one per service, because ``hexgrid.rasterize_ranges`` memoizes the geometry sweep by
     ``id(vol)`` behind a 1024-entry LRU precisely so a commit's several occupancy consumers share it —
@@ -755,7 +756,8 @@ class AStarPlanner:
             t_lo=math.nextafter(raster_lo, -math.inf),
             t_hi=float(max_step * cfg.dt_s + hover_tail_steps(cfg) * cfg.dt_s
                        + max(hg.max_lane_traverse_s(origin, o_term, cfg),
-                             hg.max_lane_traverse_s(dest, d_term, cfg))),
+                             hg.max_lane_traverse_s(dest, d_term, cfg))
+                       + req.pad_hold_after_s),                   # a landing reads the held pad too
             unbounded=bool(unbounded),
         )
 
@@ -933,7 +935,10 @@ class AStarPlanner:
         # budget (the accept/deny frontier shifts by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + ground_delay_steps(cfg)
+        # An itinerary's parked aircraft: the return may only hold on the ground while its pad stays
+        # clear, and the outbound only lands where the pad stays clear through the turnaround.
+        ground_max_step = parked_ground_max_step(req, ledger, cfg, base, base + ground_delay_steps(cfg))
+        hold_hits = landing_hold_hits(req, ledger, cfg, base, max_step, dwell_steps)
 
         start = ("g", oq, orr, base)
         g = {start: 0.0}
@@ -972,7 +977,8 @@ class AStarPlanner:
                             _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term),
                             d_cap, origin, levels[st[3]],
                         ) if d_term is not None
-                        else svc_q.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
+                        else (svc_q.pad_clear(gq, grr, st[4], dwell_steps[st[3]])
+                              and landing_hold_clear(hold_hits, st[4], dwell_steps[st[3]], req, cfg))
                     )
                 if goal_ok:
                     # The final boundary-cell→terminal-edge segment is outside the lattice graph.
@@ -1754,7 +1760,10 @@ class AStarPlanner:
         # budget (the accept/deny frontier shifts by exactly the lane's steps).
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + ground_delay_steps(cfg)
+        # An itinerary's parked aircraft: the return may only hold on the ground while its pad stays
+        # clear, and the outbound only lands where the pad stays clear through the turnaround.
+        ground_max_step = parked_ground_max_step(req, ledger, cfg, base, base + ground_delay_steps(cfg))
+        hold_hits = landing_hold_hits(req, ledger, cfg, base, max_step, dwell_steps)
 
         # ---- box / window membership guard: else fall back to the reference ----
         if cocc.cell_id(oq, orr, 0) < 0 or max_step > cocc.MAXS:
@@ -1833,7 +1842,9 @@ class AStarPlanner:
             else:
                 for gi in range(n_gsteps):
                     for Lv in range(n_levels):
-                        land_ok[gi * n_levels + Lv] = svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
+                        land_ok[gi * n_levels + Lv] = (
+                            svc.pad_clear(gq, grr, base + gi, dwell_steps[Lv])
+                            and landing_hold_clear(hold_hits, base + gi, dwell_steps[Lv], req, cfg))
 
             # `gen` version-stamps BOTH the own-column overlay AND the kernel's open-addressing hash (its
             # O(1) reset — a slot whose stamp != `gen` is empty). The FB_MASK widen re-run therefore needs a

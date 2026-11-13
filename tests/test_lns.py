@@ -598,11 +598,10 @@ def test_repair_restores_the_ledger_on_denial_and_on_exception(monkeypatch):
     assert _ledger_multiset(res.ledger) == before
 
 
-def test_claim_index_excludes_the_flights_own_terminal_interior():
-    """The claim index must mirror what A* actually deconflicts against. Corridor cells inside the
-    flight's OWN terminal column are the vertiport's unreserved tactical interior — the occupancy
-    services drop them — so indexing them would make every pair of same-hub flights look mutually
-    contended, and the map-based operator picks its neighborhoods BY contention."""
+def test_claim_index_matches_occupancy_inside_the_flights_own_terminal_column():
+    """The claim index must mirror what A* deconflicts against, cell for cell — including corridor
+    cells inside the flight's OWN terminal column, which the ledger contends (two same-hub boxes
+    conflict) and the occupancy services therefore keep."""
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.planner import hexgrid as hg
     from freespace_sim.planner.astar.occupancy import HexOccupancyService
@@ -624,7 +623,7 @@ def test_claim_index_excludes_the_flights_own_terminal_interior():
     blocked = {cell for cells in svc.blocked.values() for cell in cells}
     assert set(state._claims) == blocked
 
-    naive = set()                           # what the index would hold without the own-column drop
+    rastered = set()                        # every blocked-strength cell of the corridor box
     for v in vols:
         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec):
             continue
@@ -632,8 +631,10 @@ def test_claim_index_excludes_the_flights_own_terminal_interior():
             v, cfg, state._R, state._infl_b, state._infl_p
         ):
             if in_blk:
-                naive.add((q, r, level))
-    assert naive - blocked, "no own-column cells here: this test would pass vacuously"
+                rastered.add((q, r, level))
+    assert rastered == blocked
+    inside = {c for c in rastered if np.hypot(*hg.hex_center(c[0], c[1], state._R)) <= 400.0}
+    assert inside, "no own-column cells here: this test would pass vacuously"
 
 
 def test_borrowed_repair_planner_keeps_its_own_eviction_floor():

@@ -185,6 +185,7 @@ def test_density_scenario_matrix(name, hubs, rates):
     assert demand.return_flights is True
     assert demand.turnaround_s is None          # inherits cfg.turnaround_s
     assert demand.timing_mode == "departure"
+    assert demand.walled_layout is True         # walls-off arms fly the walled world
 
 
 @pytest.mark.parametrize(

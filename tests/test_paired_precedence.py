@@ -144,16 +144,13 @@ def test_colgen_refuses_an_itinerary_rather_than_dropping_the_return():
         run_batch(scen, SimConfig(), None, None, (), None, None, None)
 
 
-def test_the_pad_hold_is_deconflicted_before_the_itinerary_is_accepted():
-    """The hold is built FROM both legs' results, so neither leg's search ever saw it.
-
-    Checking it in `_compose` keeps `FCFSMechanism.commit`'s re-check the no-op its docstring
-    promises, and matters most under LNS, whose commit path re-checks nothing at all.
-    """
+def test_the_pad_hold_is_deconflicted_by_the_search():
+    """The parked aircraft holds its pad from landing until the return's takeoff column clears, so
+    both legs' searches must see that hold: a blocker inside the turnaround is planned AROUND (the
+    trip still flies, later) instead of surfacing only after both legs exist, as a denial."""
     from freespace_sim.geometry import CylinderSpec
     from freespace_sim.ledger import ReservationLedger
     from freespace_sim.planner import get_planner
-    from freespace_sim.types import DenialReason
     from freespace_sim.volumes import Volume4D
 
     cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
@@ -167,16 +164,69 @@ def test_the_pad_hold_is_deconflicted_before_the_itinerary_is_accepted():
                 if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
     assert hold.t_end - hold.t_start > 10.0          # room for a blocker that clears both columns
 
-    # Strictly inside the turnaround gap: both columns stay clear, so both legs still plan exactly
-    # as before and the hold between them is the only thing that conflicts.
+    # Strictly inside the turnaround gap: both columns stay clear, so only the hold conflicts.
     mid = 0.5 * (hold.t_start + hold.t_end)
     led = ReservationLedger(cfg)
     led.commit(2, [Volume4D(CylinderSpec(cx=hold.shape.cx, cy=hold.shape.cy,
                                          radius=hold.shape.radius, z_lo=cfg.ground_level_m,
                                          z_hi=cfg.airspace_ceiling_m), mid - 5.0, mid + 5.0)])
     out = planner.plan(req, led, cfg)
-    assert not out.accepted
-    assert out.denial_reason is DenialReason.CONFLICT_FILED
+    assert out.accepted
+    assert not led.any_conflict(out.volumes)
+    assert out.cost > clean.cost
+
+
+@pytest.mark.parametrize("neighbour_dx, expect_capped", [(15.0, True), (40.0, False)])
+def test_a_parked_return_holds_on_the_ground_only_until_its_pad_is_needed(neighbour_dx, expect_capped):
+    """A return leg's ground hold keeps its aircraft parked, so it must end before the first committed
+    volume reaches the parked box — a neighbour landing whose pad overlaps it (15 m away), but not one
+    whose pad does not (40 m), nor anything that merely overflies."""
+    import math
+
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner.pad_hold import parked_ground_max_step
+    from freespace_sim.volumes import corridor_segment_volume, hover_reservation
+
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    led = ReservationLedger(cfg)
+    led.commit(2, [hover_reservation(CUST + vec(neighbour_dx, 0, 0), 200.0, cfg)])
+    led.commit(3, [corridor_segment_volume(CUST + vec(-200, 0, 75), 120.0, CUST + vec(200, 0, 75), 135.0, cfg)])
+    leg = FlightRequest(1, CUST, HUB, 0.0, t_departure=100.0, parked_since_s=80.0)
+    base, bound = 25, 25 + 900
+    got = parked_ground_max_step(leg, led, cfg, base, bound)
+    assert got == (math.floor(200.0 / cfg.dt_s) if expect_capped else bound)
+    assert parked_ground_max_step(replace(leg, parked_since_s=None), led, cfg, base, bound) == bound
+
+
+@pytest.mark.parametrize("retimes", [0, 3])
+def test_a_return_stuck_on_its_pad_re_times_the_outbound(monkeypatch, retimes):
+    """A parked return that can neither leave (traffic crosses over its pad until after T) nor stay (a
+    neighbour lands beside it at T) cannot be fixed by the return alone; the itinerary re-times the
+    outbound to keep the pad clear as long as the return needs, instead of denying the trip."""
+    from freespace_sim.geometry import CylinderSpec
+    from freespace_sim.ledger import ReservationLedger
+    from freespace_sim.planner import get_planner
+    from freespace_sim.planner import itinerary
+    from freespace_sim.volumes import corridor_segment_volume, hover_reservation
+
+    monkeypatch.setattr(itinerary, "_MAX_RETIMES", retimes)
+    cfg = SimConfig(flight_levels_m=(75.0,), airspace_ceiling_m=125.0)
+    req = FlightRequest(1, HUB, CUST, 0.0, return_to_origin=True, turnaround_s=60.0)
+    planner = get_planner("astar")
+    clean = planner.plan(req, ReservationLedger(cfg), cfg)
+    top = cfg.ground_level_m + cfg.ground_box_height_m
+    hold = next(v for v in clean.volumes
+                if isinstance(v.shape, CylinderSpec) and v.shape.z_hi <= top + 1e-9)
+
+    T = hold.t_end + 20.0
+    led = ReservationLedger(cfg)
+    led.commit(2, [hover_reservation(CUST + vec(15, 0, 0), T, cfg)])
+    led.commit(3, [corridor_segment_volume(CUST + vec(-300, 0, 75), hold.t_end - 10.0,
+                                           CUST + vec(300, 0, 75), T + 60.0, cfg)])
+    out = planner.plan(req, led, cfg)
+    assert out.accepted is (retimes > 0)                   # without re-timing the trip is denied
+    if out.accepted:
+        assert not led.any_conflict(out.volumes)
 
 
 def test_the_pad_hold_is_not_denied_by_its_own_terminals_permanent_wall():

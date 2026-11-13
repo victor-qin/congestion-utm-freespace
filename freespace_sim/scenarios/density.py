@@ -150,6 +150,9 @@ def _density_scenario(
             departure_offset_s=departure_offset_s,
             timing_mode="departure",
             request_clock_offset_s=request_clock_offset_s,
+            # The world stays the walled one when the walls are switched off, so an on/off run pair
+            # flies the same hubs and requests.
+            walled_layout=True,
         ),
     )
 

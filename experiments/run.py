@@ -208,6 +208,8 @@ def spec_from_args(args):
         demand["return_flights"] = args.return_flights
     if args.turnaround is not None:
         demand["turnaround_s"] = args.turnaround
+    if args.walled_layout is not None:
+        demand["walled_layout"] = args.walled_layout
 
     return with_overrides(spec, demand_overrides=demand or None, **top)
 
@@ -251,6 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--return-flights", action=argparse.BooleanOptionalAction, default=None,
                    help="emit a return flight to the origin pad for each delivery")
     p.add_argument("--turnaround", type=float, default=None, help="return-flight turnaround (s)")
+    p.add_argument("--walled-layout", action=argparse.BooleanOptionalAction, default=None,
+                   help="hub_radius: space hubs and filter customers for permanent terminal walls even "
+                        "when the walls are off (density_* scenarios pin this on, so toggling "
+                        "--terminal-airspace-always-active keeps the same world)")
     p.add_argument("--tag", default=None, help="run-folder label + index join key (default: scenario name)")
     p.add_argument("--window-frac", type=float, default=0.9,
                    help="steady-state plateau threshold: measure where airborne density ≥ frac×peak "

@@ -57,6 +57,7 @@ from ..astar.compiled_hex_occupancy import (
     ground_delay_steps,
     search_horizon,
 )
+from ..pad_hold import landing_hold_clear, landing_hold_hits, parked_ground_max_step
 from ..astar.planner import _BBOX_HUGE, _BindBatch, _absorb, _committed_arrival
 
 _EPS = 1e-6
@@ -168,11 +169,9 @@ class SafeIntervalIndex:
         - output (None): updates ``corr``/``cols``; in removal mode, appends the flight's journal.
         """
         hg.prepare_range_cache_for_commit(volumes)
-        own_cols = tuple((v.shape.cx, v.shape.cy, v.shape.radius) for v in volumes
-                         if v.terminal_id is not None and isinstance(v.shape, CylinderSpec))
         rows = [] if self.track_removal else None
         for v in volumes:
-            self._add(v, own_cols, rows)
+            self._add(v, rows)
         self.n_added += len(volumes)
         if self.track_removal:
             entry = self._rows.get(flight_id)
@@ -184,30 +183,14 @@ class SafeIntervalIndex:
                 # yields a SECOND group for any fid whose volumes are non-contiguous in the ledger.
                 entry.extend(rows)
 
-    def _inside_a_column(self, q, r, cols) -> bool:
-        """True if hex ``(q, r)``'s center lies inside any ``(cx, cy, radius)`` column disc.
-
-        Parameters
-        ------------
-        - q (int): axial q of the hex to test.
-        - r (int): axial r of the hex to test.
-        - cols (Iterable[tuple]): candidate column discs as ``(cx, cy, radius)`` in ENU.
-
-        Return
-        --------
-        - output (bool): True if the hex centre falls within any disc.
-        """
-        c = hg.hex_center(q, r, self.R)
-        return any((c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad for cx, cy, rad in cols)
-
-    def _add(self, vol, own_cols, _rows=None) -> None:
-        """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode).
+    def _add(self, vol, _rows=None) -> None:
+        """Rasterize one volume into ``corr``/``cols`` (and the journal in removal mode). Every
+        corridor cell is kept, its own hub's interior included, as in
+        ``HexOccupancyService.add_volume``.
 
         Parameters
         ------------
         - vol (Volume): one committed volume (corridor or terminal column) to rasterize.
-        - own_cols (Sequence[tuple]): the committing flight's own column discs ``(cx, cy, radius)``;
-          a corridor cell inside one is skipped (own terminal interior is passable).
         - _rows (array | None): removal-mode journal to extend with flat int64 4-slot rows; ``None``
           in set mode.
 
@@ -241,8 +224,8 @@ class SafeIntervalIndex:
                     d = self.cols.setdefault(cell, {})
                     for s in range(s_lo, s_hi + 1):
                         d.setdefault(s, set()).add(tid)
-            elif not (own_cols and self._inside_a_column(q, r, own_cols)):
-                if track:                                       # (skip own terminal interior)
+            else:
+                if track:
                     cell, cid = self._intern(cell)
                     _rows += (cid, s_lo, s_hi, -1)
                     d = self.corr.setdefault(cell, {})
@@ -828,7 +811,9 @@ class SIPPPlanner(AStarPlanner):
                       if cfg.n_levels > 1 else 0)      # extra step budget for mid-route rungs
         max_step = search_horizon(base, max(takeoff_steps) + max((ln.steps for ln in o_lanes), default=0),
                                   n_hops, climb_span, cfg)
-        ground_max_step = base + ground_delay_steps(cfg)
+        # An itinerary's parked aircraft (see `planner.pad_hold`), as in `AStarPlanner._plan_reference`.
+        ground_max_step = parked_ground_max_step(req, ledger, cfg, base, base + ground_delay_steps(cfg))
+        hold_hits = landing_hold_hits(req, ledger, cfg, base, max_step, dwell_steps)
 
         SI = _SafeIntervals(sidx, own, base, max_step, fixed_lanes)
         came: dict = {}
@@ -847,7 +832,8 @@ class SIPPPlanner(AStarPlanner):
             if d_term is not None:
                 arr = _committed_arrival(st, came, R, dt, cfg, origin, dest, o_term, d_term)
                 return tcap.dwell_ok(d_term, dest, arr, d_cap, origin, levels[L])
-            return svc.pad_clear(gq, grr, s, dwell_steps[L])
+            return (svc.pad_clear(gq, grr, s, dwell_steps[L])
+                    and landing_hold_clear(hold_hits, s, dwell_steps[L], req, cfg))
 
         # ---- cost-aware safe-interval search; AS = ("g"/"a", q, r, step), A*-shaped ----
         start = ("g", oq, orr, base)
@@ -1228,7 +1214,8 @@ class SIPPPlanner(AStarPlanner):
         # spans [base, base + ground_delay_steps] and the landing runs span [base, max_step];
         # rebuilding the latter per iteration is ~12k Python `tcap.dwell_ok` calls for a value that
         # cannot change. ----
-        smax = base + ground_delay_steps(cfg)
+        smax = parked_ground_max_step(req, ledger, cfg, base, base + ground_delay_steps(cfg))
+        hold_hits = landing_hold_hits(req, ledger, cfg, base, max_step, dwell_steps)
         n_to = smax - base + 1                                 # ground-delay steps; to_ok is per (step, level)
         to_ok = []                                             # flat mask, indexed [si*nlev + L]
         if fixed and o_term is not None:
@@ -1246,7 +1233,8 @@ class SIPPPlanner(AStarPlanner):
                 return tcap.dwell_ok(d_term, dest, s_ * dt, d_cap, z=levels[L])
         else:                                                  # single dest hex; pad-clear landing
             def _land(s_, L):
-                return svc.pad_clear(gq, grr, s_, dwell_steps[L])
+                return (svc.pad_clear(gq, grr, s_, dwell_steps[L])
+                        and landing_hold_clear(hold_hits, s_, dwell_steps[L], req, cfg))
         lf_lo, lf_hi, lf_off = [], [], [0]                     # per-level landing runs, concatenated
         for L in range(nlev):
             lo = -1

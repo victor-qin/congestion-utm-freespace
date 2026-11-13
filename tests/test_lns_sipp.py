@@ -250,8 +250,8 @@ def test_sipp_reference_arms_the_blocked_map():
 
     * `incremental_release=True`, so `blocked` holds REFCOUNTS. With the default set-valued map a
       replay that added every volume twice is idempotent and invisible.
-    * TERMINAL flights, so `own_cols` is non-empty and `enable_blocked`'s own-column skip is
-      actually exercised. Point-to-point requests make that branch a no-op.
+    * TERMINAL flights, so hub-tagged corridor boxes and columns are replayed, not just plain
+      corridors.
     * a comparator built `maintain_blocked=True` from construction — NOT another compiled
       SIPPPlanner, whose service is also built with the map off and would be filled by the very same
       replay, comparing `enable_blocked` against itself.

@@ -223,6 +223,18 @@ def test_terminal_airspace_filter_drops_foreign_column_customers():
     # and the filter actually dropped some flights: fid advances on a drop, so kept fids have gaps
     assert reqs and len(reqs) < max(r.flight_id for r in reqs) + 1
 
+    # walled_layout=True keeps this exact world with the walls OFF, so a walls-on/off pair is paired
+    # flight for flight; pinning the layout off while the walls are on is refused.
+    off = dc.replace(cfg, terminal_airspace_always_active=False)
+    walled = dc.replace(dm, walled_layout=True)
+    off_hubs = walled.place_hubs(off, np.random.default_rng(dm.hub_seed))
+    assert all(np.array_equal(hubs[u], off_hubs[u]) for u in hubs)
+    off_reqs = walled.generate(off, np.random.default_rng(0))
+    assert [(r.flight_id, tuple(r.origin), tuple(r.dest), r.t_request, r.t_departure) for r in off_reqs] == \
+        [(r.flight_id, tuple(r.origin), tuple(r.dest), r.t_request, r.t_departure) for r in reqs]
+    with pytest.raises(ValueError, match="walled_layout"):
+        dc.replace(dm, walled_layout=False).generate(cfg, np.random.default_rng(0))
+
 
 def test_radius_demand_run_verified_astar():
     cfg = SimConfig(planner="astar", region_size_m=(8000.0, 8000.0),

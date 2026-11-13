@@ -914,60 +914,6 @@ _RANGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _RANGE_CACHE_MIN_CAP = 1024
 _RANGE_CACHE_CAP = 1024
 
-_COL_HEX_CACHE: "OrderedDict[tuple, frozenset]" = OrderedDict()
-# Sized like `_RANGE_CACHE` and for the same reason. The key is `(cols, R)` and `cols` comes from a
-# flight's own terminal CYLINDERS, so with hub-radius demand it is really per-HUB — hundreds of
-# distinct hubs; a smaller cap thrashes. An entry is ~50 hexes. Undershooting silently loses
-# the sharing, so this errs high.
-_COL_HEX_CACHE_CAP = 1024
-# Unsynchronized, exactly like `_RANGE_CACHE`: the parallel LNS path SPAWNS processes, so each has
-# its own copy and there is no cross-thread reader to race with.
-
-
-def column_hexes(cols: tuple, R: float) -> frozenset:
-    """Axial hexes whose CENTRE lies inside any ``(cx, cy, radius)`` disc in ``cols``.
-
-    Four consumers ask "is this cell inside the committing flight's own terminal column?" — the two
-    occupancy images, ``HexOccupancyService.enable_blocked``'s re-derive, and the LNS claim index —
-    and the answer depends only on ``(cols, R)``, both constant for a flight, so it is resolved once
-    per flight and shared instead of recomputed per rasterized cell.
-
-    Exact by construction, not by approximation: the set is built with the SAME ``hex_center`` and the
-    SAME ``<=`` comparison the per-cell test uses, and ``_hexes_in_box`` yields a SUPERSET
-    of the hexes whose centres could lie in a box — so every centre within ``rad`` of a disc centre,
-    which necessarily lies in that disc's AABB, is enumerated.
-
-    Parameters
-    ------------
-    - cols (tuple): the flight's terminal discs as ``(cx, cy, radius)`` tuples.
-    - R (float): hex circumradius (m).
-
-    Return
-    --------
-    - output (frozenset): the axial ``(q, r)`` cells whose centre lies inside any disc (empty when
-      ``cols`` is empty).
-    """
-    if not cols:
-        return frozenset()
-    key = (cols, R)
-    hit = _COL_HEX_CACHE.get(key)
-    if hit is not None:
-        _COL_HEX_CACHE.move_to_end(key)
-        return hit
-    out = set()
-    for cx, cy, rad in cols:
-        for q, r in _hexes_in_box((cx - rad, cy - rad), (cx + rad, cy + rad), R):
-            c = hex_center(q, r, R)
-            if (c[0] - cx) ** 2 + (c[1] - cy) ** 2 <= rad * rad:
-                out.add((q, r))
-    res = frozenset(out)
-    _COL_HEX_CACHE[key] = res
-    _COL_HEX_CACHE.move_to_end(key)
-    if len(_COL_HEX_CACHE) > _COL_HEX_CACHE_CAP:
-        _COL_HEX_CACHE.popitem(last=False)
-    return res
-
-
 def prepare_range_cache_for_commit(volumes) -> None:
     """Size the shared raster cache for one synchronous ledger commit.
 

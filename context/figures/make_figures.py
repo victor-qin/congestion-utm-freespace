@@ -1604,6 +1604,294 @@ def fig_cpu_preparation_builders() -> None:
     _save(fig, "cpu_builder_solver")
 
 
+FIX_CASES = f"{OUT}/occupancy_fix_cases_data.json"
+
+
+def _fix_case(key: str) -> dict:
+    """One recorded denial from :data:`FIX_CASES` (written by the PR #153 replay probes)."""
+    import json
+
+    with open(FIX_CASES) as f:
+        return json.load(f)[key]
+
+
+def _footprint(ax, c, ext, rot, **kw) -> None:
+    """Draw an oriented box's ground footprint: ``c`` centre (xy), ``ext`` full (L, W, H), ``rot`` row-major 3x3."""
+    m = np.asarray(rot, float).reshape(3, 3)[:2, :2]
+    hl, hw = ext[0] / 2.0, ext[1] / 2.0
+    corners = [np.asarray(c[:2]) + m @ np.array(p) for p in ((hl, hw), (-hl, hw), (-hl, -hw), (hl, -hw))]
+    ax.add_patch(Polygon(corners, closed=True, **kw))
+
+
+def _hex_lattice(ax, anchor, R: float, xlim, ylim) -> None:
+    """Faint pointy-top hex lattice through ``anchor`` (any cell centre) covering the view."""
+    a, b = np.array([R * SQRT3, 0.0]), np.array([R * SQRT3 / 2.0, 1.5 * R])
+    n = int(max(xlim[1] - xlim[0], ylim[1] - ylim[0]) / R) + 4
+    for i in range(-n, n + 1):
+        for j in range(-n, n + 1):
+            x, y = np.asarray(anchor) + i * a + j * b
+            if xlim[0] - R <= x <= xlim[1] + R and ylim[0] - R <= y <= ylim[1] + R:
+                ax.add_patch(RegularPolygon((x, y), 6, radius=R, orientation=0, fc="none",
+                                            ec=HEXGRID, lw=0.6, zorder=0))
+
+
+def _path(ax, boxes, color, hop: float, lw=2.2) -> None:
+    """A flight's corridor: faint box footprints plus its centreline through the hop vertices (cell centres).
+
+    Each box spans one hop of length ``hop`` along its local x axis, so its endpoints are ``c ± hop/2·u``;
+    consecutive boxes share an endpoint, which orders the chain.
+    """
+    boxes = sorted(boxes, key=lambda b: b["t"][0])
+    for b in boxes:
+        _footprint(ax, b["c"], b["ext"], b["rot"], fc=color, ec=color, alpha=0.13, lw=0.8, zorder=2)
+    ends = []
+    for b in boxes:
+        u = np.asarray(b["rot"], float).reshape(3, 3)[:2, 0] * hop / 2.0
+        ends.append((np.asarray(b["c"][:2]) - u, np.asarray(b["c"][:2]) + u))
+    a0, b0 = ends[0]
+    if len(ends) > 1 and min(np.hypot(*(a0 - e)) for e in ends[1]) < min(np.hypot(*(b0 - e)) for e in ends[1]):
+        a0, b0 = b0, a0
+    pts = [a0, b0]
+    for a, b in ends[1:]:
+        pts.append(b if np.hypot(*(a - pts[-1])) < np.hypot(*(b - pts[-1])) else a)
+    xy = np.array(pts)
+    ax.plot(xy[:, 0], xy[:, 1], color=color, lw=lw, zorder=4, solid_capstyle="round")
+    ax.annotate("", xy=xy[-1], xytext=xy[-2], arrowprops=dict(arrowstyle="-|>", color=color, lw=lw), zorder=4)
+
+
+def fig_fix_own_column_interior() -> None:
+    """PR #153 fix 1 (astar occupancy.add_volume): a committed corridor inside its OWN hub column stays blocked.
+
+    Real case: density_future_wing_zipline, walls off, seed 0, flight 11755 vs 5035 — the first flight
+    whose outcome differs between the pre-fix and fixed runs, so both panels plan against the same traffic.
+    """
+    d = _fix_case("interior")
+    R, xlim, ylim = d["R"], (-470, 330), (-640, 330)
+    hop = R * SQRT3
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 7.9), sharex=True, sharey=True)
+    for ax, after in zip(axes, (False, True)):
+        ax.set_aspect("equal")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+        _hex_lattice(ax, d["cells"][0]["xy"], R, xlim, ylim)
+        ax.add_patch(Circle((0, 0), d["hub_radius"], fc="#f7fafc", ec=INK, lw=1.4, ls="--", zorder=1))
+        ax.text(d["hub_radius"] + 8, 30, f"hub column\nr = {d['hub_radius']:.0f} m", fontsize=8.5, color=INK,
+                zorder=6)
+        for c in d["cells"]:
+            if c["dropped"] and not after:
+                ax.add_patch(RegularPolygon(c["xy"], 6, radius=R, orientation=0, fc="white", ec=RED, lw=1.3,
+                                            hatch="///", zorder=1.5))
+            else:
+                ax.add_patch(RegularPolygon(c["xy"], 6, radius=R, orientation=0, fc="#bee3f8", ec=BLUE, lw=0.9,
+                                            zorder=1.5))
+        mine, color = (d["b_new"], GREEN) if after else (d["b_old"], ORANGE)
+        for xy in d["b_new_cells"] if after else d["b_old_cells"]:
+            ax.add_patch(RegularPolygon(xy, 6, radius=R * 0.93, orientation=0, fc="none", ec=color, lw=1.4,
+                                        ls="--", zorder=3))
+        _path(ax, d["a_boxes"], BLUE, hop)
+        _path(ax, mine, color, hop)
+        ax.plot([0], [0], "o", color=INK, ms=4, zorder=5)
+        ax.set_xlabel("x from hub centre (m)")
+        ax.spines[["top", "right"]].set_visible(False)
+    axes[0].set_ylabel("y from hub centre (m)")
+    hit = d["b_old_collide"][0]["xy"]
+    axes[0].plot(*hit, "X", color=RED, ms=16, mec="white", mew=1.2, zorder=7)
+    axes[0].annotate(f"both claim this cell in the\nsame steps: the ledger\nrejects {d['b']} (conflict_filed)",
+                     xy=hit, xytext=(hit[0] + 140, hit[1] - 150), fontsize=9, color=RED, weight="bold",
+                     arrowprops=dict(arrowstyle="->", color=RED, lw=1.2), zorder=7)
+    caps = (f"{d['a']} leaves by its lane, then cuts back across its own column.\n"
+            f"Its cells inside that column were dropped from occupancy\n(hatched), so A* routed {d['b']} through one.",
+            "Every committed cell is kept, inside the column too. On the\n"
+            f"same traffic, {d['b']} now leaves by another lane and shares\nno cell with {d['a']}.")
+    for ax, cap, title, col in zip(axes, caps, ("Before: interior cells dropped → conflict_filed",
+                                                "After: interior cells blocked → planned around"), (RED, GREEN)):
+        ax.set_title(title, fontsize=11.5, weight="bold", loc="left", color=col, pad=52)
+        ax.text(0, 1.015, cap, transform=ax.transAxes, fontsize=8.8, va="bottom", color=INK)
+    handles = [Rectangle((0, 0), 1, 1, fc="#bee3f8", ec=BLUE, label=f"cell blocked by {d['a']}"),
+               Rectangle((0, 0), 1, 1, fc="white", ec=RED, hatch="///", label="cell dropped by old code"),
+               Rectangle((0, 0), 1, 1, fc="none", ec=INK, ls="--", label=f"cell {d['b']} claims"),
+               plt.Line2D([], [], color=BLUE, lw=2.2, label=f"flight {d['a']} (committed first)"),
+               plt.Line2D([], [], color=ORANGE, lw=2.2, label=f"flight {d['b']}, old plan"),
+               plt.Line2D([], [], color=GREEN, lw=2.2, label=f"flight {d['b']}, fixed plan")]
+    fig.legend(handles=handles, loc="lower center", ncol=6, fontsize=8.6, frameon=False, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle(f"Fix 1 — a corridor inside its own hub column was invisible to other flights "
+                 f"(future density, walls off, seed 0; both leave the hub at t = {d['hub_t'][0]:.0f} s, "
+                 f"corridors shown for t = {d['window'][0]:.0f}–{d['window'][1]:.0f} s)", fontsize=10, y=0.995)
+    fig.tight_layout(rect=(0, 0.045, 1, 0.975))
+    _save(fig, "fix_own_column_interior")
+
+
+def _pad_bar(ax, y: float, t0: float, t1: float, kind: str, color, *, ghost=False, hatch=None) -> None:
+    """One pad reservation on a timeline row: a tall bar for a full-height column, a short one for a
+    parked ground box, so bar height mirrors the reserved altitude band."""
+    h = 0.62 if kind == "column" else 0.26
+    if ghost:
+        ax.add_patch(Rectangle((t0, y - h / 2), t1 - t0, h, fc="none", ec=GRID, lw=1.1, ls="--", zorder=2))
+        return
+    ax.add_patch(Rectangle((t0, y - h / 2), t1 - t0, h, fc=color, alpha=0.95 if kind == "column" else 0.38,
+                           ec=color, lw=1.0, hatch=hatch, zorder=3))
+
+
+def _pad_axes(ax, xlim, labels, title: str, title_color, caption: str) -> None:
+    """Shared timeline frame for the pad figures: two rows, time axis, title + caption above."""
+    ax.set_xlim(*xlim)
+    ax.set_ylim(-0.6, 1.6)
+    ax.set_yticks([0, 1], labels, fontsize=9)
+    ax.set_xlabel("time (s)")
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    ax.grid(axis="x", color=HEXGRID, lw=0.6)
+    ax.set_title(title, fontsize=11.5, weight="bold", loc="left", color=title_color, pad=40)
+    ax.text(0, 1.02, caption, transform=ax.transAxes, fontsize=8.8, va="bottom", color=INK)
+
+
+def fig_fix_parked_aircraft_pad() -> None:
+    """PR #153 fix 2a (astar occupancy.add_volume): a parked aircraft's full-height twin enters ``pad``.
+
+    Real case: density_future_wing_zipline, walls on, seed 0, flight 10645 vs 8397. Both panels plan
+    10645 against the SAME ledger (a replay stopped at 10645), once with the old and once with the PR code.
+    """
+    d = _fix_case("parked")
+    R, ox = d["R"], d["other_xy"]
+    fig = plt.figure(figsize=(13.0, 9.0))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.35, 1.0], hspace=0.32, wspace=0.18)
+    other_park = next(r for r in d["other_rows"] if r[2] == "parked")
+    for col, after in enumerate((False, True)):
+        me = GREEN if after else ORANGE
+        ax = fig.add_subplot(gs[0, col])
+        lim = (-150, 150)
+        ax.set_aspect("equal")
+        ax.set_xlim(*lim)
+        ax.set_ylim(-118, 118)
+        _hex_lattice(ax, d["dest_cell"], R, lim, lim)
+        if after:
+            for xy in d["twin_cells"]:
+                ax.add_patch(RegularPolygon(xy, 6, radius=R, orientation=0, fc="#c6f6d5", ec=GREEN, lw=1.0,
+                                            zorder=1))
+        ax.add_patch(RegularPolygon(d["dest_cell"], 6, radius=R * 0.97, orientation=0, fc="none",
+                                    ec=RED if after else ORANGE, lw=2.0, ls="-" if after else "--", zorder=2))
+        ax.add_patch(Circle(ox, d["hover_r"], fc=BLUE, alpha=0.55, ec=BLUE, zorder=4))
+        ax.add_patch(Circle((0, 0), d["hover_r"], fc=me, alpha=0.75, ec=me, zorder=4))
+        ax.plot([0, ox[0]], [0, ox[1]], color=INK, lw=0.9, zorder=5)
+        ax.text(ox[0] + 14, ox[1] + 6, f"{d['other']} parked\n(0–5 m ground box)", fontsize=8.5, color=BLUE, zorder=6)
+        ax.text(-14, -14, f"{d['fid']} lands\nhere", fontsize=8.5, color=me, ha="right", va="top", zorder=6)
+        ax.text(ox[0] + 4, ox[1] - 16, f"{d['dist']:.1f} m apart", fontsize=8, color=INK, zorder=6)
+        ax.text(d["dest_cell"][0], d["dest_cell"][1] - R * 0.78,
+                "pad_clear: blocked while parked" if after else "pad_clear: clear (map empty)",
+                fontsize=8.5, ha="center", color=RED if after else ORANGE, weight="bold", zorder=6,
+                bbox=dict(fc="white", ec="none", alpha=0.85, pad=1.5))
+        ax.set_xlabel("x from landing pad (m)")
+        ax.spines[["top", "right"]].set_visible(False)
+        if col == 0:
+            ax.set_ylabel("y from landing pad (m)")
+        title, color = (("Before: parked aircraft not in the pad map → conflict_filed", RED) if not after else
+                        ("After: its full-height twin marks the pad map → waits", GREEN))
+        cap = (f"{d['other']}'s ground box sits below every flight level, so the level rasterizer dropped\n"
+               f"it: the pad map stayed empty and {d['fid']}'s landing cell looked clear." if not after else
+               "The ground box's full-height twin enters the pad map only (cruise may\n"
+               f"still overfly), so {d['fid']}'s landing cell is blocked while {d['other']} is parked.")
+        ax.set_title(title, fontsize=11.5, weight="bold", loc="left", color=color, pad=40)
+        ax.text(0, 1.02, cap, transform=ax.transAxes, fontsize=8.8, va="bottom", color=INK)
+
+        tl = fig.add_subplot(gs[1, col])
+        xlim = (other_park[0] - 60, d["new_rows"][-1][1] + 30)
+        for t0, t1, kind in d["other_rows"]:
+            _pad_bar(tl, 1, t0, t1, kind, BLUE)
+        if after:
+            for t0, t1, kind in d["old_rows"]:
+                _pad_bar(tl, 0, t0, t1, kind, me, ghost=True)
+            tl.text(d["old_rows"][0][0], 0.36, "old landing", fontsize=8, color=GRID, va="bottom")
+        for t0, t1, kind in (d["new_rows"] if after else d["old_rows"]):
+            _pad_bar(tl, 0, t0, t1, kind, me)
+        if not after:
+            a, b = max(d["old_hit"][0], other_park[0]), min(d["old_hit"][1], other_park[1])
+            tl.axvspan(a, b, color=RED, alpha=0.18, zorder=1)
+            tl.text((a + b) / 2, 1.45, "overlap → ledger: conflict_filed", fontsize=9, color=RED, ha="center",
+                    weight="bold")
+        else:
+            tl.text(d["new_rows"][-1][1], -0.42, f"lands after {d['other']} leaves: the outbound waits "
+                    f"{d['new_out_ground']:.0f} s at its hub (was {d['old_out_ground']:.0f} s)", fontsize=8.6,
+                    color=me, ha="right", va="top")
+        tl.set_xlim(*xlim)
+        tl.set_ylim(-0.75, 1.7)
+        tl.set_yticks([0, 1], [f"{d['fid']} at its pad", f"{d['other']}, {d['dist']:.1f} m away"], fontsize=9)
+        tl.set_xlabel("time (s)")
+        tl.spines[["top", "right", "left"]].set_visible(False)
+        tl.tick_params(axis="y", length=0)
+        tl.grid(axis="x", color=HEXGRID, lw=0.6)
+    handles = [Rectangle((0, 0), 1, 1, fc=INK, label="full-height column (descent / climb)"),
+               Rectangle((0, 0), 1, 1, fc=INK, alpha=0.38, label="parked ground box"),
+               Rectangle((0, 0), 1, 1, fc="#c6f6d5", ec=GREEN, label="pad-map cells from the twin"),
+               Rectangle((0, 0), 1, 1, fc="none", ec=GRID, ls="--", label="old plan (for reference)")]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8.8, frameon=False, bbox_to_anchor=(0.5, 0.0))
+    fig.suptitle("Fix 2 — an aircraft parked between legs was invisible to landings "
+                 "(future density, walls on, seed 0; same committed traffic in both panels)", fontsize=10, y=0.995)
+    fig.subplots_adjust(top=0.875, bottom=0.085, left=0.08, right=0.98)
+    _save(fig, "fix_parked_aircraft_pad")
+
+
+def fig_fix_return_ground_hold() -> None:
+    """PR #153 fixes 2b + 3 (planner/pad_hold.py, ItineraryPlanner.plan): a return may only hold on the
+    ground until traffic reaches its pad; a return that can neither leave nor stay re-times the outbound.
+
+    Real case: density_future_wing_zipline_amazon, walls off, seed 0, flight 9158 vs 13985, both panels
+    planned against the SAME ledger (a replay stopped at 9158).
+    """
+    d = _fix_case("ground_hold")
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.9), sharey=True)
+    xlim = (d["old_rows"][0][0] - 40, d["new_rows"][-1][1] + 30)
+    labels = [f"{d['fid']} at its pad", f"{d['other']}, {d['dist']:.1f} m away"]
+    land, park, climb = d["old_rows"]
+    turn_end = park[0] + d["turnaround"]
+    caps = (f"{d['fid']} lands, but its return cannot climb out (the air above the pad is busy), so\nit "
+            f"waits {d['old_return_ground']:.0f} s on the ground. No search checked that it was still parked when "
+            f"{d['other']}\nlanded next to it, so the itinerary check rejects the whole trip.",
+            f"The return may hold only until ground traffic first reaches its pad (t = {d['first_hit']:.0f} s), so "
+            f"it\nfails ({d['attempt1_return']}). The itinerary re-times the outbound to keep the pad clear\n"
+            f"{d['retime_hold']:.0f} s: it leaves the hub at t = {d['new_out_dep']:.0f} s, not "
+            f"{d['old_out_dep']:.0f} s, and the trip flies.")
+    titles = (("Before: ground hold ran into a neighbour → conflict_filed", RED),
+              ("After: hold capped, outbound re-timed → accepted", GREEN))
+    for ax, after, cap, (title, tc) in zip(axes, (False, True), caps, titles):
+        _pad_axes(ax, xlim, labels, title, tc, cap)
+        for t0, t1, kind in d["other_rows"]:
+            _pad_bar(ax, 1, t0, t1, kind, BLUE)
+        if not after:
+            _pad_bar(ax, 0, *land[:2], "column", ORANGE)
+            _pad_bar(ax, 0, park[0], turn_end, "parked", ORANGE)
+            _pad_bar(ax, 0, turn_end, park[1], "parked", ORANGE, hatch="///")
+            _pad_bar(ax, 0, *climb[:2], "column", ORANGE)
+            ax.text((turn_end + park[1]) / 2, -0.32, f"return's ground hold, {d['old_return_ground']:.0f} s",
+                    fontsize=8.5, color=ORANGE, ha="center", va="top")
+            a, b = d["other_rows"][0][0], d["other_rows"][-1][1]
+            ax.axvspan(a, b, color=RED, alpha=0.16, zorder=1)
+            ax.text((a + b) / 2, 1.45, "still parked → conflict_filed", fontsize=9, color=RED, ha="center",
+                    weight="bold")
+        else:
+            _pad_bar(ax, 0, *land[:2], "column", GREEN, ghost=True)
+            _pad_bar(ax, 0, park[0], d["first_hit"], "parked", GREEN, ghost=True)
+            ax.axvline(d["first_hit"], color=RED, lw=1.4, ls=":", zorder=4)
+            ax.text(d["first_hit"] + 4, -0.32, "hold cap: return\ncannot leave in time", fontsize=8, color=RED,
+                    va="top")
+            nl, npk, nc = d["new_rows"]
+            _pad_bar(ax, 0, *nl[:2], "column", GREEN)
+            _pad_bar(ax, 0, npk[0], npk[0] + d["turnaround"], "parked", GREEN)
+            _pad_bar(ax, 0, npk[0] + d["turnaround"], npk[1], "parked", GREEN, hatch="///")
+            _pad_bar(ax, 0, *nc[:2], "column", GREEN)
+            ax.text(nl[0] - 6, 0.42, "re-timed\ntrip", fontsize=8.5, color=GREEN, ha="right", va="bottom")
+            ax.text(land[0], 0.42, "first attempt", fontsize=8, color=GRID, va="bottom")
+    handles = [Rectangle((0, 0), 1, 1, fc=INK, label="full-height column (descent / climb)"),
+               Rectangle((0, 0), 1, 1, fc=INK, alpha=0.38, label="parked: turnaround"),
+               Rectangle((0, 0), 1, 1, fc=INK, alpha=0.38, hatch="///", label="parked: return's ground hold"),
+               Rectangle((0, 0), 1, 1, fc="none", ec=GRID, ls="--", label="first attempt (rejected)")]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8.8, frameon=False, bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle("Fix 3 — a return's ground hold kept its aircraft parked into another flight's landing "
+                 "(future density + Amazon, walls off, seed 0; same committed traffic in both panels)",
+                 fontsize=10, y=0.995)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.97))
+    _save(fig, "fix_return_ground_hold")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,
@@ -1615,6 +1903,7 @@ FIGURES = (
     fig_od_hop_ellipse, fig_pricing_dag, fig_label_dp_dominance, fig_completion_envelope,
     fig_cg_loop, fig_pricing_pool_schedule, fig_pricing_pool_tail_stealing,
     fig_colgen_certificate_reuse,
+    fig_fix_own_column_interior, fig_fix_parked_aircraft_pad, fig_fix_return_ground_hold,
 )
 
 

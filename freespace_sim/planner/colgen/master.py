@@ -11,10 +11,12 @@ from __future__ import annotations
 import math
 import operator
 import os
+import sys
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -113,16 +115,55 @@ def _env_int(name: str, default: int) -> int:
         ) from exc
 
 
-def gurobi_threads() -> int:
-    """``Threads`` for the master's Gurobi model, one by default.
+# Fastest master-LP thread counts measured (barrier replay of one run's LPs, rounds 2-21): 12 on
+# the Mac (Apple silicon; 16 and 20 are ~1.2x slower), 32 on a 48-core SuperCloud node (24-48
+# within 5%; 64 and 96, i.e. hyperthreads, 1.1-1.2x slower). 32 is also Gurobi's own ceiling.
+_GUROBI_THREAD_CAP = 12 if sys.platform == "darwin" else 32
+# Fewer cores than this run ONE thread: exactly 2 threads makes the IP reproducibly ~10% worse.
+_MIN_THREADED_CORES = 4
+_SYSFS_CPU = Path("/sys/devices/system/cpu")
 
-    Reported in ``stats`` because it is answer-affecting and lives in an environment variable
-    nothing else writes down, so an archived run that omits it cannot be compared with one
-    that ran at a different count. 4/8/16 threads return an identical objective and 1 is fine,
-    but 2 is reproducibly ~10% worse.
+
+def _available_cores() -> int:
+    """Physical cores this process may run on: its affinity mask (a Slurm job's grant), not the node.
+
+    Counts cores, not hyperthreads, because a second thread per core slowed the barrier on
+    SuperCloud. ``os.cpu_count()`` would count the whole node, so a 4-core job on a 48-core
+    node would oversubscribe its grant -- which is exactly what Gurobi's own ``Threads=0``
+    does (32 threads on a 4-core job ran the largest LP 4.4x slower).
     """
 
-    return _env_int("COLGEN_GUROBI_THREADS", 1)
+    try:
+        allowed = os.sched_getaffinity(0)
+    except AttributeError:  # macOS: no affinity API, and Apple silicon has no hyperthreads
+        return os.cpu_count() or 1
+    cores = set()
+    for cpu in allowed:
+        topology = _SYSFS_CPU / f"cpu{cpu}" / "topology"
+        try:
+            cores.add(((topology / "physical_package_id").read_text().strip(),
+                       (topology / "core_id").read_text().strip()))
+        except OSError:  # no topology exposed (some containers): count logical CPUs
+            return len(allowed)
+    return len(cores) or 1
+
+
+def gurobi_threads() -> int:
+    """``Threads`` for the master's Gurobi model: this process's cores, capped at the fastest count.
+
+    The cap is per platform (see ``_GUROBI_THREAD_CAP``); fewer than ``_MIN_THREADED_CORES``
+    cores run one thread. ``COLGEN_GUROBI_THREADS`` overrides it (0 = Gurobi's own count,
+    which ignores a Slurm grant). Pricing never runs during a Gurobi solve, so the threads
+    do not compete with the pricing pool.
+
+    Reported in ``stats`` because it is answer-affecting and comes from an environment
+    variable or the machine, neither of which a run otherwise writes down, so an archived run
+    that omits it cannot be compared with one that ran at a different count.
+    """
+
+    cores = _available_cores()
+    default = min(cores, _GUROBI_THREAD_CAP) if cores >= _MIN_THREADED_CORES else 1
+    return _env_int("COLGEN_GUROBI_THREADS", default)
 
 
 def gurobi_lp_method() -> tuple[int, int]:
@@ -486,14 +527,10 @@ class GurobiBackend:
         # (elapsed_s, incumbent, bound) per MIPSOL, filled by `solve_ip`'s callback.
         self.last_ip_trajectory: tuple[tuple[float, float, float], ...] = ()
         model.Params.OutputFlag = 0
-        # ONE thread by default, and it is a determinism choice, not a performance one:
-        # parallel Gurobi breaks ties by whichever worker got there first, so a threaded
-        # solve is not reproducible even at a fixed `Seed`, and this repo pins objectives and
-        # column sets across runs. The cost is real -- at scale the final IP is the binding
-        # stage and burns its budget on one core while the rest sit idle -- so
-        # `COLGEN_GUROBI_THREADS` exists to measure that trade; 0 means every core Gurobi can
-        # see. Reported in `stats` as `gurobi_threads` because it changes the answer (see
-        # `gurobi_threads`).
+        # A run is reproducible at a fixed `Threads` and `Seed`, but the count itself changes
+        # the answer (barrier's interior point and the MIP search both depend on it), so the
+        # default depends on the machine and is reported in `stats` as `gurobi_threads`.
+        # `COLGEN_GUROBI_THREADS` overrides it; 0 means every core Gurobi can see.
         model.Params.Threads = gurobi_threads()
         model.Params.Seed = self.seed
         model.ModelSense = gp.GRB.MAXIMIZE

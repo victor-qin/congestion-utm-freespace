@@ -1948,6 +1948,58 @@ def test_a_malformed_gurobi_env_var_names_itself(monkeypatch):
         master_module.gurobi_lp_method()
 
 
+@pytest.mark.parametrize(
+    ("cores", "cap", "env", "expected"),
+    [
+        (48, 32, None, 32),  # a whole SuperCloud node: capped at the fastest count
+        (24, 32, None, 24),  # a partial grant: every core it was given
+        (20, 12, None, 12),  # the Mac: its own, lower cap
+        (4, 32, None, 4),
+        (3, 32, None, 1),  # never 2 or 3: exactly 2 threads is the pathological IP count
+        (4, 32, "1", 1),  # an explicit count wins in both directions
+        (8, 32, "48", 48),
+        (48, 32, "0", 0),  # Gurobi's own count
+    ],
+)
+def test_gurobi_threads_default_to_the_granted_cores_up_to_the_platform_cap(
+    monkeypatch, cores, cap, env, expected
+):
+    """The master's Gurobi runs one thread per granted core, capped at the platform's fastest.
+
+    ``COLGEN_GUROBI_THREADS`` overrides the default either way.
+    """
+
+    monkeypatch.setattr(master_module, "_available_cores", lambda: cores)
+    monkeypatch.setattr(master_module, "_GUROBI_THREAD_CAP", cap)
+    if env is None:
+        monkeypatch.delenv("COLGEN_GUROBI_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("COLGEN_GUROBI_THREADS", env)
+    assert master_module.gurobi_threads() == expected
+
+
+def test_available_cores_counts_the_grant_in_physical_cores(monkeypatch, tmp_path):
+    """A Slurm grant is counted in cores, not hyperthreads, and not the whole node.
+
+    CPUs 0 and 2 are hyperthreads of one core and 1 and 3 of another, so four granted CPUs
+    are two cores; CPU 4 is on the node but outside the grant. Without topology files the
+    count falls back to the granted logical CPUs.
+    """
+
+    for cpu, (package, core) in enumerate([(0, 0), (0, 1), (0, 0), (0, 1), (1, 0)]):
+        topology = tmp_path / f"cpu{cpu}" / "topology"
+        topology.mkdir(parents=True)
+        (topology / "physical_package_id").write_text(f"{package}\n")
+        (topology / "core_id").write_text(f"{core}\n")
+    monkeypatch.setattr(master_module, "_SYSFS_CPU", tmp_path)
+    monkeypatch.setattr(master_module.os, "sched_getaffinity", lambda pid: {0, 1, 2, 3},
+                        raising=False)
+    assert master_module._available_cores() == 2
+
+    monkeypatch.setattr(master_module, "_SYSFS_CPU", tmp_path / "missing")
+    assert master_module._available_cores() == 4
+
+
 @pytest.mark.parametrize("columns_per_flight", [1, 3])
 def test_solver_revalidates_replaced_pricing_results(monkeypatch, columns_per_flight):
     """Changed sweep payloads must recover canonical claims and costs before entering the LP."""

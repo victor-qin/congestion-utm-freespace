@@ -190,6 +190,15 @@ def test_colgen_flags_reach_the_planner_params():
     assert params.n_pricing_workers == 4
     assert params.pricing_work_stealing is True
     assert params.min_price_duals is True
+    # Exclusive with --colgen-min-price-duals, so it gets its own parse.
+    norm = colgen_params_from_args(
+        _args("colgen_test", "--planner", "colgen", "--colgen-min-norm-duals"), "colgen"
+    )
+    assert (norm.min_norm_duals, norm.min_price_duals) == (True, False)
+    off = colgen_params_from_args(
+        _args("colgen_test", "--planner", "colgen", "--no-colgen-emptiest-airspace"), "colgen"
+    )
+    assert off.effective_emptiest_airspace_tiebreak is False
     assert params.seed_ladder_steps == 30
     assert params.greedy_budget_s_per_flight == 1.5
 
@@ -215,6 +224,10 @@ def test_unset_colgen_flags_leave_the_defaults_alone():
     assert defaults.n_pricing_workers == 0
     assert defaults.pricing_work_stealing is False
     assert defaults.min_price_duals is False
+    assert defaults.min_norm_duals is False
+    # Unset follows the pricing device: on for the CPU default.
+    assert defaults.emptiest_airspace_tiebreak is None
+    assert defaults.effective_emptiest_airspace_tiebreak is True
     assert defaults.seed_ladder_steps == 20
     assert defaults.greedy_budget_s_per_flight == 0.0
     # Bootstrap is ON at K=1, and the two fields move together: `bootstrap_roots=1` works

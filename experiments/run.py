@@ -409,7 +409,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="colgen (Gurobi only): after each master LP, re-solve its dual for the "
                         "optimal duals with the smallest total capacity price and price against "
                         "those. Answer-affecting; a round whose re-solve fails keeps the LP's "
-                        "duals and is counted in min_price_dual_fallbacks")
+                        "duals and is counted in dual_selection_fallbacks")
+    p.add_argument("--colgen-min-norm-duals", action="store_true", default=None,
+                   help="colgen (Gurobi only; excludes --colgen-min-price-duals): after each "
+                        "master LP, price against the optimal duals whose capacity prices have "
+                        "the smallest Euclidean norm (minimum-norm multipliers). The final IP is "
+                        "paired with a plain LP whose own duals the solver returns. "
+                        "Answer-affecting; failed re-solves count in dual_selection_fallbacks")
+    p.add_argument("--colgen-emptiest-airspace", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="colgen: break pricing's price ties toward the routes through the least "
+                        "master-LP traffic (default on for CPU pricing, off for GPU). "
+                        "Answer-affecting; --no-colgen-emptiest-airspace turns it off")
     p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="colgen: seed each flight's column with STEPS retimed copies of itself "
                         "before the first LP (default 20; 0 disables). Pure clock translation, so "
@@ -500,6 +511,8 @@ def _colgen_overrides(args) -> dict:
             ("n_pricing_workers", args.colgen_workers),
             ("pricing_work_stealing", args.colgen_work_stealing),
             ("min_price_duals", args.colgen_min_price_duals),
+            ("min_norm_duals", args.colgen_min_norm_duals),
+            ("emptiest_airspace_tiebreak", args.colgen_emptiest_airspace),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),

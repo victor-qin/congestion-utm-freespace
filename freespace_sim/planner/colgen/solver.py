@@ -35,7 +35,7 @@ from .network import (
     build_flight_graph,
     column_claims,
 )
-from .master import BackendTimeout, RestrictedMaster
+from .master import BackendLpResult, BackendTimeout, RestrictedMaster
 from .master import gurobi_lp_method as _gurobi_lp_method
 from .master import gurobi_threads as _gurobi_threads
 from .params import ColGenParams
@@ -56,6 +56,11 @@ log = logging.getLogger(__name__)
 _FEASIBILITY_TOL = 1e-7
 _REDUCED_COST_TOL = 1e-9
 _OBJECTIVE_TOL = 1e-8
+# Nudge per unit of load/capacity for `emptiest_airspace_tiebreak`. Small enough to act as
+# a tie-break: offline on the 1,537-flight cohort's min-norm duals, 25 of 5,135 pricings on
+# nudged duals returned a route that was not an exact tie, losing at most 1.1e-5 s of true
+# reduced cost.
+_EMPTIEST_AIRSPACE_DELTA = 1e-7
 
 
 def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
@@ -111,6 +116,10 @@ class ColGenResult:
 
     columns: dict[int, Column]
     stats: dict[str, Any]
+    # With a dual-selection rule on, the master LP over the final pool, solved right after the
+    # final IP and returned with its own, unselected duals (see `_real_dual_lp`). ``None``
+    # with the rule off or when no budget remained.
+    real_dual_lp: BackendLpResult | None = None
 
 
 def _fixed_loads(fixed_claims: Sequence[frozenset[RowKey]]) -> dict[RowKey, int]:
@@ -581,6 +590,43 @@ def _better_selection(
     return _selection_key(candidate) < _selection_key(incumbent)
 
 
+def _emptiest_airspace_duals(
+    capacity_duals: Mapping[Any, float], master: RestrictedMaster, x: Sequence[float],
+    delta: float,
+) -> tuple[dict[Any, float], float, int]:
+    """
+    Nudge the round's capacity prices toward empty airspace for pricing.
+
+    Every row the LP solution ``x`` loads (fixed loads included) gains
+    ``delta * load / capacity``. Any nonnegative row multipliers give a valid Lagrangian
+    bound, so the nudged prices still bound the master if ``b^T y`` grows by the nudge times
+    each row's right-hand side ``capacity - fixed load``; that increase is returned.
+
+    Parameters
+    ------------
+    - capacity_duals (Mapping[Any, float]): the row prices pricing would otherwise use.
+    - master (RestrictedMaster): the master whose pool ``x`` indexes (loads, capacities).
+    - x (Sequence[float]): the row-clean LP solution the duals belong to.
+    - delta (float): nudge per unit of load / capacity.
+
+    Return
+    --------
+    - output (tuple[dict[Any, float], float, int]): nudged prices, the increase of
+      ``b^T y``, and the number of rows nudged.
+    """
+    nudged = dict(capacity_duals)
+    increase: list[float] = []
+    loads = master.fractional_loads(x)
+    for row, load in loads.items():
+        cap = master.row_index.cap(row)
+        if cap <= 0 or load <= 0.0:
+            continue
+        step = delta * load / cap
+        nudged[row] = nudged.get(row, 0.0) + step
+        increase.append((cap - master.fixed_loads.get(row, 0)) * step)
+    return nudged, math.fsum(increase), len(increase)
+
+
 def _relative_revenue_gap(upper_bound: float, rmp_value: float) -> float:
     """The paper's gap, equations (10) and (11): ``(UB - RMP) / RMP``.
 
@@ -720,6 +766,35 @@ def _dual_regime_stats(backend_name: str) -> dict[str, int | None]:
         "lp_crossover": crossover,
         "gurobi_threads": _gurobi_threads(),
     }
+
+
+def _real_dual_lp(master: RestrictedMaster, deadline: float) -> tuple[BackendLpResult | None, str]:
+    """Solve the master LP over the current pool and return it with its own duals.
+
+    The same LP the generation loop solves -- violated capacity rows are materialized and the
+    LP re-solved until none remain -- but no dual-selection rule is applied afterwards.
+
+    Parameters
+    ------------
+    - master (RestrictedMaster): the live master; its ``last_*`` LP state is overwritten.
+    - deadline (float): ``time.monotonic()`` wall limit for the whole step.
+
+    Return
+    --------
+    - output (tuple[BackendLpResult | None, str]): the LP and ``"solved"``, or ``None`` and
+      ``"time_limit"`` when the deadline passed first.
+    """
+    while True:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0.0:
+            return None, "time_limit"
+        master.backend.time_limit_s = max(1e-6, remaining_s)
+        try:
+            objective, row_duals, x = master.solve_lp()
+        except BackendTimeout:
+            return None, "time_limit"
+        if not master.add_violated_rows(x, _FEASIBILITY_TOL):
+            return BackendLpResult(objective, master.flight_duals, row_duals, x), "solved"
 
 
 def _pre_master_timeout_result(
@@ -892,7 +967,10 @@ def _pre_master_timeout_result(
             "n_materialized_rows": 0,
             "lazy_rows_added": 0,
             "lazy_row_rounds": 0,
-            "min_price_dual_fallbacks": 0,
+            "dual_selection_fallbacks": 0,
+            "real_dual_lp_status": "not_run",
+            "real_dual_lp_s": 0.0,
+            "real_dual_lp_objective": None,
             "time_limit_overrun_s": max(0.0, elapsed_s - params.time_limit_s),
             "elapsed_s": elapsed_s,
         },
@@ -1159,7 +1237,10 @@ class ColGenSolver:
                     "n_materialized_rows": 0,
                     "lazy_rows_added": 0,
                     "lazy_row_rounds": 0,
-                    "min_price_dual_fallbacks": 0,
+                    "dual_selection_fallbacks": 0,
+                    "real_dual_lp_status": "not_run",
+                    "real_dual_lp_s": 0.0,
+                    "real_dual_lp_objective": None,
                     "time_limit_overrun_s": 0.0,
                     "elapsed_s": time.monotonic() - started,
                 },
@@ -1236,10 +1317,13 @@ class ColGenSolver:
             seed=cfg.seed,
             fixed_loads=committed_loads,
         )
-        if params.min_price_duals and _backend_name(master) != "gurobi":
+        # The rule `master.select_duals` applies after every complete LP, if any.
+        dual_rule = ("min_price" if params.min_price_duals
+                     else "min_norm" if params.min_norm_duals else None)
+        if dual_rule is not None and _backend_name(master) != "gurobi":
             raise ValueError(
-                "min_price_duals needs the Gurobi backend, but this solve resolved to "
-                f"{_backend_name(master)!r}; set solver='gurobi' or turn min_price_duals off"
+                f"{dual_rule}_duals needs the Gurobi backend, but this solve resolved to "
+                f"{_backend_name(master)!r}; set solver='gurobi' or turn {dual_rule}_duals off"
             )
         time_to_master_s = time.monotonic() - started
         seedless_flights: set[int] = set(graph_infeasible)
@@ -1430,7 +1514,7 @@ class ColGenSolver:
         heuristic_costs: list[float] = []
         lazy_rows_added = 0
         lazy_row_rounds = 0
-        min_price_dual_fallbacks = 0
+        dual_selection_fallbacks = 0
         termination_reason = "iteration_limit"
         last_upper_bound = math.inf
         last_lp_objective = -math.inf
@@ -1527,17 +1611,17 @@ class ColGenSolver:
                 # Lagrangian bound below must add the reduced costs to.
                 dual_selection, dual_objective = "lp", last_lp_objective
                 dual_selection_status = None
-                if params.min_price_duals:
+                if dual_rule is not None:
                     master.backend.time_limit_s = max(1e-6, pricing_deadline - time.monotonic())
-                    selection = _timed("select_duals", master.select_min_price_duals)
+                    selection = _timed("select_duals", master.select_duals, dual_rule)
                     dual_selection_status = selection.status
                     if selection.row_duals is None:
                         dual_selection = "fallback"
-                        min_price_dual_fallbacks += 1
-                        log.info("  min-price duals: %s, pricing on the LP's duals",
-                                 selection.status)
+                        dual_selection_fallbacks += 1
+                        log.info("  %s duals: %s, pricing on the LP's duals",
+                                 dual_rule, selection.status)
                     else:
-                        dual_selection, dual_objective = "min_price", selection.dual_objective
+                        dual_selection, dual_objective = dual_rule, selection.dual_objective
                         capacity_duals = dict(master.last_row_duals)
 
                 # LNS needs something to start from; `best_heuristic` is the greedy seed on
@@ -1635,7 +1719,16 @@ class ColGenSolver:
                     ),
                 )
                 pricing_complete = True
-                dual_view = DualView(capacity_duals, cfg)
+                # Pricing may see nudged prices; `capacity_duals` stays the selected duals
+                # for the round record, and `dual_objective` follows the prices priced on.
+                pricing_duals, nudged_rows = capacity_duals, 0
+                if params.effective_emptiest_airspace_tiebreak:
+                    pricing_duals, nudge_objective, nudged_rows = _timed(
+                        "emptiest_airspace", _emptiest_airspace_duals, capacity_duals, master,
+                        last_x, _EMPTIEST_AIRSPACE_DELTA,
+                    )
+                    dual_objective += nudge_objective
+                dual_view = DualView(pricing_duals, cfg)
                 flight_duals = master.flight_duals
                 # Per-iteration sweep cost, which is the whole cost of a solve.  A total
                 # cannot answer "is pricing getting cheaper as the cutoffs tighten, or is
@@ -1660,7 +1753,7 @@ class ColGenSolver:
                         cfg,
                         params,
                         static_catalog,
-                        capacity_duals,
+                        pricing_duals,
                         dual_view,
                         flight_duals,
                         best_heuristic,
@@ -2008,11 +2101,12 @@ class ColGenSolver:
                         "lazy_rows_added": lazy_rows_added,
                         "lazy_row_rounds": lazy_row_rounds,
                         # Which duals this round priced against: the LP's own ("lp"), the
-                        # min-price re-selection, or the LP's after a failed one ("fallback",
-                        # with the second solve's Gurobi status).
+                        # rule's re-selection ("min_price" / "min_norm"), or the LP's after a
+                        # failed one ("fallback", with the second solve's Gurobi status).
                         "dual_selection": dual_selection,
                         "dual_selection_status": dual_selection_status,
                         "dual_objective": dual_objective,
+                        "emptiest_airspace_rows": nudged_rows,
                     })
                 # Preserve failed-sweep diagnostics before leaving for final IP, without
                 # treating partial scores as a proof of convergence.
@@ -2152,6 +2246,17 @@ class ColGenSolver:
                 )
             if not incumbent or _better_selection(ip_selection, incumbent, params.M):
                 incumbent = dict(ip_selection)
+
+        # Every LP above handed pricing re-selected duals, so the last real ones belong to an
+        # older pool. Re-solve the final master's LP for its own. AFTER the final IP, so the IP
+        # keeps its whole budget and its answer; the eager rows it added are valid capacity
+        # rows, which leave the LP's optimum unchanged.
+        real_dual_lp: BackendLpResult | None = None
+        real_dual_lp_status, real_dual_lp_s = "not_run", 0.0
+        if dual_rule is not None and math.isfinite(last_lp_objective):
+            real_dual_lp_started = time.monotonic()
+            real_dual_lp, real_dual_lp_status = _real_dual_lp(master, deadline)
+            real_dual_lp_s = time.monotonic() - real_dual_lp_started
 
         # A ≤1 flight row keeps every RMP feasible.  Recover omitted flights in
         # planned-departure order by pricing with already saturated rows removed
@@ -2506,11 +2611,16 @@ class ColGenSolver:
             "n_materialized_rows": len(materialized_rows),
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,
-            "min_price_dual_fallbacks": min_price_dual_fallbacks,
+            "dual_selection_fallbacks": dual_selection_fallbacks,
+            "real_dual_lp_status": real_dual_lp_status,
+            "real_dual_lp_s": real_dual_lp_s,
+            "real_dual_lp_objective": (
+                None if real_dual_lp is None else real_dual_lp.objective
+            ),
             "time_limit_overrun_s": max(0.0, elapsed_s - params.time_limit_s),
             "elapsed_s": elapsed_s,
         }
-        return ColGenResult(columns=incumbent, stats=stats)
+        return ColGenResult(columns=incumbent, stats=stats, real_dual_lp=real_dual_lp)
 
 
 __all__ = ["ColGenResult", "ColGenSolver"]

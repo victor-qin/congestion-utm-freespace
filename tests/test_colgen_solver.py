@@ -46,6 +46,7 @@ from freespace_sim.planner.colgen.objective import DELAY_MODEL, cost_model
 from freespace_sim.planner.colgen.solver import (
     ColGenSolver,
     _add_departure_ladder,
+    _emptiest_airspace_duals,
     _fixed_loads,
     _greedy_feasible_selection,
     _initial_feasible_selection,
@@ -739,33 +740,38 @@ def test_highs_flight_row_owns_its_maximize_dual():
     assert master.flight_duals[9] == pytest.approx(123.0)
 
 
-def test_min_price_duals_move_a_free_row_price_onto_its_flight():
-    """The selected duals are optimal, dual-feasible, and price no row more than they must.
+@pytest.mark.parametrize("rule", ["min_price", "min_norm"])
+def test_selected_duals_are_optimal_and_price_rows_by_their_rule(rule):
+    """The selected duals are optimal, dual-feasible, and price rows as their rule prefers.
 
     Row ``s`` is claimed only by flight 1's column, so its flight row and ``s`` bind together
-    and any split of the column's value between ``pi_1`` and ``mu_s`` is optimal. Row ``r`` is
-    contested by flights 2 and 3, whose detours cost 10 s, so ``mu_r = 10`` in every optimal
-    dual. Presolve is off so the master's barrier returns the centre of that set, as it does at
-    scale, instead of a vertex.
+    and any split of the column's value between ``pi_1`` and ``mu_s`` is optimal; both rules
+    move it onto ``pi_1``. Flight 2's direct column claims rows ``a`` and ``b``; flights 3
+    and 4 claim one each, and detouring costs 10 s, 10 s and 4 s. Flight 2 detours, so every
+    optimal dual has ``mu_a + mu_b >= 10`` with ``mu_a <= 10``, ``mu_b <= 4``: min-price takes
+    any split summing to 10, min-norm the one closest to even, ``(6, 4)``. Presolve is off so
+    the master's barrier returns the centre of that set, as it does at scale, not a vertex.
     """
 
     pytest.importorskip("gurobipy")
     M = 1000.0
-    s, r = RowKey.cell((5, 0), 0, 1), RowKey.cell((0, 0), 0, 1)
-    master = RestrictedMaster((1, 2, 3), RowIndex(), _params(solver="gurobi", M=M))
+    s, a, b = (RowKey.cell((q, 0), 0, 1) for q in (5, 0, 2))
+    master = RestrictedMaster((1, 2, 3, 4), RowIndex(), _params(solver="gurobi", M=M))
     columns = [_synthetic_column(1, 0.0, frozenset({s}))]
-    for flight_id in (2, 3):
-        columns.append(_synthetic_column(flight_id, 0.0, frozenset({r})))
-        columns.append(_synthetic_column(flight_id, 10.0, frozenset(), departure_step=1))
+    for flight_id, claims, detour_s in ((2, {a, b}, 10.0), (3, {a}, 10.0), (4, {b}, 4.0)):
+        columns.append(_synthetic_column(flight_id, 0.0, frozenset(claims)))
+        columns.append(_synthetic_column(flight_id, detour_s, frozenset(), departure_step=1))
     for column in columns:
         master.add_column(column)
-    master.materialize_rows([s, r])
+    master.materialize_rows([s, a, b])
     master.backend._model.Params.Presolve = 0
     z, lp_rows, _ = master.solve_lp()
     lp_flights = master.flight_duals
-    assert lp_rows[s] > 1.0  # the master really did split the free price
+    assert z == pytest.approx(4 * M - 10.0)
+    # The master really did split the free price and over-price the contested pair.
+    assert lp_rows[s] > 1.0 and lp_rows[a] + lp_rows[b] > 10.0 + 1e-3
 
-    selection = master.select_min_price_duals()
+    selection = master.select_duals(rule)
 
     assert selection.status == "OPTIMAL"
     pi, mu = selection.flight_duals, selection.row_duals
@@ -776,11 +782,36 @@ def test_min_price_duals_move_a_free_row_price_onto_its_flight():
     assert selection.dual_objective == pytest.approx(
         sum(pi.values()) + sum(mu.values()), abs=1e-9
     )
-    assert z - 1e-6 <= selection.dual_objective <= z + 1e-9 * max(1.0, abs(z)) + 1e-6
-    assert sum(mu.values()) <= sum(lp_rows.values())
+    # Both rules stay within their optimality allowance (min-norm's is the wider, 1e-6).
+    assert z - 1e-6 <= selection.dual_objective <= z + 1e-6 * max(1.0, abs(z)) + 1e-6
     assert mu[s] == pytest.approx(0.0, abs=1e-6)
-    assert mu[r] == pytest.approx(10.0, abs=1e-4)
     assert pi[1] == pytest.approx(lp_flights[1] + lp_rows[s], abs=1e-4) == pytest.approx(M)
+    assert mu[a] + mu[b] == pytest.approx(10.0, abs=1e-4)
+    if rule == "min_norm":
+        assert (mu[a], mu[b]) == pytest.approx((6.0, 4.0), abs=1e-3)
+    # The selection never touches the master's model, so the next LP returns its own duals.
+    assert master.solve_lp()[1] == pytest.approx(lp_rows)
+
+
+def test_emptiest_airspace_duals_nudge_loaded_rows_and_keep_the_bound():
+    """Pricing's prices gain ``delta * load / capacity`` on every row the LP loads.
+
+    Row ``a`` carries 0.5 + 0.25 of two columns and ``b`` 0.5 on top of a real price of 3;
+    ``c`` is claimed only by a column at zero, so it stays unpriced; ``d`` holds a fixed load
+    and no column. ``b^T y`` grows by each nudge times the row's right-hand side
+    ``capacity - fixed load``, which is 0 for ``d``, so the Lagrangian bound stays valid.
+    """
+
+    a, b, c, d = (RowKey.cell((q, 0), 0, 1) for q in (0, 1, 2, 3))
+    master = RestrictedMaster((1, 2, 3), RowIndex(), _params(), fixed_loads={d: 1})
+    for flight_id, claims in ((1, {a, b}), (2, {a}), (3, {c})):
+        master.add_column(_synthetic_column(flight_id, 0.0, frozenset(claims)))
+
+    nudged, increase, rows = _emptiest_airspace_duals({b: 3.0}, master, [0.5, 0.25, 0.0], 0.1)
+
+    assert nudged == pytest.approx({a: 0.075, b: 3.05, d: 0.1})
+    assert increase == pytest.approx(0.075 + 0.05)
+    assert rows == 3
 
 
 def test_backend_native_mip_gap_is_scaled_out_of_big_m_revenue():
@@ -1013,11 +1044,13 @@ def test_hand_checked_detour_beats_hold():
         (),
         _params(max_air_overrun_hops=0, gap_metric="cost"),
     )
+    # Plain duals: the default emptiest-airspace nudge is a valid but looser dual (here the
+    # proven bound reads 2e-5 under 12), and the bound assertions below are exact.
     with_detour = ColGenSolver().solve(
         requests,
         cfg,
         (),
-        _params(max_air_overrun_hops=1, gap_metric="cost"),
+        _params(max_air_overrun_hops=1, gap_metric="cost", emptiest_airspace_tiebreak=False),
     )
 
     # The claim is the name of the test: a one-hop detour still beats a four-step hold.
@@ -1067,7 +1100,9 @@ def test_revenue_gap_stops_early_but_still_returns_the_optimum():
         # shipped default the same absolute gap no longer closes: the denominator is
         # `n*M - cost`, so shrinking M grows the ratio in proportion.  Pinning 1e6 here keeps
         # the pathology on the record rather than deleting the evidence.
-        _params(max_air_overrun_hops=1, gap_metric="revenue", M=1_000_000.0),
+        # Plain duals, so the exact bound below is not loosened by the tie-break's nudge.
+        _params(max_air_overrun_hops=1, gap_metric="revenue", M=1_000_000.0,
+                emptiest_airspace_tiebreak=False),
     )
 
     assert revenue.stats["termination_reason"] == "lp_gap"
@@ -2256,13 +2291,19 @@ def test_bounds_are_monotone_and_solver_is_deterministic():
         assert first.stats[key] == second.stats[key]
 
 
-def test_min_price_duals_refuse_a_highs_master():
-    """The selection re-solves the dual through Gurobi's matrix API; HiGHS has no such step."""
+def test_dual_selection_refuses_a_highs_master_and_a_second_rule():
+    """The selection re-solves the dual through Gurobi's matrix API; HiGHS has no such step.
+
+    The two rules pick different duals, so asking for both is an error, not a precedence.
+    """
 
     cfg = _cfg()
     request = _request(1, (-2, 0), (2, 0), cfg)
-    with pytest.raises(ValueError, match="min_price_duals needs the Gurobi backend"):
-        ColGenSolver().solve([request], cfg, (), _params(min_price_duals=True))
+    for rule in ("min_price", "min_norm"):
+        with pytest.raises(ValueError, match=f"{rule}_duals needs the Gurobi backend"):
+            ColGenSolver().solve([request], cfg, (), _params(**{f"{rule}_duals": True}))
+    with pytest.raises(ValueError, match="turn one of them off"):
+        _params(min_price_duals=True, min_norm_duals=True)
 
 
 def test_single_level_guard():
@@ -2298,8 +2339,9 @@ def test_backend_parity():
 def test_backend_parity_when_final_integer_master_runs():
     """HiGHS and Gurobi return the same answer when the final IP cannot be skipped.
 
-    So does Gurobi pricing on min-price duals, whose bound must still hold: it adds the
-    reduced costs to ``b^T y`` of the duals it priced against, not to the LP objective.
+    So does Gurobi pricing on min-price or min-norm duals, plain or nudged toward empty
+    airspace, whose bound must still hold: it adds the reduced costs to ``b^T y`` of the
+    duals it priced against, not to the LP objective. With a rule on, the final IP comes with the final pool's LP and its own duals.
     """
 
     pytest.importorskip("gurobipy")
@@ -2319,22 +2361,32 @@ def test_backend_parity_when_final_integer_master_runs():
     controls = {**controls, "seed_ladder_steps": 0}
     highs = ColGenSolver().solve(requests, cfg, (), _params(solver="highs", **controls))
     gurobi = ColGenSolver().solve(requests, cfg, (), _params(solver="gurobi", **controls))
-    rounds: list[dict] = []
-    min_price = ColGenSolver().solve(
-        requests, cfg, (), _params(solver="gurobi", min_price_duals=True, **controls),
-        on_iteration=rounds.append,
-    )
 
     assert highs.stats["ip_skipped"] is False
     assert gurobi.stats["ip_skipped"] is False
     assert highs.stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
-    assert min_price.stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
-    assert rounds and {r["dual_selection"] for r in rounds} <= {"min_price", "fallback"}
-    assert min_price.stats["min_price_dual_fallbacks"] == sum(
-        r["dual_selection"] == "fallback" for r in rounds
-    )
-    assert gurobi.stats["min_price_dual_fallbacks"] == 0
-    assert max(min_price.stats["cost_lower_bounds"]) <= min_price.stats["objective"] + 1e-6
+    assert gurobi.stats["dual_selection_fallbacks"] == 0
+    assert gurobi.real_dual_lp is None and gurobi.stats["real_dual_lp_status"] == "not_run"
+    for rule, emptiest in (("min_price", False), ("min_norm", False), ("min_norm", True)):
+        rounds: list[dict] = []
+        selected = ColGenSolver().solve(
+            requests, cfg, (),
+            _params(solver="gurobi", **{f"{rule}_duals": True},
+                    emptiest_airspace_tiebreak=emptiest, **controls),
+            on_iteration=rounds.append,
+        )
+        assert {r["emptiest_airspace_rows"] > 0 for r in rounds} == {emptiest}
+        stats = selected.stats
+        assert stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
+        assert rounds and {r["dual_selection"] for r in rounds} <= {rule, "fallback"}
+        assert stats["dual_selection_fallbacks"] == sum(
+            r["dual_selection"] == "fallback" for r in rounds
+        )
+        assert max(stats["cost_lower_bounds"]) <= stats["objective"] + 1e-6
+        # The final pool contains the last loop LP's columns, whose solution stays feasible.
+        assert stats["real_dual_lp_status"] == "solved"
+        assert selected.real_dual_lp.objective == stats["real_dual_lp_objective"]
+        assert stats["real_dual_lp_objective"] >= stats["final_lp_objective"] - 1e-6
     assert sorted(column.delay_s for column in highs.columns.values()) == pytest.approx(
         sorted(column.delay_s for column in gurobi.columns.values())
     )

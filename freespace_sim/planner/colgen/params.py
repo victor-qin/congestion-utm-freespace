@@ -248,6 +248,29 @@ class ColGenParams:
     # pricing finds, never the validity of the bound. Off by default: on the 1,537-flight
     # cohort it cut pricing 33% but its sparser pool's final IP cost 4% more (HISTORY.md).
     min_price_duals: bool = False
+    # Gurobi only; excludes `min_price_duals`. After each complete master LP, price against
+    # the optimal duals whose capacity prices have the smallest Euclidean norm (the
+    # minimum-norm multiplier of Su et al., Mathematics 14(6):931, 2026; see
+    # `GurobiBackend.select_min_norm_duals`). Same fallback, answer-affecting and bound rules
+    # as `min_price_duals`. With either rule on, the final IP is paired with a plain LP over
+    # the final pool whose own duals are returned as `ColGenResult.real_dual_lp`.
+    min_norm_duals: bool = False
+    # Price against the round's duals plus a tiny nudge on every row the master LP uses,
+    # proportional to its load / capacity (`solver._emptiest_airspace_duals`). Rows below
+    # capacity are always unpriced, so real prices cannot tell an empty cell from a 90%-used
+    # one; the nudge makes pricing return, among routes whose real prices tie, the one
+    # through the least LP traffic. The nudged duals are still a valid dual, so the bound
+    # holds. Answer-affecting. None (default) = on for CPU pricing, off for GPU pricing,
+    # where it is unmeasured: on the 1,537-flight cohort it cut a solve from 14 to 5
+    # rounds and 595 s to 465 s for a final IP 0.02% costlier (HISTORY.md).
+    emptiest_airspace_tiebreak: bool | None = None
+
+    @property
+    def effective_emptiest_airspace_tiebreak(self) -> bool:
+        """Whether pricing nudges prices toward empty airspace; None follows the device."""
+        if self.emptiest_airspace_tiebreak is None:
+            return self.pricing_device == "cpu"
+        return self.emptiest_airspace_tiebreak
 
     @property
     def effective_ip_reserve_s(self) -> float:
@@ -365,9 +388,16 @@ class ColGenParams:
         object.__setattr__(self, "ip_time_limit_s", ip_limit)
 
         for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
-                     "seed_nominal_routes", "pricing_work_stealing", "min_price_duals"):
+                     "seed_nominal_routes", "pricing_work_stealing", "min_price_duals",
+                     "min_norm_duals"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
+        if self.emptiest_airspace_tiebreak is not None and not isinstance(
+                self.emptiest_airspace_tiebreak, bool):
+            raise TypeError("emptiest_airspace_tiebreak must be a boolean or None")
+        if self.min_price_duals and self.min_norm_duals:
+            raise ValueError("min_price_duals and min_norm_duals select duals differently; "
+                             "turn one of them off")
         if not self.iteration_ip_search and not self.iteration_ip_eager:
             raise ValueError(
                 "iteration_ip_search=False requires iteration_ip_eager=True; "

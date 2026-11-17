@@ -21,7 +21,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, linprog, milp
-from scipy.sparse import csc_matrix
+from scipy.sparse import csc_matrix, diags
 
 from .network import RowIndex, RowKey
 from .params import ColGenParams
@@ -42,9 +42,22 @@ class BackendLpResult:
     x: np.ndarray
 
 
+# `GurobiBackend.select_min_norm_duals` reads the optimal dual face off the LP's own primal
+# solution: a column with `x > tol` is in its support, a row with `slack > tol` is slack.
+# Wide on purpose. Barrier leaves noise up to ~1e-6 on x and up to ~1e-4 on the slack of
+# rows that are really tight (1e-6 made 2 of 7 captured masters infeasible), while real
+# support values and slacks on the captured masters sit at >= 1e-2. A value it misreads as
+# zero only drops a condition, widening the set the selection searches; see the next constant.
+_SUPPORT_TOL = 1e-3
+# A widened set can admit a non-optimal dual, so a min-norm selection whose `b^T y` exceeds
+# `z*` by more than this, relative to `max(1, |z*|)`, is rejected. The captured masters land
+# within 1e-6 absolute of the exact optimum.
+_MIN_NORM_DUAL_REL_TOL = 1e-7
+
+
 @dataclass(frozen=True, slots=True)
 class BackendDualSelection:
-    """Outcome of re-selecting the master's duals for the smallest total capacity price.
+    """Outcome of re-selecting the master's duals among its optimal ones by a rule.
 
     Attributes
     ------------
@@ -690,6 +703,70 @@ class GurobiBackend:
         x = np.asarray([variable.X for variable in self._variables], dtype=float)
         return BackendLpResult(float(self._model.ObjVal), flight_duals, row_duals, x)
 
+    def _select_duals(self, name: str, configure) -> BackendDualSelection:
+        """Re-solve the last LP's dual ``{A^T y >= c, y >= 0}`` under a caller's objective.
+
+        Builds the dual of the live model from ``getA()`` (``y = (pi, mu)``, one variable per
+        constraint), lets ``configure`` set its objective, extra rows and algorithm, and reads
+        back the duals. Must run before any column or row is added after :meth:`solve_lp`.
+
+        Parameters
+        ------------
+        - name (str): Gurobi model name of the dual.
+        - configure (Callable): ``configure(dual, y, rhs, is_capacity, columns, objective)``
+          with the dual model, its ``MVar``, the master's ``b``, a mask of capacity rows over
+          ``y``, ``A^T`` (CSR, one row per column) and ``c``.
+
+        Return
+        --------
+        - output (BackendDualSelection): the selected duals and their ``b^T y``, or only the
+          status when the solve was not optimal.
+        """
+        gp = self._gp
+        model = self._model
+        model.update()
+        constraints = model.getConstrs()
+        # Rows and columns of `getA()` are constraint and variable `.index`, the same order
+        # `getConstrs()` / `getVars()` return.
+        matrix = model.getA()
+        rhs = np.asarray(model.getAttr("RHS", constraints), dtype=float)
+        objective = np.asarray(model.getAttr("Obj", model.getVars()), dtype=float)
+        flight_index = np.array([row.index for row in self._flight_rows.values()], dtype=np.int64)
+        capacity_index = np.array(
+            [row.index for row in self._capacity_rows.values()], dtype=np.int64
+        )
+        is_capacity = np.zeros(len(constraints), dtype=bool)
+        is_capacity[capacity_index] = True
+
+        dual = gp.Model(name)
+        try:
+            dual.Params.OutputFlag = 0
+            dual.Params.Threads = gurobi_threads()
+            dual.Params.Seed = self.seed
+            dual.Params.TimeLimit = self.time_limit_s
+            y = dual.addMVar(len(constraints), lb=0.0)
+            columns = matrix.T.tocsr()
+            dual.addMConstr(columns, y, gp.GRB.GREATER_EQUAL, objective)
+            configure(dual, y, rhs, is_capacity, columns, objective)
+            dual.optimize()
+            status = next(
+                (label for label in dir(gp.GRB.Status)
+                 if label.isupper() and getattr(gp.GRB.Status, label) == dual.Status),
+                str(dual.Status),
+            )
+            if dual.Status != gp.GRB.OPTIMAL:
+                return BackendDualSelection(status)
+            # Barrier without crossover can leave components a hair below their bound.
+            values = np.maximum(np.asarray(y.X, dtype=float), 0.0)
+        finally:
+            dual.dispose()
+        return BackendDualSelection(
+            status,
+            float(rhs @ values),
+            dict(zip(self._flight_rows, values[flight_index].tolist())),
+            dict(zip(self._capacity_rows, values[capacity_index].tolist())),
+        )
+
     def select_min_price_duals(self, primal_objective: float) -> BackendDualSelection:
         """Re-select the last LP's duals as the optimal ones with the smallest capacity price.
 
@@ -718,52 +795,68 @@ class GurobiBackend:
           status when the solve was not optimal.
         """
         gp = self._gp
-        model = self._model
-        model.update()
-        constraints = model.getConstrs()
-        # Rows and columns of `getA()` are constraint and variable `.index`, the same order
-        # `getConstrs()` / `getVars()` return.
-        matrix = model.getA()
-        rhs = np.asarray(model.getAttr("RHS", constraints), dtype=float)
-        objective = np.asarray(model.getAttr("Obj", model.getVars()), dtype=float)
-        flight_index = np.array([row.index for row in self._flight_rows.values()], dtype=np.int64)
-        capacity_index = np.array(
-            [row.index for row in self._capacity_rows.values()], dtype=np.int64
-        )
-        weights = np.zeros(len(constraints))
-        weights[capacity_index] = 1.0
         z = float(primal_objective)
         pin = z + 1e-9 * max(1.0, abs(z))
 
-        dual = gp.Model("colgen-min-price-duals")
-        try:
-            dual.Params.OutputFlag = 0
-            dual.Params.Threads = gurobi_threads()
-            dual.Params.Seed = self.seed
-            dual.Params.TimeLimit = self.time_limit_s
+        def configure(dual, y, rhs, is_capacity, columns, objective):
             dual.Params.Method = 1
-            y = dual.addMVar(len(constraints), lb=0.0, obj=weights)
-            dual.addMConstr(matrix.T.tocsr(), y, gp.GRB.GREATER_EQUAL, objective)
+            dual.setMObjective(None, is_capacity.astype(float), 0.0, sense=gp.GRB.MINIMIZE)
             dual.addMConstr(rhs.reshape(1, -1), y, gp.GRB.LESS_EQUAL, np.array([pin]))
-            dual.ModelSense = gp.GRB.MINIMIZE
-            dual.optimize()
-            status = next(
-                (name for name in dir(gp.GRB.Status)
-                 if name.isupper() and getattr(gp.GRB.Status, name) == dual.Status),
-                str(dual.Status),
-            )
-            if dual.Status != gp.GRB.OPTIMAL:
-                return BackendDualSelection(status)
-            # Barrier without crossover can leave components a hair below their bound.
-            values = np.maximum(np.asarray(y.X, dtype=float), 0.0)
-        finally:
-            dual.dispose()
-        return BackendDualSelection(
-            status,
-            float(rhs @ values),
-            dict(zip(self._flight_rows, values[flight_index].tolist())),
-            dict(zip(self._capacity_rows, values[capacity_index].tolist())),
-        )
+
+        return self._select_duals("colgen-min-price-duals", configure)
+
+    def select_min_norm_duals(self, primal_objective: float) -> BackendDualSelection:
+        """Re-select the last LP's duals as the optimal ones of smallest capacity-price norm.
+
+        The minimum-norm multiplier (Su et al., Mathematics 14(6):931, 2026): among optimal
+        duals, the capacity prices ``mu`` with least ``||mu||_2``; flight duals ``pi`` are
+        free. Solves ``min 1/2 ||mu||^2`` over ``{A^T y >= c, y >= 0}`` restricted to the
+        optimal face by complementary slackness with the LP's own primal ``x*``: ``(A^T y)_j
+        = c_j`` on ``x*``'s support and ``y_i = 0`` on its slack rows. For any optimal ``x*``
+        those conditions on a feasible ``y`` ARE dual optimality, so the face is pinned
+        without :meth:`select_min_price_duals`' ``b^T y <= z*`` slab, which barrier cannot
+        solve. They also fix most of ``y`` at zero: on captured 1,537-flight masters
+        (237k-771k rows) barrier solves it in under a second, against 5-23 s per master LP.
+
+        Support and slack are read with :data:`_SUPPORT_TOL`. A selection is rejected
+        (status ``"OFF_OPTIMAL_FACE"``) when ``b^T y`` exceeds ``z*`` by more than
+        :data:`_MIN_NORM_DUAL_REL_TOL` ``max(1, |z*|)``; like an infeasible restriction, the
+        caller then keeps the LP's duals.
+
+        Parameters
+        ------------
+        - primal_objective (float): ``z*``, the objective of the LP :meth:`solve_lp` just
+          solved on this model (the pool and rows must not have changed since).
+
+        Return
+        --------
+        - output (BackendDualSelection): the selected duals and their ``b^T y``, or only the
+          status when the solve was not optimal or left the optimal face.
+        """
+        gp = self._gp
+        model = self._model
+        support = np.asarray(model.getAttr("X", model.getVars()), dtype=float) > _SUPPORT_TOL
+        slack_rows = np.asarray(model.getAttr("Slack", model.getConstrs()), dtype=float)
+        slack_rows = slack_rows > _SUPPORT_TOL
+
+        def configure(dual, y, rhs, is_capacity, columns, objective):
+            # Barrier without crossover, like the master LP: the minimizer is unique in mu
+            # and need not be a vertex, so crossover would only cost time.
+            dual.Params.Method = 2
+            dual.Params.Crossover = 0
+            y.UB = np.where(slack_rows, 0.0, gp.GRB.INFINITY)
+            # With the `>=` rows already present, `<=` on the support makes them equalities.
+            dual.addMConstr(columns[support], y, gp.GRB.LESS_EQUAL, objective[support])
+            # `setMObjective` reads `x^T Q x`, so the diagonal carries 1/2.
+            dual.setMObjective(diags(np.where(is_capacity, 0.5, 0.0)).tocsr(), None, 0.0,
+                               sense=gp.GRB.MINIMIZE)
+
+        selection = self._select_duals("colgen-min-norm-duals", configure)
+        z = float(primal_objective)
+        if (selection.row_duals is not None
+                and selection.dual_objective > z + _MIN_NORM_DUAL_REL_TOL * max(1.0, abs(z))):
+            return BackendDualSelection("OFF_OPTIMAL_FACE", selection.dual_objective)
+        return selection
 
     def solve_ip(self, warm_start: np.ndarray | None = None) -> BackendIpResult:
         """Solve the binary MIP with the recorded warm start and return the incumbent.
@@ -1262,8 +1355,8 @@ class RestrictedMaster:
         self.last_lp_x = np.asarray(result.x, dtype=float)
         return self.last_lp_objective, dict(self.last_row_duals), self.last_lp_x.copy()
 
-    def select_min_price_duals(self) -> BackendDualSelection:
-        """Replace the last LP's duals with optimal ones of smallest total capacity price.
+    def select_duals(self, rule: str) -> BackendDualSelection:
+        """Replace the last LP's duals with the optimal ones a selection rule prefers.
 
         On success ``last_row_duals`` and ``last_flight_duals`` (so :attr:`flight_duals`) hold
         the selected duals; otherwise they keep the LP's. Must run before any column or row is
@@ -1271,16 +1364,19 @@ class RestrictedMaster:
 
         Parameters
         ------------
-        - none: reads ``last_lp_objective`` and the backend's current model.
+        - rule (str): ``"min_price"`` (least total capacity price, see
+          :meth:`GurobiBackend.select_min_price_duals`) or ``"min_norm"`` (least Euclidean
+          norm of the capacity prices, see :meth:`GurobiBackend.select_min_norm_duals`).
 
         Return
         --------
-        - output (BackendDualSelection): the backend's outcome (see
-          :meth:`GurobiBackend.select_min_price_duals`).
+        - output (BackendDualSelection): the backend's outcome.
         """
-        select = getattr(self._backend, "select_min_price_duals", None)
+        if rule not in ("min_price", "min_norm"):
+            raise ValueError(f"unknown dual selection rule {rule!r}")
+        select = getattr(self._backend, f"select_{rule}_duals", None)
         if select is None:
-            raise TypeError(f"the {self.backend_name} backend cannot select min-price duals")
+            raise TypeError(f"the {self.backend_name} backend cannot select {rule} duals")
         selection = select(self.last_lp_objective)
         if selection.row_duals is not None:
             self.last_flight_duals = dict(selection.flight_duals)

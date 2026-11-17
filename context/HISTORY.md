@@ -305,3 +305,18 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   ≥161,934 vs 156,616 (+4.0% final cost, final IP unproven at 600 s). Judge any dual-selection
   change by the final IP cost, not rounds or bound. Runs 20261112T024339Z-mpd44-spx-on1-dd1941,
   20261112T024408Z-mpd44-off2-433fee. Files: `freespace_sim/planner/colgen/{master,solver}.py`.
+
+- 2026-11-17T23:50Z [TOOL] Zero prices cannot break pricing's ties. Every row below capacity has
+  mu = 0 under any optimal duals (complementary slackness), and 92-96% of FULL rows are unpriced
+  too because only violated rows are materialized, so pricing's geometric tie-break (hops,
+  departure, lane, cell order) sends tied flights through cells the LP already uses. Min-norm duals
+  made it worse: 8 rounds instead of 14, but the pool lost the same-delay alternatives the final IP
+  needs (+7.9%, IP unproven at 600 s, bound >= 161,369 vs 156,584). Breaking ties by LP load
+  (`emptiest_airspace_tiebreak`) fixed both: own duals 14 -> 5 rounds, 595 s -> 465 s, IP +0.02%.
+  Judge any pricing/dual change by the final IP cost or its proven bound; time-limited re-solves of
+  one pool differ by ~3%. Files: `freespace_sim/planner/colgen/{solver,params,master}.py`.
+
+- 2026-11-17T23:50Z [TOOL] A different optimal vertex of the final LP (crossover instead of
+  barrier) is not row-clean: it looked 91% integral but overloaded 35,482 lazy rows the barrier
+  solution never touched. Re-run `add_violated_rows` until clean before reading integrality or
+  rounding off any re-solved master LP. Files: `freespace_sim/planner/colgen/master.py`.

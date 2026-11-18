@@ -1499,7 +1499,7 @@ def test_zeta_native_preparation_deadline_releases_waiters_and_compilers(monkeyp
     """Native preparation must bound lock waits and reap its compiler on timeout."""
     import subprocess
     import sys
-    from freespace_sim.planner.colgen import zeta_native
+    from freespace_sim.planner.zeta import native as zeta_native
 
     started = time.perf_counter()
     zeta_native._LOAD_LOCK.acquire()
@@ -1840,7 +1840,7 @@ def test_zeta_supplied_full_seeds_require_explicit_authority_without_widening_pr
 ):
     """A shared fixed seed keeps its full claims but never expands restricted search scope."""
     from freespace_sim.planner.colgen.objective import cost_model
-    from freespace_sim.planner.colgen.zeta_geometry import reservation_claims
+    from freespace_sim.planner.zeta.geometry import reservation_claims
     from freespace_sim.planner.colgen.zeta_pool import build_seed_columns
 
     cfg = _cfg(max_ground_delay_s=0.0, dt_s=4.0, nominal_speed_mps=30.0)

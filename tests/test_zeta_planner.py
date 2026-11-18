@@ -1,6 +1,8 @@
 """Standalone Zeta files flights in order and reads the current reservation ledger."""
 
 from dataclasses import replace
+import io
+import pickle
 import subprocess
 import sys
 
@@ -35,20 +37,24 @@ def _params() -> ZetaPlannerParams:
     )
 
 
-@pytest.mark.parametrize("domain", ["full480", "hex12", "forward12-native"])
+@pytest.mark.parametrize("domain", ["full480", "radius240", "radius240-native", "hex12", "forward12-native"])
 def test_zeta_fcfs_files_buffered_routes_in_request_order(domain: str) -> None:
     first = FlightRequest(1, vec(0, 0, 0), vec(480, 0, 0), 0.0)
     second = replace(first, flight_id=2)
     cfg = _config()
     params = _params()
     if domain != "full480":
-        native = domain == "forward12-native"
+        native = domain.endswith("-native")
+        radius240 = domain.startswith("radius240")
         if native:
             pytest.importorskip("numba")
             pytest.importorskip("Cython")
         params = replace(params, options=replace(
-            params.options, connection_mode="hex12", backend="compiled" if native else "reference",
-            forward_cruise=native, traversal="forward_dp" if native else "best_first",
+            params.options, connection_radius_m=240.0 if radius240 else 480.0,
+            connection_mode="full" if radius240 else "hex12",
+            backend="compiled" if native else "reference",
+            forward_cruise=native and not radius240,
+            traversal="forward_dp" if native and not radius240 else "best_first",
             compiled_loop=native, native_state_index=native, early_return=True,
         ))
     result = run(cfg, requests=[first, second], planner_params=params)
@@ -170,14 +176,48 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.zeta import ZetaPlannerParams
 from freespace_sim.types import FlightRequest, vec
+from experiments.zeta_prototype import _run_fcfs
 cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0, max_ground_delay_s=0.0)
 planner = get_planner('zeta', ZetaPlannerParams(max_air_overrun_hops=0))
 intent = planner.plan(FlightRequest(1, vec(0,0,0), vec(480,0,0), 0.0), ReservationLedger(cfg), cfg)
 assert intent.accepted
 assert planner.inner.last_result.complete
+routes, intents, stats = _run_fcfs(cfg, [intent.request], (), planner.inner.params)
+assert len(routes) == len(intents) == 1 and stats['violated_rows'] == 0
 assert not any(name.startswith('freespace_sim.planner.colgen') for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=30)
+
+
+def test_zeta_archive_migration_preserves_graph_routes_and_claims() -> None:
+    """Old saved graphs require explicit migration and retain their canonical route model."""
+    from experiments.zeta_migrate import load_archive
+    from freespace_sim.planner.colgen.params import ColGenParams
+    from freespace_sim.planner.colgen.zeta import ZetaGraph, price_zeta
+    from freespace_sim.planner.route_domain import build_flight_graph
+
+    cfg = _config(max_ground_delay_s=0.0)
+    params = ColGenParams(max_air_overrun_hops=0)
+    req = FlightRequest(1, vec(0, 0, 0), vec(480, 0, 0), 0.0)
+    graph = ZetaGraph(build_flight_graph(req, cfg, (), params), cfg, RowIndex())
+    seeds = graph.seed_columns(params)
+    original = price_zeta(graph, {}, 0.0, params, known_columns=seeds)
+    current = pickle.dumps((graph, params, seeds), protocol=2)
+    modern = b"freespace_sim.planner.zeta.route_cache\n"
+    legacy = b"freespace_sim.planner.colgen.zeta_route_cache\n"
+    assert modern in current
+    archived = current.replace(modern, legacy)
+    with pytest.raises(ModuleNotFoundError, match="zeta_route_cache"):
+        pickle.loads(archived)
+    restored, restored_params, restored_seeds = load_archive(io.BytesIO(archived))
+    assert restored.seed_columns(restored_params) == seeds == restored_seeds
+    migrated = pickle.dumps((restored, restored_params, restored_seeds), protocol=2)
+    assert legacy not in migrated
+    restored, restored_params, restored_seeds = pickle.loads(migrated)
+    result = price_zeta(restored, {}, 0.0, restored_params, known_columns=restored_seeds)
+    assert result.complete and result.column == original.column
+    assert result.column.claims == original.column.claims
+    assert result.reduced_cost == original.reduced_cost
 
 
 def test_zeta_rejects_unwrapped_itinerary_and_reports_preparation_deadline() -> None:

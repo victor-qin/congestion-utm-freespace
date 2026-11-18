@@ -2702,6 +2702,68 @@ def fig_fix_return_ground_hold() -> None:
     _save(fig, "fix_return_ground_hold")
 
 
+def fig_zeta_fcfs240(data_path: str) -> None:
+    """Show per-flight planning time and certificate status for the captured FCFS cohort.
+
+    Parameters
+    ------------
+    - data_path (str): audited standalone240.json from the frozen radius240 run.
+
+    Return
+    --------
+    - output (None): writes desktop and mobile PNGs in context/figures.
+    """
+    import json
+    from collections import Counter
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    records = data["progress"]
+    counts = Counter(record["reason"] for record in records)
+    names = [name for name in ("optimal", "merge_uncertainty", "deadline", "search_cap",
+                               "graph_infeasible") if counts[name]]
+    labels = {"optimal": "Optimal", "merge_uncertainty": "Numerical allowance",
+              "deadline": "Deadline", "search_cap": "Work cap",
+              "graph_infeasible": "Infeasible graph"}
+    for mobile in (False, True):
+        with plt.rc_context({"font.size": 12}):
+            fig, axes = plt.subplots(2 if mobile else 1, 1 if mobile else 2,
+                                     figsize=(5.3, 7.6) if mobile else (10.5, 4.8),
+                                     layout="constrained")
+            timings, statuses = axes
+            for accepted, complete, color, label in (
+                (True, True, GREEN, "Accepted, proved"),
+                (True, False, ORANGE, "Accepted, incomplete"),
+                (False, False, RED, "Denied"),
+            ):
+                points = [(i + 1, row["plan_wall_s"]) for i, row in enumerate(records)
+                          if row["accepted"] == accepted
+                          and (not accepted or row["complete"] == complete)]
+                if points:
+                    x, y = zip(*points)
+                    timings.scatter(x, y, s=22, color=color, label=label, zorder=3)
+            timings.axhline(5.0, color=GRID, linestyle="--", linewidth=1)
+            timings.set(xlabel="FCFS request order", ylabel="Planning wall time (s)",
+                        xlim=(0, len(records)+1), ylim=(0, max(5.4, max(
+                            row["plan_wall_s"] for row in records)*1.08)))
+            timings.set_title("Time per flight", loc="left")
+            handles, legend_labels = timings.get_legend_handles_labels()
+            fig.legend(handles, legend_labels, frameon=False, fontsize=10,
+                       loc="outside lower center", ncol=1 if mobile else 3)
+            colors = [GREEN if name == "optimal" else ORANGE for name in names]
+            bars = statuses.barh([labels[name] for name in names],
+                                 [counts[name] for name in names], color=colors)
+            statuses.bar_label(bars, padding=4)
+            statuses.invert_yaxis()
+            statuses.set(xlabel="Number of searches", xlim=(0, max(counts.values())*1.18))
+            statuses.set_title("Per-leg certificates", loc="left")
+            for ax in axes:
+                ax.spines[["top", "right"]].set_visible(False)
+            fig.suptitle(f"Standalone Zeta* · 240 m radius\n{data['served']}/{data['requests']} accepted",
+                         fontsize=15)
+            _save(fig, "zeta_fcfs240_20261118" + ("_mobile" if mobile else ""))
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,

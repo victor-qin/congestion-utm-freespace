@@ -88,7 +88,7 @@ A cache fingerprint must include every input that affects geometry or eligibilit
 
 The next cache prototype should therefore share immutable connection geometry across flights, add terminal-lane trees and a bounded set of alternative templates, and retain full pricing as the certification fallback. Its evaluation should report offline construction, cold loading, warm solves, memory, cache misses, and final solution quality separately. The seed fix in this change preserves caches within a solve; persistent map-wide and terminal-to-cell caches remain proposed work.
 
-Implementation references: [graph and static seeds](../freespace_sim/planner/colgen/zeta.py), [priced search](../freespace_sim/planner/colgen/zeta_compact.py), [reservation construction](../freespace_sim/planner/colgen/zeta_geometry.py), [persistent workers](../freespace_sim/planner/colgen/zeta_pool.py), and [column-generation driver](../freespace_sim/planner/colgen/zeta_solver.py).
+Implementation references: [graph and static seeds](../freespace_sim/planner/zeta/search.py), [priced search](../freespace_sim/planner/zeta/compact.py), [reservation construction](../freespace_sim/planner/zeta/geometry.py), [persistent workers](../freespace_sim/planner/colgen/zeta_pool.py), and [column-generation driver](../freespace_sim/planner/colgen/zeta_solver.py).
 
 ## Why one waypoint accumulated 4,213 histories
 
@@ -517,7 +517,7 @@ remaining-distance estimate without changing permitted routes. For axial displac
 steps present in the 240 m graph does not shorten this distance. Norm-square-seven
 links do: the formula is therefore disabled for `hex12_long` and full480.
 
-The implementation in `zeta_lattice_bound.py` rounds the ideal expression downward
+The implementation in `planner/zeta/lattice_bound.py` rounds the ideal expression downward
 and subtracts a conservative whole-route allowance for physical geometry and cost
 arithmetic. It requires stable endpoint folds, a nonbinding final detour gate and
 supported coordinate/spacing scales; unsafe contexts retain the prior Euclidean

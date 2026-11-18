@@ -37,14 +37,29 @@ cancel before physical cost is added, with downward rounding at each operation.
 If a finite allowance cannot be established, that bound becomes negative infinity;
 caps and deadlines then remain incomplete with a conservative certificate.
 
-Old `colgen.zeta_*` import paths remain thin compatibility modules for archived
-experiments and pickles. There is one search implementation. Old graph caches
-containing master columns are rebuilt on loading. New work should import the
-shared package; the independent workspace/price-preparation experiments must be
-adapted to these moved modules before integration.
-The legacy `zeta_compact.price_zeta_compact` and `zeta_hybrid.price_hybrid`
-entry points retain `pi_f`, `params`, `known_columns` and `ZetaPricingResult` through
-CG adapters. Their shared-engine equivalents accept `SearchSettings` and routes.
+`colgen` retains only `zeta.py` (CG objective/column adapter), `zeta_pool.py`
+(persistent pricing workers), and `zeta_solver.py` (LP/IP and column-generation
+scheduling). Search, geometry, bounds, caches and native compilation live in
+`planner.zeta`; current callers import those modules directly.
+
+The twenty old helper modules, including the compact/hybrid CG entry points,
+have been removed. For example, replace `colgen.zeta_geometry` with `zeta.geometry`.
+CG callers use `colgen.zeta.price_zeta`; direct search callers use `zeta.search`
+with `SearchSettings`, `Route` and `SearchResult`. The public CG adapter retains
+its CG arguments and result type. Independent workspace/price-preparation
+experiments need the same import migration before integration.
+
+Archived scripts that select frozen source keep running against that source.
+For trusted graph pickles reused against current code, explicitly load through
+`experiments.zeta_migrate.load_archive`, or write a new migrated copy:
+
+```sh
+python -m experiments.zeta_migrate archived-graph.pkl migrated-graph.pkl
+```
+
+The command refuses to overwrite an existing destination and leaves the archive
+unchanged. Old column-valued graph caches are rebuilt on loading; the new copy
+uses shared helper class paths and can subsequently use ordinary `pickle.load`.
 
 ## Standalone FCFS
 
@@ -108,3 +123,33 @@ its whole solve. The harness reports this distinction and independently audits
 physical conflicts and full-volume row capacities. Compare matching domains:
 full480+FCFS with full480+CG, or forward12+FCFS with forward12+CG. If fixed seeds
 contain longer links, disclose them in the certificate scope for each arm.
+
+### Captured 100-request radius240 FCFS trial (2026-11-18)
+
+The original captured first 100 requests were filed with all connections within
+240 m (18 offsets at 120 m pitch), no forward restriction, and no CG seed pool.
+The process refused all CG imports. Native state/history/coverage helpers and
+both guarded history merges were enabled; 50k expansions / 250k labels and a
+5 s per-leg deadline, with the unchanged 1 s snap/5% speed allowance and 4 s
+buffered reservation rows. Captured physical cost weights remained ground 1 / air 3.
+
+- 98 accepted; flights 330 and 1454 timed out without a route. All collision,
+  capacities, reconstructed claims and radius audits passed. No selected route
+  revisited a waypoint; the search domain itself permits backward links.
+- Search 277.932 s; FCFS with claim audit 282.882 s; complete guarded process 294.891 s,
+  including 8.297 s cold native compilation and 2.025 s separate kernel warmup.
+  Peak process-tree RSS 0.708 GiB.
+- Accepted-route cost 2725.748287; including two 10,000 denial penalties,
+  objective 22725.748287. Certificates: 2 optimal, 59 numerical allowances,
+  39 deadlines (37 retain feasible routes). Maximum merge allowance 0.000102 cost
+  units; no small-gap guarantee for deadline results and no fleet lower bound.
+- 1,771,720 expanded / 2,446,913 generated histories / 7,072,008 edge evaluations.
+
+The earlier full480 trial also accepted 98, at cost 1002.364407. It is a historical
+reference from before the signed-price fix, not a fresh matched timing control.
+This radius240 trial does not establish a runtime or cost benefit.
+
+Frozen source, input checks, progress and audits are in canonical
+`.agent/zeta-fcfs240-20261118/`. The figure can be regenerated with
+`fig_zeta_fcfs240("context/figures/zeta_fcfs240_20261118.json")` from
+`context/figures/make_figures.py`.

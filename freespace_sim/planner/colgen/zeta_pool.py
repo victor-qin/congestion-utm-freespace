@@ -238,7 +238,7 @@ def _worker_main(
         # Retain the optional controller for the lifetime of this process.
         _thread_limits = _limit_worker_threads()
         if native_artifact is not None:
-            from .zeta_native import install_compiled_loop
+            from ..zeta.native import install_compiled_loop
             install_compiled_loop(native_artifact)
         graphs: dict[int, ZetaGraph] = {}
         conn.send(("ready", worker, os.getpid(), _peak_rss_bytes()))
@@ -388,7 +388,7 @@ class ZetaPricingPool:
             native_artifact = None
             if any(getattr(definition[3], "compiled_loop", False)
                    for definition in self._definitions.values()):
-                from .zeta_native import prepare_compiled_loop
+                from ..zeta.native import prepare_compiled_loop
                 try:
                     native_artifact = prepare_compiled_loop(deadline)
                 except TimeoutError as error:

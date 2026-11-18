@@ -189,7 +189,7 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
     """Any-angle selected routes preserve physical safety, objective and terminal capacity."""
     from freespace_sim.planner.colgen.objective import cost_model
     from freespace_sim.planner.colgen.zeta import ZetaOptions
-    from freespace_sim.planner.colgen.zeta_geometry import reservation_claims
+    from freespace_sim.planner.zeta.geometry import reservation_claims
     from freespace_sim.planner.colgen.zeta_solver import solve_zeta
 
     native_state_index = backend.endswith("-indexed")

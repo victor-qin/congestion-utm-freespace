@@ -27,9 +27,9 @@ from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.planner.colgen.translate import Column
 from freespace_sim.planner.colgen.zeta import ZetaGraph, ZetaOptions, ZetaPricingResult, price_zeta
-from freespace_sim.planner.colgen.zeta_geometry import anyangle_to_intent, reservation_claims
-from freespace_sim.planner.colgen.zeta_history import PriceHistory
-from freespace_sim.planner.colgen.zeta_history_guard import HistoryGuard
+from freespace_sim.planner.zeta.geometry import anyangle_to_intent, reservation_claims
+from freespace_sim.planner.zeta.history import PriceHistory
+from freespace_sim.planner.zeta.history_guard import HistoryGuard
 from freespace_sim.types import FlightRequest, Terminal, vec
 from freespace_sim.volumes import enroute_flown_m, exit_radius
 from tests._colgen_support import with_air_hops
@@ -507,7 +507,7 @@ def _check_anyangle_future_price_bound(
     --------
     - output (float): largest valid bound observed across complete paid prefixes.
     """
-    from freespace_sim.planner.colgen.zeta_bound import FuturePriceBound
+    from freespace_sim.planner.zeta.bound import FuturePriceBound
 
     cfg = graph.cfg
     model = cost_model(cfg, params)
@@ -617,14 +617,14 @@ def _check_anyangle_completion_bounds(
     --------
     - output (dict[str, float]): strongest additional component floor beyond sunk prices.
     """
-    from freespace_sim.planner.colgen.zeta_completion import CompletionBounds
-    from freespace_sim.planner.colgen.zeta_completion_geometry import geometry
-    from freespace_sim.planner.colgen.zeta_geometry import volume_spatial_cells
-    from freespace_sim.planner.colgen.zeta_timing import edge_end_times
+    from freespace_sim.planner.zeta.completion import CompletionBounds
+    from freespace_sim.planner.zeta.completion_geometry import geometry
+    from freespace_sim.planner.zeta.geometry import volume_spatial_cells
+    from freespace_sim.planner.zeta.timing import edge_end_times
     from freespace_sim.volumes import Volume4D
 
     cfg, model = graph.cfg, cost_model(graph.cfg, params)
-    from freespace_sim.planner.colgen.zeta_lattice_bound import LatticeDistanceBound
+    from freespace_sim.planner.zeta.lattice_bound import LatticeDistanceBound
     lattice = (LatticeDistanceBound.build(graph, model, prices)
                if graph.options.lattice_distance_bound else None)
     bounds = CompletionBounds.build(graph, prices, model)
@@ -711,7 +711,7 @@ def _anyangle_history_type(compiled_history: bool) -> type:
     pytest.importorskip("Cython")
     import sys
 
-    from freespace_sim.planner.colgen.zeta_native import prepare_compiled_loop
+    from freespace_sim.planner.zeta.native import prepare_compiled_loop
 
     name, _binary = prepare_compiled_loop()
     return sys.modules[name].PriceHistory
@@ -817,33 +817,6 @@ def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
                              deadline=time.perf_counter() - 1.0)
         assert not expired.complete and expired.reason == "deadline"
         assert expired.upper_bound >= expected - 1e-9
-
-
-@pytest.mark.parametrize("entry", ["compact", "hybrid"])
-def test_anyangle_legacy_pricing_entries_preserve_columns_and_bounds(entry: str) -> None:
-    """Archived low-level calls must accept CG arguments and return ordinary pricing results."""
-    pytest.importorskip("numba")
-    if entry == "compact":
-        from freespace_sim.planner.colgen.zeta_compact import price_zeta_compact as legacy
-    else:
-        from freespace_sim.planner.colgen.zeta_hybrid import price_hybrid as legacy
-    cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=2.0)
-    fg, params = _graph(cfg, dest=(2, 0), overrun=0)
-    rows = network_mod.RowIndex()
-    options = ZetaOptions(backend="compiled", early_return=True,
-                          cheap_connection_mode="hex12" if entry == "hybrid" else None)
-    graph = ZetaGraph(fg, cfg, rows, options)
-    known = graph.seed_columns(params)
-    prices = {row: (-0.25 if index % 2 else 2.0)
-              for index, row in enumerate(sorted(known[0].claims))}
-    for kwargs in ({}, {"known_columns": known}, {"forbidden_rows": known[0].claims},
-                   {"deadline": time.perf_counter() - 1.0}):
-        expected = price_zeta(ZetaGraph(fg, cfg, rows, options), prices, 0.0, params, **kwargs)
-        result = legacy(graph, prices, 0.0, params, **kwargs)
-        assert isinstance(result, ZetaPricingResult)
-        assert _without_anyangle_cache_metrics(result) == _without_anyangle_cache_metrics(expected)
-    with pytest.raises(ValueError, match="flight dual"):
-        legacy(graph, prices, math.nan, params)
 
 
 @pytest.mark.parametrize("objective", ["total_delay", "total_cost"])
@@ -1133,10 +1106,10 @@ def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
 
 def test_anyangle_shared_leg_cache_preserves_geometry_clocks_and_bounded_reuse(monkeypatch):
     """Shared entries preserve exact physical claims, request-specific walls and bounded retention."""
-    from freespace_sim.planner.colgen import zeta_leg_cache as cache
+    from freespace_sim.planner.zeta import leg_cache as cache
     from freespace_sim.planner.colgen.windows import terminal_claim_steps
-    from freespace_sim.planner.colgen.zeta_geometry import volume_spatial_cells
-    from freespace_sim.planner.colgen.zeta_timing import edge_end_times
+    from freespace_sim.planner.zeta.geometry import volume_spatial_cells
+    from freespace_sim.planner.zeta.timing import edge_end_times
 
     cache.clear_caches()
     cfg = _cfg(corridor_width_m=10.0, hover_radius_m=5.0, max_ground_delay_s=0.0)
@@ -1348,7 +1321,7 @@ def test_anyangle_pricing_reuses_geometry_with_new_prices_and_exact_clock_window
     expected = max(params.M - c.delay_s - math.fsum(prices[r] for r in c.claims)
                    for c in columns)
     if compiled_loop:
-        from freespace_sim.planner.colgen import zeta_native
+        from freespace_sim.planner.zeta import native as zeta_native
 
         def unexpected_build(*args, **kwargs):
             """An expired pricing call must not start or wait for a native build."""
@@ -1857,7 +1830,7 @@ def test_anyangle_strong_history_guard_preserves_ruler_and_budget_boundaries(
     prices = {RowKey.cell(1, -1, 0, 9): -2.0, RowKey.cell(1, 0, 0, 8): 0.5}
     guard = HistoryGuard(graph, cost_model(cfg, params), prices)
     assert guard.margin(None, None) is not None
-    from freespace_sim.planner.colgen.zeta_lattice_bound import LatticeDistanceBound
+    from freespace_sim.planner.zeta.lattice_bound import LatticeDistanceBound
 
     enabled = replace(options, lattice_distance_bound=True)
     lattice_graph = ZetaGraph(fg, cfg, row_index, enabled)
@@ -2187,7 +2160,7 @@ def test_anyangle_numeric_state_groups_preserve_exact_continuations() -> None:
     pytest.importorskip("Cython")
     import sys
 
-    from freespace_sim.planner.colgen.zeta_native import prepare_compiled_loop
+    from freespace_sim.planner.zeta.native import prepare_compiled_loop
 
     name, _binary = prepare_compiled_loop()
     index = sys.modules[name]._StateIndex()
@@ -2250,14 +2223,14 @@ def test_anyangle_route_coverage_cache_reprices_complete_unions(
     max_routes: int, compiled_route_coverage: bool,
 ) -> None:
     """Cached coverage must preserve union prices across clock, altitude and dual changes."""
-    from freespace_sim.planner.colgen.zeta_route_cache import RouteCoverageCache
+    from freespace_sim.planner.zeta.route_cache import RouteCoverageCache
 
     cache_type = RouteCoverageCache
     if compiled_route_coverage:
         pytest.importorskip("Cython")
         import sys
 
-        from freespace_sim.planner.colgen.zeta_native import prepare_compiled_loop
+        from freespace_sim.planner.zeta.native import prepare_compiled_loop
 
         name, _binary = prepare_compiled_loop()
         cache_type = sys.modules[name].RouteCoverageCache

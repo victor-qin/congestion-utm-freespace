@@ -42,13 +42,13 @@ from freespace_sim.planner.colgen.translate import (
     column_to_corners,
     column_to_intent,
 )
-from freespace_sim.planner.colgen.zeta_geometry import (
+from freespace_sim.planner.zeta.geometry import (
     anyangle_to_intent,
     reservation_claims,
     volume_claims,
     volume_spatial_cells,
 )
-from freespace_sim.planner.colgen.zeta_timing import edge_end_times
+from freespace_sim.planner.zeta.timing import edge_end_times
 from freespace_sim.planner.colgen.windows import (
     derive_cell_window,
     endpoint_claim_cells,
@@ -2484,7 +2484,7 @@ def test_anyangle_connection_set_controls_search_and_column_admission(
         stationary = replace(fg, request=replace(request, dest=request.origin), dest_cell=fg.origin_cell)
         assert not ZetaGraph(stationary, cfg, RowIndex(), options).neighbors((0, 0))
         if connection_mode == "hex12":
-            from freespace_sim.planner.colgen.zeta_forward import ForwardTopology
+            from freespace_sim.planner.zeta.forward import ForwardTopology
 
             for heading in (request.dest, request.origin, request.dest + vec(7.0, 11.0, 0.0)):
                 directed = ZetaGraph(replace(fg, request=replace(request, dest=heading)),
@@ -2516,7 +2516,7 @@ def test_anyangle_connection_set_controls_search_and_column_admission(
     with pytest.raises(ValueError, match="connection_mode"):
         replace(options, connection_mode="unknown")
 
-    from freespace_sim.planner.colgen.zeta_lattice_bound import (
+    from freespace_sim.planner.zeta.lattice_bound import (
         LatticeDistanceBound, lattice_distance_lower,
     )
     distance_bound = LatticeDistanceBound.build(graph, cost_model(cfg, params), {})

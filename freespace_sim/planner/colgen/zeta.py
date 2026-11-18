@@ -1,6 +1,6 @@
 """Column-generation adapter to the shared Zeta route search."""
 from __future__ import annotations
-from collections.abc import Callable, Mapping, Sequence, Set as AbstractSet
+from collections.abc import Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass, fields, replace
 from functools import partial
 import math
@@ -8,7 +8,7 @@ import time
 from ...types import OperationalIntent
 from ..zeta.model import Route, SearchSettings
 from ..zeta.search import (
-    ZetaGraph as RouteGraph, ZetaOptions as ZetaOptions, SearchResult, search,
+    ZetaGraph as RouteGraph, ZetaOptions as ZetaOptions, search,
     _Part as _Part, _Label as _Label, _Scan as _Scan,
 )
 from .network import RowKey
@@ -143,42 +143,14 @@ def price_zeta(
     --------
     - output (ZetaPricingResult): master column, reduced-cost bound and complete work evidence.
     """
-    return _price_with(search, graph, duals, pi_f, params, known_columns=known_columns,
-                       forbidden_rows=forbidden_rows, deadline=deadline)
-
-
-def _price_with(
-    searcher: Callable[..., SearchResult], graph: RouteGraph,
-    duals: Mapping[RowKey, float], pi_f: float, params: ColGenParams,
-    *, known_columns: Sequence[Column] = (), forbidden_rows: AbstractSet[RowKey] = frozenset(),
-    deadline: float | None = None, **backend_options: object,
-) -> ZetaPricingResult:
-    """Adapt CG arguments and results for public search and legacy backend entry points.
-
-    Parameters
-    ------------
-    - searcher (Callable): shared route-search entry point selected by the caller.
-    - graph (RouteGraph): reusable route graph and geometry caches.
-    - duals (Mapping[RowKey, float]): signed current reservation prices.
-    - pi_f (float): finite request dual.
-    - params (ColGenParams): objective and master improvement tolerance.
-    - known_columns (Sequence[Column]): supplied columns, revalidated by search.
-    - forbidden_rows (AbstractSet[RowKey]): saturated reservation rows.
-    - deadline (float | None): absolute cutoff covering setup and search.
-    - backend_options (object): legacy compact native-helper arguments, passed unchanged.
-
-    Return
-    --------
-    - output (ZetaPricingResult): CG result with the same canonical cost and certificate.
-    """
     started = time.perf_counter()
     if not math.isfinite(pi_f):
         raise ValueError("flight dual must be finite")
     model = cost_model(graph.cfg, params)
     settings = SearchSettings(model, params.epsilon, params.M - pi_f,
                               partial(_improves, model=model, params=params, pi_f=pi_f))
-    result = searcher(graph, duals, settings, known_routes=tuple(_route(c) for c in known_columns),
-                      forbidden_rows=forbidden_rows, deadline=deadline, **backend_options)
+    result = search(graph, duals, settings, known_routes=tuple(_route(c) for c in known_columns),
+                      forbidden_rows=forbidden_rows, deadline=deadline)
     margin = params.M - pi_f
     rc = margin - result.priced_cost
     upper = margin - result.raw_lower_bound

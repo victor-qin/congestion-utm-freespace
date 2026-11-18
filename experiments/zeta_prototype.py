@@ -13,7 +13,10 @@ from pathlib import Path
 import resource
 import sys
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from freespace_sim.planner.colgen.params import ColGenParams
 
 PROCESS_STARTED = time.monotonic()
 for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -28,7 +31,6 @@ from freespace_sim.ledger import ReservationLedger  # noqa: E402
 from freespace_sim.mechanism import FCFSMechanism  # noqa: E402
 from freespace_sim.planner import get_planner  # noqa: E402
 from freespace_sim.planner import hexgrid as hg  # noqa: E402
-from freespace_sim.planner.colgen.params import ColGenParams  # noqa: E402
 from freespace_sim.planner.route_cost import cost_model  # noqa: E402
 from freespace_sim.planner.route_domain import RowIndex  # noqa: E402
 from freespace_sim.planner.zeta import Route, ZetaOptions  # noqa: E402
@@ -413,6 +415,8 @@ def main() -> None:
     cfg, requests, terms = workload(args.case, args.flights, args.distance_cells, args.ground_delay)
     if args.arm == "zeta_fcfs":
         cfg = replace(cfg, planner="zeta")
+    from freespace_sim.planner.colgen.params import ColGenParams
+
     params = ColGenParams(
         solver=args.solver, max_air_overrun_hops=args.overrun,
         time_limit_s=args.seconds, ip_time_limit_s=args.ip_seconds,

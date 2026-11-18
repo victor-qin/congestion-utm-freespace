@@ -78,7 +78,7 @@ class PriceHistory:
         self._merge_equivalent = merge_equivalent
         self._merge_shorter = merge_shorter
         self._length_groups: dict[tuple[object, ...], list[tuple[float, float, int]]] = {}
-        self._broad_extrema: dict[tuple[object, ...], tuple[int, int]] = {}
+        self._broad_extrema: dict[Hashable, tuple[int, int]] = {}
         self.dead: set[int] = set()
         self.pruned = self.comparisons = 0
         self.strong_pruned = 0

@@ -217,6 +217,8 @@ def main() -> None:
     parser.add_argument("--ground-delay", type=float, default=64.0)
     parser.add_argument("--overrun", type=int, default=2)
     parser.add_argument("--radius", type=float, default=480.0)
+    parser.add_argument("--connection-mode", choices=("full", "hex12", "hex12_long"),
+                        default="full", help="permitted waypoint offsets within --radius")
     parser.add_argument("--seconds", type=float, default=60.0)
     parser.add_argument("--ip-seconds", type=float, default=5.0)
     parser.add_argument("--iterations", type=int, default=30)
@@ -301,6 +303,7 @@ def main() -> None:
                           merge_equivalent_histories=args.merge_equivalent_histories,
                           merge_shorter_histories=args.merge_shorter_histories,
                           forward_cruise=args.forward_cruise,
+                          connection_mode=args.connection_mode,
                           traversal=args.traversal,
                           lattice_distance_bound=args.lattice_distance_bound,
                           route_coverage_cache=args.route_coverage_cache,

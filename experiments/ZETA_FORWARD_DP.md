@@ -6,6 +6,24 @@ connection_mode="hex12", forward_cruise=True, traversal="forward_dp", ...)`, or
 use the corresponding `experiments.zeta_prototype` flags. The native Cython loop
 and compiled history helpers remain optional; the measured arm enables them.
 
+For a small self-contained forward12 run (install `uv sync --extra zeta-native`
+and a C compiler first):
+
+```sh
+uv run python -m experiments.zeta_prototype --arm zeta --solver highs \
+  --backend compiled --compiled-loop --compiled-history --native-state-index \
+  --connection-mode hex12 --forward-cruise --traversal forward_dp \
+  --expire-history --history-dominance --strong-history-dominance \
+  --merge-equivalent-histories --merge-shorter-histories --lattice-distance-bound \
+  --leg-cache --persistent-timing-cache --early-return \
+  --arrival-snap 1 --speed-fraction 0.05 --workers 2 \
+  --flights 2 --distance-cells 2 --ground-delay 8 --seconds 60 \
+  --out results/zeta-forward12-smoke.json
+```
+
+This generated crossing example exercises the entry point; it is not the captured
+100-request benchmark. The benchmark uses the fixed inputs and seeds below.
+
 ## Domain and state
 
 The existing graph filter is authoritative: retain an allowed hex offset only
@@ -90,5 +108,28 @@ serial/parallel parity, and physical collision/capacity/forward audits.
 Frozen sources, guarded fixed-dual profiles, alternating actual100 runs, resource
 measurements and the results report are in the canonical checkout's
 `.agent/zeta-forward-dp-20261118/`. Every optimizer, test and compilation run uses
-its absolute shared `metal-benchmark.lock`. No PR, merge or default switch is part
-of this experiment.
+its absolute shared `metal-benchmark.lock`. Integration retains the production
+planner as the default. The PR includes the prerequisite Zeta implementation,
+which was unpublished when the experiment ran.
+
+## Recorded actual100 comparison
+
+Two alternating runs per arm, before native indexing, used the same requests,
+3,495 seeds, 12 persistent workers, 50k expansions / 250k labels per pricing call,
+300 s solver budget, 1 s snapping and 5% allowance. Future-price and completion-price
+bounds were off. Total wall includes preparation, seeds, pool, master, IP and audit;
+cold native compilation (7.704 s) is reported separately.
+
+| Arm | Pricing wall (s) | Total wall (s) | Cost | Valid cost lower bound | Complete / unresolved |
+|---|---:|---:|---:|---:|---:|
+| Best-first forward12 | 53.505 | 86.488 | 1023.188923 | 916.050177 | 92 / 8 |
+| Forward12 DP | 50.507 | 83.507 | 1026.096762 | 836.906819 | 88 / 12 |
+
+Both served all 100 with zero collision, capacity or forward-audit violations.
+DP took 5 rounds, expanded 2,607,412 labels and generated 3,981,152; best-first took
+6 rounds, expanded 1,729,199 and generated 1,836,632. DP's unresolved calls were
+10 caps plus 2 numerical-merge allowances, versus 6 plus 2 for best-first. Their
+integer gaps were 18.438% and 10.471%, respectively. These capped results do not
+establish convergence or isolate a queue-removal speedup. The
+[native-index comparison](ZETA_NATIVE_INDEX.md#recorded-actual100-comparison) holds
+the traversal and search results fixed.

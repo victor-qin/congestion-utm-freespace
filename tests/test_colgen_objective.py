@@ -2191,6 +2191,9 @@ def test_anyangle_route_coverage_cache_reprices_complete_unions(
 @pytest.mark.parametrize("snap", [0.0, 1.0])
 def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(native, snap, monkeypatch):
     """A waypoint sweep retains asynchronous histories, signed unions and all pending bounds."""
+    pytest.importorskip("numba")
+    if native:
+        pytest.importorskip("Cython")
     cfg = _cfg(max_ground_delay_s=4.0, max_detour_factor=2.0)
     fg, params = _graph(cfg, dest=(3, -1), overrun=1)
     rows = network_mod.RowIndex()

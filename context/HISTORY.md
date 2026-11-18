@@ -2,6 +2,15 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-18T02:10Z [CODE/TOOL] Zeta's variable-duration links cannot reuse production DP's
+  hop-derived clock/length or fixed recent-hop history. Preserve exact arrival times, both length
+  accumulations, endpoint/context roles and the union of buffered reservation rows. Native group
+  IDs do not permit collapsing different paid histories; signed paid-set partitions are local
+  to one frozen dual vector. A spatial forward sweep interrupted inside an expansion must retain
+  the active parent's lower floor as well as every pending waypoint, or it can falsely certify
+  omitted successors. Files: `freespace_sim/planner/colgen/{zeta_compact,zeta_forward,zeta_history,zeta_state_index}.py`,
+  `tests/test_colgen_objective.py`.
+
 - 2026-11-12T02:10Z [TOOL] `terminal_airspace_always_active` is not only a wall switch: hub placement
   reject-samples on the wall extent and the demand drops customers inside foreign walls, both keyed on
   the flag. Flipping it on density_faa moved 119/182 hubs and left 0 of 2,318 requests in common, so an

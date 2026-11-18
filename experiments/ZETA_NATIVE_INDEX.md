@@ -54,3 +54,36 @@ are maintained in the canonical workspace under `.agent/zeta-native-index-202611
 The initial index-only probes were mixed; caching the existing paid-set partitions
 addressed the measured history-preparation cost. Consult that task's report for measured
 benefits and limits; no timing claim follows from native compilation alone.
+
+## Recorded actual100 comparison
+
+| Domain | Index off pricing (s) | Index on pricing (s) | Index off total (s) | Index on total (s) |
+|---|---:|---:|---:|---:|
+| Forward12 DP, two runs per option | 50.752 | 46.195 | 82.926 | 78.515 |
+| Full480, first 8 identical complete rounds, one pair | 245.367 | 236.904 | — | — |
+
+Forward DP preserves all 500 pricing results, routes, bounds and operation counts
+per run: 100 served, cost 1026.096762, valid lower bound 836.906819, gap 18.438%,
+88 complete / 12 unresolved. Pricing decreased 8.98% and total wall 5.32% in this
+cohort. The unresolved calls remain 10 caps and 2 numerical-merge allowances.
+
+Full480's matching eight rounds used 3.45% less pricing wall in one pair. Both
+whole runs reached the pricing deadline at approximately 284.19 s total; their
+different partial ninth rounds prevent a whole-run speed comparison. Both selected
+the same 100 routes at cost 1007.828388, lower bound 596.351271 and gap 40.828%.
+Neither domain converged. Certificate scopes are the configured graph plus the
+fixed seed pool: 3,495 forward-compatible full480 seeds for forward12; 3,500 for full480.
+
+The comparison uses 12 persistent workers, 50k / 250k work caps, a 300 s solver
+budget, 1 s snap / 5% allowance, and no future-price/completion bounds. Total wall
+includes seed preparation, graph, pool, master, IP and physical audit. Cold native
+compilation took 7.514 s separately. Peak RSS off/on was 7.679/7.638 GiB for DP and
+11.768/11.787 GiB for full480. Interned rejected keys/paid sets remain until a call
+ends, so memory reduction is not guaranteed on other inputs.
+
+Validation before integration: 200 focused tests, 24 matched fixed-price calls and
+six actual100 solves. All six physical collision/capacity/cost audits passed.
+These measurements belong to the frozen pre-integration snapshot, subsequently
+committed as `ae0734a33f994777c3de0c261d7d99facf5c01ba`; current-main integration
+checks are recorded separately in the PR. Raw logs, input/source hashes, negative
+probes and reproduction harnesses remain in the task directory named above.

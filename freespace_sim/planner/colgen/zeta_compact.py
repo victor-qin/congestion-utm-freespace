@@ -1,8 +1,9 @@
 """Compact parent-pointer search with compiled sparse reservation-price expansion.
 
 Geometry and final columns remain owned by the simulator. Numeric successor scans,
-label writes, expiry and reservation unions are compiled; the priority queue remains
-in Python. Timed footprints use exact clocks and a fresh row table each pricing call.
+label writes, expiry and reservation unions are compiled. Best-first uses a Python
+priority queue; forward DP uses waypoint buckets. Timed footprints use exact clocks
+and a fresh row table each pricing call.
 """
 
 from __future__ import annotations

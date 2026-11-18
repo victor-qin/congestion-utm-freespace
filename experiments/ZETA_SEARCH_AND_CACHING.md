@@ -535,4 +535,3 @@ This option preserves the certificate's existing domain. In the actual100 compar
 that is each restricted graph plus the same 3,500 initial full480 routes, with forward
 filtering disabled. The proof and fixed-dual evidence are filed under the root
 `.agent/zeta-lattice-bound-20261117/`; matched full solves are in its `actual100/`.
-

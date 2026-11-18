@@ -320,3 +320,9 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   barrier) is not row-clean: it looked 91% integral but overloaded 35,482 lazy rows the barrier
   solution never touched. Re-run `add_violated_rows` until clean before reading integrality or
   rounding off any re-solved master LP. Files: `freespace_sim/planner/colgen/master.py`.
+- 2026-11-18T00:48Z [TOOL] Persistent-worker collectors must report deaths already marked on shared
+  channels to each new phase. Otherwise a known death becomes a full deadline wait when the prior
+  collector has already consumed the sentinel. Report once per collector to avoid busy polling while
+  earlier live flights finish. Reproduced by killing a worker, observing its exit, then starting a seed
+  phase (PR #158). Files: `freespace_sim/planner/colgen/pricing_pool.py`,
+  `tests/test_colgen_pricing_pool.py`.

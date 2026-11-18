@@ -11,7 +11,8 @@ so the per-round IP step adds its eager rows without searching. Round sums exclu
 cohort to convergence under the capture's own limits, final IP included.
 
     python -m experiments.colgen_four_round --capture CAPTURE.pkl --out results/four_round/X \
-        --profile [--rows-only] [--work-stealing] [--full] [--workers N] [--gurobi-threads N]
+        --profile [--rows-only] [--work-stealing] [--min-price-duals] [--full] [--workers N]
+        [--gurobi-threads N]
         [--lock FILE]
 """
 
@@ -192,6 +193,16 @@ def main() -> None:
                         help='Per-round step adds eager rows only (iteration_ip_search=False).')
     parser.add_argument('--work-stealing', action='store_true',
                         help='Idle pricing workers take unsent flights (pricing_work_stealing).')
+    parser.add_argument('--min-price-duals', action='store_true',
+                        help='Price against the min-total-capacity-price optimal duals '
+                             '(min_price_duals).')
+    parser.add_argument('--min-norm-duals', action='store_true',
+                        help='Price against the minimum-norm optimal duals (min_norm_duals); '
+                             'with --full, rounds.pkl gains the final pool LP with its own duals.')
+    parser.add_argument('--emptiest-airspace', action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help='Break price ties toward the least LP traffic '
+                             "(emptiest_airspace_tiebreak; default: the solver's, on for CPU).")
     parser.add_argument('--full', action='store_true',
                         help="Solve to convergence and the final IP under the capture's limits.")
     args = parser.parse_args()
@@ -225,7 +236,10 @@ def main() -> None:
                      n_pricing_workers=args.workers,
                      max_iterations=params.max_iterations if args.full else 4,
                      iteration_ip_search=not args.rows_only,
-                     pricing_work_stealing=args.work_stealing)
+                     pricing_work_stealing=args.work_stealing,
+                     min_price_duals=args.min_price_duals,
+                     min_norm_duals=args.min_norm_duals,
+                     emptiest_airspace_tiebreak=args.emptiest_airspace)
     # The per-round step, and so --rows-only, only runs with a positive per-round IP limit.
     assert params.iteration_ip_time_limit_s > 0, params.iteration_ip_time_limit_s
     rounds: list[dict[str, Any]] = []
@@ -279,7 +293,9 @@ def main() -> None:
                 raise PricingPrefixComplete
 
         kwargs['on_iteration'] = record
-        return original_solve(self, *positional, **kwargs)
+        result = original_solve(self, *positional, **kwargs)
+        initial['real_dual_lp'] = getattr(result, 'real_dual_lp', None)
+        return result
 
     # --lock serializes with other benchmarks on a shared machine; a job owning its node
     # needs none.

@@ -294,3 +294,29 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   "simplify" to Gurobi's `Threads=0`: it counts the whole node, not the Slurm grant, and ran 32
   threads in a 4-core job (largest LP 80.3 s vs 18.3 s on a whole node). Files:
   `freespace_sim/planner/colgen/master.py`.
+
+- 2026-11-12T03:30Z [TOOL] Min-price dual selection (`min_price_duals`): barrier without crossover
+  cannot solve an LP pinned to its own optimum at 1e-9 relative. The feasible slab is thinner than
+  barrier's convergence tolerance, so it returned NUMERIC on 28/28 rounds of two full 1,537-flight
+  solves (homogeneous barrier failed on some rounds too) although the pin was feasible (exact
+  optimum within 5e-7 of the master's barrier z*). Use dual simplex for any second-stage LP pinned
+  to optimality. Separately, faster LP convergence did not mean a better answer: min-price duals
+  cut pricing 33% and lifted the lower bound every round, but the sparser pool's final IP cost
+  162,924 vs 156,616 (+4.0%; unproven at 600 s, its bound ≥161,934 is already +3.4%). Judge any dual-selection
+  change by the final IP cost, not rounds or bound. Runs 20261112T024339Z-mpd44-spx-on1-dd1941,
+  20261112T024408Z-mpd44-off2-433fee. Files: `freespace_sim/planner/colgen/{master,solver}.py`.
+
+- 2026-11-17T23:50Z [TOOL] Zero prices cannot break pricing's ties. Every row below capacity has
+  mu = 0 under any optimal duals (complementary slackness), and 92-96% of FULL rows are unpriced
+  too because only violated rows are materialized, so pricing's geometric tie-break (hops,
+  departure, lane, cell order) sends tied flights through cells the LP already uses. Min-norm duals
+  made it worse: 8 rounds instead of 14, but the pool lost the same-delay alternatives the final IP
+  needs (+7.9%, IP unproven at 600 s, bound >= 161,381 vs 156,584). Breaking ties by LP load
+  (`emptiest_airspace_tiebreak`) fixed both: own duals 14 -> 5 rounds, 595 s -> 465 s, IP +0.02%.
+  Judge any pricing/dual change by the final IP cost or its proven bound; time-limited re-solves of
+  one pool differ by ~3%. Files: `freespace_sim/planner/colgen/{solver,params,master}.py`.
+
+- 2026-11-17T23:50Z [TOOL] A different optimal vertex of the final LP (crossover instead of
+  barrier) is not row-clean: it looked 91% integral but overloaded 35,482 lazy rows the barrier
+  solution never touched. Re-run `add_violated_rows` until clean before reading integrality or
+  rounding off any re-solved master LP. Files: `freespace_sim/planner/colgen/master.py`.

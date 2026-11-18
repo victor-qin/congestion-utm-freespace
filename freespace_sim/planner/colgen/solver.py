@@ -63,6 +63,12 @@ _OBJECTIVE_TOL = 1e-8
 _EMPTIEST_AIRSPACE_DELTA = 1e-7
 
 
+def _dual_rule(params: ColGenParams) -> str | None:
+    """The rule `master.select_duals` applies after every complete LP, or ``None``."""
+    return ("min_price" if params.min_price_duals
+            else "min_norm" if params.min_norm_duals else None)
+
+
 def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
     """Describe the selected pricing implementation even when setup stops early.
 
@@ -83,6 +89,9 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
         "pricing_gpu_prepare_batch_size": params.pricing_gpu_prepare_batch_size,
         "pricing_gpu_prepare_max_bytes": params.pricing_gpu_prepare_max_bytes,
         "pricing_gpu_prepare_cache_bytes": params.pricing_gpu_prepare_cache_bytes,
+        # Both change the answer, so a run must record which ran.
+        "dual_rule": _dual_rule(params),
+        "emptiest_airspace_tiebreak": params.effective_emptiest_airspace_tiebreak,
         "pricing_bound_certified": False,
         "pricing_search_complete": False,
         "last_pricing_status": "not_started",
@@ -782,7 +791,8 @@ def _real_dual_lp(master: RestrictedMaster, deadline: float) -> tuple[BackendLpR
     Return
     --------
     - output (tuple[BackendLpResult | None, str]): the LP and ``"solved"``, or ``None`` and
-      ``"time_limit"`` when the deadline passed first.
+      ``"time_limit"`` when the deadline passed first, or ``"failed"`` when the backend
+      returned a non-optimal status.
     """
     while True:
         remaining_s = deadline - time.monotonic()
@@ -793,6 +803,10 @@ def _real_dual_lp(master: RestrictedMaster, deadline: float) -> tuple[BackendLpR
             objective, row_duals, x = master.solve_lp()
         except BackendTimeout:
             return None, "time_limit"
+        except RuntimeError as exc:
+            # A diagnostic: losing it must not lose the solve that already finished.
+            log.warning("final-pool LP for real duals failed: %s", exc)
+            return None, "failed"
         if not master.add_violated_rows(x, _FEASIBILITY_TOL):
             return BackendLpResult(objective, master.flight_duals, row_duals, x), "solved"
 
@@ -1317,9 +1331,7 @@ class ColGenSolver:
             seed=cfg.seed,
             fixed_loads=committed_loads,
         )
-        # The rule `master.select_duals` applies after every complete LP, if any.
-        dual_rule = ("min_price" if params.min_price_duals
-                     else "min_norm" if params.min_norm_duals else None)
+        dual_rule = _dual_rule(params)
         if dual_rule is not None and _backend_name(master) != "gurobi":
             raise ValueError(
                 f"{dual_rule}_duals needs the Gurobi backend, but this solve resolved to "
@@ -1623,6 +1635,16 @@ class ColGenSolver:
                     else:
                         dual_selection, dual_objective = dual_rule, selection.dual_objective
                         capacity_duals = dict(master.last_row_duals)
+                # Pricing may see nudged prices; `capacity_duals` stays the selected duals
+                # for the round record, and `dual_objective` follows the prices priced on.
+                # Built here, before the greedy stage adds columns `last_x` does not index.
+                pricing_duals, nudged_rows = capacity_duals, 0
+                if params.effective_emptiest_airspace_tiebreak:
+                    pricing_duals, nudge_objective, nudged_rows = _timed(
+                        "emptiest_airspace", _emptiest_airspace_duals, capacity_duals, master,
+                        last_x, _EMPTIEST_AIRSPACE_DELTA,
+                    )
+                    dual_objective += nudge_objective
 
                 # LNS needs something to start from; `best_heuristic` is the greedy seed on
                 # iteration 1 and a real incumbent after, so it is never empty here -- but
@@ -1719,15 +1741,6 @@ class ColGenSolver:
                     ),
                 )
                 pricing_complete = True
-                # Pricing may see nudged prices; `capacity_duals` stays the selected duals
-                # for the round record, and `dual_objective` follows the prices priced on.
-                pricing_duals, nudged_rows = capacity_duals, 0
-                if params.effective_emptiest_airspace_tiebreak:
-                    pricing_duals, nudge_objective, nudged_rows = _timed(
-                        "emptiest_airspace", _emptiest_airspace_duals, capacity_duals, master,
-                        last_x, _EMPTIEST_AIRSPACE_DELTA,
-                    )
-                    dual_objective += nudge_objective
                 dual_view = DualView(pricing_duals, cfg)
                 flight_duals = master.flight_duals
                 # Per-iteration sweep cost, which is the whole cost of a solve.  A total
@@ -2247,17 +2260,6 @@ class ColGenSolver:
             if not incumbent or _better_selection(ip_selection, incumbent, params.M):
                 incumbent = dict(ip_selection)
 
-        # Every LP above handed pricing re-selected duals, so the last real ones belong to an
-        # older pool. Re-solve the final master's LP for its own. AFTER the final IP, so the IP
-        # keeps its whole budget and its answer; the eager rows it added are valid capacity
-        # rows, which leave the LP's optimum unchanged.
-        real_dual_lp: BackendLpResult | None = None
-        real_dual_lp_status, real_dual_lp_s = "not_run", 0.0
-        if dual_rule is not None and math.isfinite(last_lp_objective):
-            real_dual_lp_started = time.monotonic()
-            real_dual_lp, real_dual_lp_status = _real_dual_lp(master, deadline)
-            real_dual_lp_s = time.monotonic() - real_dual_lp_started
-
         # A ≤1 flight row keeps every RMP feasible.  Recover omitted flights in
         # planned-departure order by pricing with already saturated rows removed
         # from their DAG.  Failure here is the optimizer's budget denial verdict.
@@ -2390,6 +2392,16 @@ class ColGenSolver:
         # folder's own delay metrics, computed from the filed intents, are the seconds.
         objective_value = math.fsum(column.delay_s for column in incumbent.values())
         master_objective = _selection_objective(incumbent, params.M)
+        # Every LP above handed pricing re-selected duals, so the last real ones belong to an
+        # older pool. Re-solve the final master's LP for its own. LAST, after the final IP and
+        # repair, so a diagnostic can neither take their budget nor change the answer; the
+        # eager rows the IP added are valid capacity rows, which leave the LP's optimum unchanged.
+        real_dual_lp: BackendLpResult | None = None
+        real_dual_lp_status, real_dual_lp_s = "not_run", 0.0
+        if dual_rule is not None and math.isfinite(last_lp_objective):
+            real_dual_lp_started = time.monotonic()
+            real_dual_lp, real_dual_lp_status = _real_dual_lp(master, deadline)
+            real_dual_lp_s = time.monotonic() - real_dual_lp_started
         elapsed_s = time.monotonic() - started
         arc_stats: Counter[str] = Counter()
         for graph in graphs.values():

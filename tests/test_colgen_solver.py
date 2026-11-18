@@ -1052,6 +1052,14 @@ def test_hand_checked_detour_beats_hold():
         (),
         _params(max_air_overrun_hops=1, gap_metric="cost", emptiest_airspace_tiebreak=False),
     )
+    # The greedy stage grows the pool between the first LP and its pricing; the default
+    # tie-break prices that round from the LP's loads and must still find the detour.
+    greedy = ColGenSolver().solve(
+        requests,
+        cfg,
+        (),
+        _params(max_air_overrun_hops=1, gap_metric="cost", greedy_budget_s_per_flight=1.0),
+    )
 
     # The claim is the name of the test: a one-hop detour still beats a four-step hold.
     # Under the config's 1:3 weighting the hold costs 16 (16 ground seconds, w_ground = 1,
@@ -1059,6 +1067,7 @@ def test_hand_checked_detour_beats_hold():
     # wins by 4, and a ratio above 4:1 would flip it.
     assert no_detour.stats["objective"] == pytest.approx(16.0, abs=1e-8)
     assert with_detour.stats["objective"] == pytest.approx(12.0, abs=1e-8)
+    assert greedy.stats["objective"] == pytest.approx(12.0, abs=1e-8)
     assert with_detour.stats["objective"] < no_detour.stats["objective"]
     assert with_detour.stats["cost_lower_bound"] == pytest.approx(12.0, abs=1e-7)
     assert with_detour.stats["cost_upper_bound"] == pytest.approx(12.0, abs=1e-7)
@@ -1287,8 +1296,44 @@ def test_budget_limited_crossing_denies_exactly_one_in_repair():
     _assert_claim_feasible(result.columns)
 
 
-def test_repair_covers_all_feasible_flights(monkeypatch):
-    """Force an empty RMP incumbent; sequential pricing must rebuild a full schedule."""
+@pytest.mark.parametrize("min_norm", [False, True])
+def test_repair_covers_all_feasible_flights(monkeypatch, min_norm):
+    """Force an empty RMP incumbent; sequential pricing must rebuild a full schedule.
+
+    With min-norm duals, the final pool's LP is re-solved for its own duals as a diagnostic.
+    That LP failing, and using up the clock, must not cost repair a flight.
+    """
+
+    params = _params()
+    if min_norm:
+        pytest.importorskip("gurobipy")
+        params = _params(solver="gurobi", min_norm_duals=True)
+
+        class _Clock:
+            """The solver's ``time`` module, with a monotonic clock the test pushes forward."""
+
+            offset = 0.0
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def monotonic(self):
+                return time.monotonic() + self.offset
+
+        clock = _Clock()
+        monkeypatch.setattr(solver_module, "time", clock)
+        real_dual_lp = solver_module._real_dual_lp
+
+        def failing_real_dual_lp(master, deadline):
+            def not_optimal():
+                raise RuntimeError("Gurobi LP failed with status 12")
+
+            monkeypatch.setattr(master, "solve_lp", not_optimal)
+            outcome = real_dual_lp(master, deadline)
+            clock.offset = params.time_limit_s + 1.0
+            return outcome
+
+        monkeypatch.setattr(solver_module, "_real_dual_lp", failing_real_dual_lp)
 
     cfg = _cfg(max_ground_delay_s=32.0)
     requests = [
@@ -1306,11 +1351,14 @@ def test_repair_covers_all_feasible_flights(monkeypatch):
     monkeypatch.setattr(RestrictedMaster, "round_heuristic", lambda *args, **kwargs: {})
     monkeypatch.setattr(RestrictedMaster, "solve_ip", lambda *args, **kwargs: {})
 
-    result = ColGenSolver().solve(requests, cfg, (), _params())
+    result = ColGenSolver().solve(requests, cfg, (), params)
 
     assert len(result.columns) == len(requests)
     assert result.stats["repair_added"] == len(requests)
     assert result.stats["denied_flight_ids"] == ()
+    if min_norm:
+        assert result.stats["real_dual_lp_status"] == "failed"
+        assert result.real_dual_lp is None
     _assert_claim_feasible(result.columns)
     _assert_files_cleanly(requests, result.columns, cfg)
 
@@ -2367,6 +2415,9 @@ def test_backend_parity_when_final_integer_master_runs():
     assert highs.stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
     assert gurobi.stats["dual_selection_fallbacks"] == 0
     assert gurobi.real_dual_lp is None and gurobi.stats["real_dual_lp_status"] == "not_run"
+    # Both change the answer, so a run's stats must say which ran (CPU default: nudge on).
+    assert (gurobi.stats["dual_rule"], gurobi.stats["emptiest_airspace_tiebreak"]) == (None, True)
+    first_round: dict[tuple[str, bool], dict] = {}
     for rule, emptiest in (("min_price", False), ("min_norm", False), ("min_norm", True)):
         rounds: list[dict] = []
         selected = ColGenSolver().solve(
@@ -2375,8 +2426,10 @@ def test_backend_parity_when_final_integer_master_runs():
                     emptiest_airspace_tiebreak=emptiest, **controls),
             on_iteration=rounds.append,
         )
+        first_round[rule, emptiest] = rounds[0]
         assert {r["emptiest_airspace_rows"] > 0 for r in rounds} == {emptiest}
         stats = selected.stats
+        assert (stats["dual_rule"], stats["emptiest_airspace_tiebreak"]) == (rule, emptiest)
         assert stats["objective"] == pytest.approx(gurobi.stats["objective"], abs=1e-6)
         assert rounds and {r["dual_selection"] for r in rounds} <= {rule, "fallback"}
         assert stats["dual_selection_fallbacks"] == sum(
@@ -2387,6 +2440,18 @@ def test_backend_parity_when_final_integer_master_runs():
         assert stats["real_dual_lp_status"] == "solved"
         assert selected.real_dual_lp.objective == stats["real_dual_lp_objective"]
         assert stats["real_dual_lp_objective"] >= stats["final_lp_objective"] - 1e-6
+    # Same first LP and selected duals with or without the nudge, so the nudge alone moves
+    # the round's ``b^T y``: by delta * load on each loaded row (``capacity - fixed load``
+    # times delta * load / capacity, with no fixed load here). The bound adds reduced costs
+    # to that value, so it must carry the increase exactly.
+    plain, nudged = first_round["min_norm", False], first_round["min_norm", True]
+    nudged_load = math.fsum(
+        value * len(column.claims) for column, value in zip(nudged["lp_columns"], nudged["lp_x"])
+    )
+    assert nudged_load > 0.0
+    assert nudged["dual_objective"] - plain["dual_objective"] == pytest.approx(
+        solver_module._EMPTIEST_AIRSPACE_DELTA * nudged_load, abs=1e-9
+    )
     assert sorted(column.delay_s for column in highs.columns.values()) == pytest.approx(
         sorted(column.delay_s for column in gurobi.columns.values())
     )

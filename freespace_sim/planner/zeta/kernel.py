@@ -6,8 +6,12 @@ import math
 
 import numpy as np
 from numba import njit
+from numba.extending import register_jitable
 
 from ..route_numeric import FSUM_MAX_PARTIALS, _fsum_add, _fsum_finalize
+from .price_floor import price_floor
+
+_price_floor = register_jitable(price_floor)
 
 
 @njit(cache=True, nogil=True)
@@ -284,7 +288,7 @@ def build_successor_scan(
     distances: np.ndarray, remainings: np.ndarray, length: float, positive: float,
     inherited_floor: float, ground: float, fold: float, reference: float,
     air_weight: float, nominal_speed: float, negative: float, tolerance: float,
-    max_length: float, best: float,
+    max_length: float, best: float, price_error: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Filter and stably order deferred successors using unchanged floating-point bounds.
 
@@ -304,6 +308,7 @@ def build_successor_scan(
     - tolerance (float): unchanged conservative bound subtraction.
     - max_length (float): maximum physical route length.
     - best (float): current feasible priced cost cutoff.
+    - price_error (float): shared whole-union rounding allowance for this price vector.
 
     Return
     --------
@@ -321,7 +326,8 @@ def build_successor_scan(
             if not math.isnan(fold) and reference > 1e-9:
                 detour = max(0.0, lower + remaining + fold - reference)
                 cost += air_weight * detour / nominal_speed
-            floor = max(inherited_floor, cost + positive + negative - tolerance)
+            floor = max(inherited_floor,
+                        _price_floor(cost, positive, negative, price_error, tolerance))
             if floor < best:
                 indices[count] = index
                 floors[count] = floor

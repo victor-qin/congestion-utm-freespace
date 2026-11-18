@@ -28,6 +28,7 @@ from .search import Cell, ZetaGraph, SearchResult
 from .geometry import volume_spatial_cells
 from .history import PriceHistory as PythonPriceHistory
 from .history_guard import HistoryGuard
+from .price_floor import prepare_price_floor, price_floor
 from .kernel import (
     apply_timed_edge, build_successor_scan, evaluate_edge, partition_expired,
     prepare_timed_edge, prepare_windowed_edge, write_label,
@@ -190,7 +191,7 @@ def search_compact(
     if any(not math.isfinite(value) for value in prices.values()):
         raise ValueError("row prices must be finite")
     forbidden_rows = frozenset(RowKey(row) for row in forbidden_rows)
-    negative: float = math.fsum(value for value in prices.values() if value < 0.0)
+    negative, price_error = prepare_price_floor(prices.values())
     cfg, fg = graph.cfg, graph.fg
     model = settings.model
     best: float = math.inf
@@ -212,10 +213,11 @@ def search_compact(
     early_candidate_ready = False
     expanded = generated = edge_evaluations = successor_pops = 0
     tol: float = min(1e-7, settings.epsilon * 0.1)
+    global_floor = price_floor(0.0, 0.0, negative, price_error, tol)
     forward_dp = graph.options.traversal == "forward_dp"
     lazy = graph.options.lazy_successors and not forward_dp
     frontier = topology = None
-    active_floor = negative - tol
+    active_floor = global_floor
     topology_setup_s = incumbent_setup_s = 0.0
     heap: list[tuple[float, int, int, int, int]] = []
     serial = itertools.count()
@@ -346,7 +348,7 @@ def search_compact(
         if fold is not None and graph.reference > 1e-9:
             detour: float = max(0.0, length + remaining + fold - graph.reference)
             cost += model.air_weight * detour / cfg.nominal_speed_mps
-        return cost + positive + negative - tol
+        return price_floor(cost, positive, negative, price_error, tol)
 
     def intern_paid(paid: np.ndarray) -> int:
         """Intern immutable sorted row-id sets, with byte equality rather than hash-only equality."""
@@ -483,7 +485,7 @@ def search_compact(
                 indices, floors = build_successor_scan(
                     *target_arrays[key], length, positive, labels.floors[label], ground,
                     math.nan if fold is None else fold, graph.reference, model.air_weight,
-                    cfg.nominal_speed_mps, negative, tol, graph.max_length, best,
+                    cfg.nominal_speed_mps, negative, tol, graph.max_length, best, price_error,
                 )
                 scans[label] = entries, indices, floors
             _entries, _indices, floors = scans[label]
@@ -658,7 +660,7 @@ def search_compact(
         setup_started = time.perf_counter()
         for column in known_routes:
             if deadline is not None and time.perf_counter() >= deadline:
-                return finish(False, "deadline", negative - tol)
+                return finish(False, "deadline", global_floor)
             accept(column, known=True)
         if incumbent is None:
             for column in graph.seed_routes(model, deadline):
@@ -666,14 +668,14 @@ def search_compact(
         incumbent_setup_s = time.perf_counter() - setup_started
         if early_candidate_ready:
             # Roots are not built yet; retain the same global floor used on interrupted setup.
-            return finish(False, "improving_column", negative - tol)
+            return finish(False, "improving_column", global_floor)
         if forward_dp:
             setup_started = time.perf_counter()
             try:
                 topology = ForwardTopology.build(graph, deadline)
             except TimeoutError:
                 topology_setup_s = time.perf_counter() - setup_started
-                return finish(False, "deadline", negative - tol)
+                return finish(False, "deadline", global_floor)
             topology_setup_s = time.perf_counter() - setup_started
             assert topology.cells == cells
             frontier = ForwardFrontier(topology)
@@ -701,10 +703,10 @@ def search_compact(
                 completion_bounds = None
         for dep in range(fg.base_step, fg.latest_departure_step + 1):
             if deadline is not None and time.perf_counter() >= deadline:
-                return finish(False, "deadline", negative - tol)
+                return finish(False, "deadline", global_floor)
             ground = model.ground_weight * ((dep - fg.base_step) * cfg.dt_s)
             # Even granting every negative row price cannot rescue this or a later departure.
-            if ground + negative - tol >= best:
+            if price_floor(ground, 0.0, negative, price_error, tol) >= best:
                 break
             origin_rows = graph.rows(graph.endpoint(True, dep * cfg.dt_s))
             if not origin_rows.isdisjoint(forbidden_rows):
@@ -725,7 +727,7 @@ def search_compact(
                         enqueue(cell_ids[start], -1, context, paid, 0, False, True,
                                 stamp, 0.0, positive, floor)
                         if graph.options.max_labels is not None and generated >= graph.options.max_labels:
-                            return finish(False, "search_cap", negative - tol)
+                            return finish(False, "search_cap", global_floor)
 
         while heap or (frontier is not None and frontier.peek() is not None):
             while heap and history is not None and heap[0][3] in history.dead:

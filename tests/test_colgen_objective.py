@@ -697,7 +697,8 @@ def _check_anyangle_completion_bounds(
 def _without_anyangle_cache_metrics(result: ZetaPricingResult) -> ZetaPricingResult:
     """Compare answers and search work while allowing reuse and elapsed-time counters to differ."""
     counters = {field.name: 0 for field in fields(result)
-                if field.name in {"wall_s", "bound_build_s", "incumbent_setup_s", "topology_setup_s"}
+                if field.name in {"wall_s", "bound_build_s", "incumbent_setup_s", "topology_setup_s",
+                                   "cheap_wall_s", "full_wall_s"}
                 or field.name.startswith(("shared_leg_cache_", "shared_footprint_cache_",
                                           "persistent_timing_cache_"))}
     return replace(result, **counters)
@@ -714,6 +715,135 @@ def _anyangle_history_type(compiled_history: bool) -> type:
 
     name, _binary = prepare_compiled_loop()
     return sys.modules[name].PriceHistory
+
+
+@pytest.mark.parametrize("values", [
+    [1e17, 10.0, -1e17], [1e200, 10.0, -1e200],
+    [1e17, *([1.0] * 64), -1e17],
+    [math.ulp(0.0), -math.ulp(0.0), math.ulp(0.0)],
+    [1e308, 1e308, -1e308, -1e308, 10.0], [],
+])
+def test_anyangle_price_floor_covers_partial_signed_unions(values: list[float]) -> None:
+    """Prefix bounds cover complete unions across cancellation, subnormals and overflow."""
+    from freespace_sim.planner.zeta.price_floor import prepare_price_floor, price_floor
+
+    negative, error = prepare_price_floor(values)
+    for ordered in (values, list(reversed(values)), sorted(values, key=abs)):
+        for batch_size in (1, 3, len(values) or 1):
+            positive = 0.0
+            for end in range(0, len(ordered) + batch_size, batch_size):
+                if end:
+                    try:
+                        positive += math.fsum(max(value, 0.0)
+                                              for value in ordered[end - batch_size:end])
+                    except OverflowError:
+                        positive = math.inf
+                prefix = ordered[:end]
+                suffix = ordered[end:]
+                for future in ([], suffix, [value for value in suffix if value < 0.0]):
+                    exact = sum(map(Fraction, prefix + future), Fraction(0))
+                    try:
+                        canonical_price = float(exact)
+                    except OverflowError:
+                        continue
+                    for physical in (0.0, 0.25, 1e17):
+                        assert price_floor(physical, positive, negative, error, 0.0) <= (
+                            physical + canonical_price)
+
+
+@pytest.mark.parametrize("backend,traversal,lazy,native,forward,mode", [
+    ("reference", "best_first", False, False, True, "hex12"),
+    ("reference", "best_first", True, False, True, "hex12"),
+    ("compiled", "best_first", True, False, True, "hex12"),
+    ("compiled", "forward_dp", False, False, True, "hex12"),
+    ("compiled", "forward_dp", False, True, True, "hex12"),
+    ("reference", "best_first", True, False, False, "full"),
+    ("compiled", "best_first", True, True, False, "full"),
+])
+@pytest.mark.parametrize("magnitude", [1e17, 1e200])
+def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
+    backend: str, traversal: str, lazy: bool, native: bool,
+    forward: bool, mode: str, magnitude: float,
+) -> None:
+    """A rounded positive subtotal must never hide a cheaper signed union or bless a cutoff."""
+    if backend == "compiled":
+        pytest.importorskip("numba")
+    if native:
+        pytest.importorskip("Cython")
+    cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=4.0,
+               corridor_width_m=10.0, hover_radius_m=5.0)
+    fg, params = _graph(cfg, dest=(3, -1), overrun=2)
+    fg = replace(fg, corridor_cells=frozenset({(0, 0), (1, 0), (1, -1), (2, -1), (3, -1)}))
+    rows = network_mod.RowIndex()
+    options = ZetaOptions(
+        backend=backend, traversal=traversal, lazy_successors=lazy, compiled_loop=native,
+        native_state_index=native, forward_cruise=forward, connection_mode=mode,
+        expire_history=True, history_dominance=True, max_expansions=None, max_labels=None,
+    )
+    graph = ZetaGraph(fg, cfg, rows, options)
+    columns = _exhaustive_anyangle_columns(fg, cfg, params, rows, 480.0, options)
+    known = graph.canonical_column(
+        Column(fg.request.flight_id, 0, 0, None, None, ((0, 0), (1, -1), (2, -1), (3, -1)), 0),
+        cost_model(cfg, params),
+    )
+    assert known in columns
+    prices = {RowKey.cell(0, 0, 0, 0): magnitude,
+              RowKey.cell(0, 0, 0, 1): -magnitude, RowKey.cell(0, 0, 0, 2): 10.0}
+    assert all(prices.keys() <= column.claims for column in columns)
+    # Reuse the graph under changed prices, retaining canonical physical claims.
+    for current in (prices, {row: 0.5 * value for row, value in prices.items()}):
+        optimum = min(c.delay_s + math.fsum(current.get(r, 0.0) for r in c.claims)
+                      for c in columns)
+        pi_f = params.M - 12.0
+        expected = params.M - pi_f - optimum
+        exact = price_zeta(graph, current, pi_f, params, known_columns=[known])
+        assert exact.complete and exact.reason == "optimal"
+        assert exact.reduced_cost == pytest.approx(expected, abs=1e-9)
+        assert exact.upper_bound >= expected - 1e-9
+        assert exact.column in columns and exact.expanded > 0
+        early_options = replace(options, early_return=True)
+        early = price_zeta(ZetaGraph(fg, cfg, rows, early_options), current, pi_f, params,
+                           known_columns=[known])
+        assert early.column != known and early.reduced_cost > params.epsilon
+        assert early.upper_bound >= expected - 1e-9
+        proof = price_zeta(ZetaGraph(fg, cfg, rows, early_options), current,
+                           params.M - optimum + 1.0, params, known_columns=[known])
+        assert proof.complete and proof.upper_bound <= params.epsilon
+        limited = price_zeta(ZetaGraph(fg, cfg, rows, replace(options, max_labels=1)),
+                             current, pi_f, params, known_columns=[known])
+        assert not limited.complete and limited.reason == "search_cap"
+        assert limited.upper_bound >= expected - 1e-9
+        expired = price_zeta(graph, current, pi_f, params, known_columns=[known],
+                             deadline=time.perf_counter() - 1.0)
+        assert not expired.complete and expired.reason == "deadline"
+        assert expired.upper_bound >= expected - 1e-9
+
+
+@pytest.mark.parametrize("entry", ["compact", "hybrid"])
+def test_anyangle_legacy_pricing_entries_preserve_columns_and_bounds(entry: str) -> None:
+    """Archived low-level calls must accept CG arguments and return ordinary pricing results."""
+    pytest.importorskip("numba")
+    if entry == "compact":
+        from freespace_sim.planner.colgen.zeta_compact import price_zeta_compact as legacy
+    else:
+        from freespace_sim.planner.colgen.zeta_hybrid import price_hybrid as legacy
+    cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=2.0)
+    fg, params = _graph(cfg, dest=(2, 0), overrun=0)
+    rows = network_mod.RowIndex()
+    options = ZetaOptions(backend="compiled", early_return=True,
+                          cheap_connection_mode="hex12" if entry == "hybrid" else None)
+    graph = ZetaGraph(fg, cfg, rows, options)
+    known = graph.seed_columns(params)
+    prices = {row: (-0.25 if index % 2 else 2.0)
+              for index, row in enumerate(sorted(known[0].claims))}
+    for kwargs in ({}, {"known_columns": known}, {"forbidden_rows": known[0].claims},
+                   {"deadline": time.perf_counter() - 1.0}):
+        expected = price_zeta(ZetaGraph(fg, cfg, rows, options), prices, 0.0, params, **kwargs)
+        result = legacy(graph, prices, 0.0, params, **kwargs)
+        assert isinstance(result, ZetaPricingResult)
+        assert _without_anyangle_cache_metrics(result) == _without_anyangle_cache_metrics(expected)
+    with pytest.raises(ValueError, match="flight dual"):
+        legacy(graph, prices, math.nan, params)
 
 
 @pytest.mark.parametrize("objective", ["total_delay", "total_cost"])

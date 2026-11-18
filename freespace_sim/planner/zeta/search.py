@@ -33,6 +33,7 @@ from .model import Route
 from .geometry import anyangle_to_intent, reservation_claims, volume_claims
 from .history import PriceHistory
 from .history_guard import HistoryGuard
+from .price_floor import prepare_price_floor, price_floor
 from .timing import edge_end_times
 
 Cell = tuple[int, int]
@@ -690,7 +691,7 @@ def _search(
     prices = {RowKey(r): float(p) for r, p in duals.items() if p != 0.0}
     if any(not math.isfinite(p) for p in prices.values()):
         raise ValueError("row prices must be finite")
-    negative = math.fsum(p for p in prices.values() if p < 0.0)
+    negative, price_error = prepare_price_floor(prices.values())
     cfg, fg = graph.cfg, graph.fg
     model = settings.model
     best, incumbent = math.inf, None
@@ -720,6 +721,7 @@ def _search(
     bound_build_s = 0.0
     bound_lookups = bound_pruned = 0
     tol = min(1e-7, settings.epsilon * 0.1)
+    global_floor = price_floor(0.0, 0.0, negative, price_error, tol)
 
     def finish(complete: bool, reason: str, floor: float) -> SearchResult:
         """Report all pending costs, including the numerical history-merge allowance."""
@@ -785,7 +787,8 @@ def _search(
             detour = max(0.0, (label.length if length is None else length) + remaining
                          + label.fold_m - graph.reference)
             cost += model.air_weight * detour / cfg.nominal_speed_mps
-        return max(label.priced_floor, cost + label.positive_paid + negative - tol)
+        return max(label.priced_floor,
+                   price_floor(cost, label.positive_paid, negative, price_error, tol))
 
     def enqueue(label: _Label, floor: float) -> None:
         """Expire unreachable paid rows, then compare only future-equivalent prefixes."""
@@ -889,7 +892,7 @@ def _search(
 
     for column in known_routes:
         if deadline is not None and time.perf_counter() >= deadline:
-            return finish(False, "deadline", negative - tol)
+            return finish(False, "deadline", global_floor)
         accept(column, known=True)
     if incumbent is None:
         for column in graph.seed_routes(model, deadline):
@@ -897,7 +900,7 @@ def _search(
 
     if early_candidate_ready:
         # Roots are not built yet; retain the same global floor used on interrupted setup.
-        return finish(False, "improving_column", negative - tol)
+        return finish(False, "improving_column", global_floor)
 
     if graph.options.lattice_distance_bound:
         from .lattice_bound import LatticeDistanceBound
@@ -920,10 +923,10 @@ def _search(
     # All departures remain in the certificate, including roots not yet built at a cap.
     for dep in range(fg.base_step, fg.latest_departure_step + 1):
         if deadline is not None and time.perf_counter() >= deadline:
-            return finish(False, "deadline", negative - tol)
+            return finish(False, "deadline", global_floor)
         ground = model.ground_weight * ((dep - fg.base_step) * cfg.dt_s)
         # Even granting every negative row price cannot rescue this or a later departure.
-        if ground + negative - tol >= best:
+        if price_floor(ground, 0.0, negative, price_error, tol) >= best:
             break
         endpoint = graph.endpoint(True, dep * cfg.dt_s)
         origin_rows = graph.rows(endpoint)
@@ -942,7 +945,7 @@ def _search(
                 if floor < best:
                     enqueue(label, floor)
                     if graph.options.max_labels is not None and generated >= graph.options.max_labels:
-                        return finish(False, "search_cap", negative - tol)
+                        return finish(False, "search_cap", global_floor)
 
     while heap:
         while heap and history is not None:

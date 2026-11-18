@@ -31,11 +31,20 @@ Numerical history-merge uncertainty remains explicit. The unadjusted floor is
 retained separately so the CG adapter preserves its previous floating-point
 bound arithmetic exactly.
 
+Ordinary price bounds use one shared summation-error allowance for accumulated
+positive charges, global negative credit and the canonical signed union. Prices
+cancel before physical cost is added, with downward rounding at each operation.
+If a finite allowance cannot be established, that bound becomes negative infinity;
+caps and deadlines then remain incomplete with a conservative certificate.
+
 Old `colgen.zeta_*` import paths remain thin compatibility modules for archived
 experiments and pickles. There is one search implementation. Old graph caches
 containing master columns are rebuilt on loading. New work should import the
 shared package; the independent workspace/price-preparation experiments must be
 adapted to these moved modules before integration.
+The legacy `zeta_compact.price_zeta_compact` and `zeta_hybrid.price_hybrid`
+entry points retain `pi_f`, `params`, `known_columns` and `ZetaPricingResult` through
+CG adapters. Their shared-engine equivalents accept `SearchSettings` and routes.
 
 ## Standalone FCFS
 

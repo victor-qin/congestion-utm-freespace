@@ -121,6 +121,7 @@ def test_gpu_residual_bound_is_separate_from_column_score(
     request = _request(1, (0, 0), (2, 0), cfg)
     params = _params(
         M=100.0, pricing_device="gpu", pricing_gpu_backend="metal",
+        worker_seed_routes=True, n_pricing_workers=2,
         max_iterations=2, seed_ladder_steps=0, ip_gap=0.0, lp_gap=0.0,
     )
     observations = []

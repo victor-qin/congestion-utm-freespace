@@ -1156,7 +1156,7 @@ class AStarPlanner:
             nq, nr = q + dq, r + dr
             if not svc.is_blocked(nq, nr, L, ns, own):
                 out.append((("a", nq, nr, L, ns), c_lat * pitch))
-        if not svc.is_blocked(q, r, L, ns, own):                                     # hover (same level)
+        if cfg.astar_allow_airborne_holds and not svc.is_blocked(q, r, L, ns, own):
             out.append((("a", q, r, L, ns), cfg.cost_air_hold_per_s * dt))
         for dL in (-1, 1) if self.vertical_edges else ():                           # vertical layer change
             L2 = L + dL
@@ -1612,7 +1612,7 @@ class AStarPlanner:
                 1, 1, np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]),
                 np.array([0], np.int64), 1,
                 np.array([1], np.int64), np.array([0.0]), np.ones(ng, np.bool_), ng, 1.0,
-                np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False,
+                np.array([1], np.int64), np.array([0.0]), 1.0, 3.0, False, True,
                 np.array([1], np.int64), np.array([1], np.int64), np.array([0.0]), 1,
                 np.ones(ng, np.bool_),
                 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0,
@@ -1886,7 +1886,7 @@ class AStarPlanner:
                 cocc.qmin, cocc.rmin, cocc.qspan, cocc.rspan, n_levels, base, max_step, ground_max_step,
                 oq, orr, lane_q, lane_r, lane_lat, lane_stp, len(lane_q),
                 tks, tkc, to_ok, n_gsteps, c_gd_dt,
-                rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges,
+                rs, rc, c_lat_pitch, c_hold_dt, self.vertical_edges, cfg.astar_allow_airborne_holds,
                 goal_q, goal_r, goal_lat, len(goal_q), land_ok,
                 gx, gy, R, h_off, c_lat, goal_cost_lb, h_ground,
                 gen, kc["g_pack"], kc["g_packf"], kc["cap"], kc["log2"],

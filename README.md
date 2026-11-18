@@ -126,6 +126,18 @@ later-departure alternatives. `--colgen-warm-start astar` imports an FCFS schedu
 `--colgen-time-limit`, `--colgen-ip-time-limit`, and `--colgen-ip-reserve` control the
 whole solve, final IP search allowance, and time reserved for the final IP stage.
 
+Initialization defaults to nominal routes. `--colgen-worker-seeds --colgen-workers N`
+builds them on persistent CPU pricing workers. Alternatively, `--colgen-initial-routes astar`
+runs serial FCFS A* with airborne holds disabled, imports valid routes, and builds nominal
+fallbacks only for missing imports. It uses the solve's cost weights, normal later-departure
+alternatives and ground-delay capacity repair; pricing keeps its full original route domain.
+This option runs inside the solver budget and reuses its graphs. Cutoffs are checked between
+FCFS flights and imports, so one atomic flight search can overrun the cutoff. Initialization
+timeouts are reported without a pricing certificate. The worker-seeding flag applies only
+to nominal initialization; pricing can use workers with either choice. The separate legacy
+`--colgen-warm-start`, `--colgen-no-nominal-seeds`, and provided-ladder controls cannot be
+combined with A* initialization. No cost weights or planner defaults change.
+
 An optimal final IP certifies the generated pool; global quality bounds also require pricing.
 Read `planner_stats.json` for termination, gaps, and per-stage times. Whole-schedule solve time
 is amortized across flights in `index.parquet`, unlike the actual per-flight timings of FCFS.

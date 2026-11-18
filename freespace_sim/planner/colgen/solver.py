@@ -14,6 +14,7 @@ import gc
 import logging
 
 import collections
+from contextlib import ExitStack
 import math
 import time
 from collections import Counter
@@ -81,6 +82,15 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
     - output (dict[str, Any]): configuration and zero-work defaults for pricing diagnostics.
     """
     return {
+        "worker_seed_routes": params.worker_seed_routes,
+        "initial_routes": params.initial_routes,
+        "astar_initialization_s": 0.0,
+        "astar_initialization_complete": False,
+        "astar_accepted_routes": 0,
+        "astar_imported_routes": 0,
+        "astar_rejected_routes": {},
+        "astar_nominal_fallback_routes": 0,
+        "seed_pool_setup_s": 0.0,
         "pricing_device": params.pricing_device,
         "pricing_gpu_backend": params.pricing_gpu_backend,
         "pricing_cpu_recompute": params.pricing_cpu_recompute,
@@ -823,6 +833,7 @@ def _pre_master_timeout_result(
     catalog: StaticTerminalCatalog | None = None,
     graph_build_elapsed_s: float = 0.0,
     seed_elapsed_s: float = 0.0,
+    seed_pool_setup_s: float = 0.0,
     seeds_completed: int = 0,
     seed_flights_processed: int = 0,
     master: RestrictedMaster | None = None,
@@ -847,7 +858,8 @@ def _pre_master_timeout_result(
     - catalog (StaticTerminalCatalog | None): supplies the static-terminal and wall-index
       counts; ``None`` reports zeros.
     - graph_build_elapsed_s (float): seconds spent building graphs, echoed into stats.
-    - seed_elapsed_s (float): seconds spent seeding, echoed into stats.
+    - seed_elapsed_s (float): seconds spent seeding, including worker startup when enabled.
+    - seed_pool_setup_s (float): the part of seeding spent starting CPU workers.
     - seeds_completed (int): number of seed columns completed before the cutoff.
     - seed_flights_processed (int): number of flights the seeding loop reached.
     - master (RestrictedMaster | None): partial master, read for its backend name and column
@@ -956,6 +968,7 @@ def _pre_master_timeout_result(
             "preprocessing_stage": stage,
             "graph_build_elapsed_s": graph_build_elapsed_s,
             "seed_elapsed_s": seed_elapsed_s,
+            "seed_pool_setup_s": seed_pool_setup_s,
             "time_to_master_s": time_to_master_s,
             "static_terminal_count": 0 if catalog is None else len(catalog.entries),
             "static_excluded_cells": 0 if catalog is None else catalog.excluded_cell_count,
@@ -1065,6 +1078,9 @@ class ColGenSolver:
         (more pricing inside the same budget, not the same answer -- see
         :mod:`.pricing_pool`).  Parallelism is configured only through
         ``params.n_pricing_workers``; there is no separate ``parallel=`` argument.
+        ``worker_seed_routes`` optionally starts CPU workers during nominal seeding. It
+        preserves completed seeds and ladders, but wall deadlines can retain a different
+        prefix. Parent geometry and greedy work remain; startup is included in seed time.
 
         Parameters
         ------------
@@ -1098,10 +1114,10 @@ class ColGenSolver:
         added after that LP have zero values, with ``lp_column_count`` identifying the
         original LP prefix. ``master`` remains live and may grow after the callback.
         """
-        with _ParentHeap() as heap:
+        with _ParentHeap() as heap, ExitStack() as resources:
             return self._solve(
                 requests, cfg, static_terms, params, fixed_claims=fixed_claims,
-                on_iteration=on_iteration, seed_columns=seed_columns, heap=heap,
+                on_iteration=on_iteration, seed_columns=seed_columns, heap=heap, resources=resources,
             )
 
     def _solve(
@@ -1115,12 +1131,14 @@ class ColGenSolver:
         on_iteration,
         seed_columns: Mapping[int, Sequence[Column]] | None,
         heap: _ParentHeap,
+        resources: ExitStack,
     ) -> ColGenResult:
         """Body of :meth:`solve`, which documents every other parameter.
 
         Parameters
         ------------
         - heap (_ParentHeap): the entered GC policy; frozen at the start of every iteration.
+        - resources (ExitStack): closes an early-started pool on every return or exception.
 
         Return
         --------
@@ -1144,6 +1162,8 @@ class ColGenSolver:
         flight_ids = tuple(request.flight_id for request in ordered_requests)
         if len(set(flight_ids)) != len(flight_ids):
             raise ValueError("colgen requests must have unique flight_id values")
+        if params.initial_routes == "astar" and seed_columns:
+            raise ValueError("initial_routes='astar' cannot combine with seed_columns")
 
         if not ordered_requests:
             return ColGenResult(
@@ -1343,18 +1363,73 @@ class ColGenSolver:
         seedless_flights: set[int] = set(graph_infeasible)
         seeds: dict[int, Column] = {}
         ladder_columns = 0
+        astar_bases: dict[int, Column] = {}
+        astar_stats: dict[str, Any] = {}
+        astar_fallbacks = 0
         seed_started = time.monotonic()
+        if params.initial_routes == "astar":
+            from .warm_start import astar_initial_routes
+
+            try:
+                astar_bases, astar_stats = astar_initial_routes(
+                    ordered_requests, cfg, static_term_snapshot, graphs, model, pricing_deadline,
+                    stats=astar_stats,
+                )
+            except PricingTimeout:
+                result = _pre_master_timeout_result(
+                    flight_ids, started, params, stage="astar_initialization", graphs=graphs,
+                    catalog=static_catalog, graph_build_elapsed_s=graph_build_elapsed_s,
+                    seed_elapsed_s=time.monotonic() - seed_started, master=master,
+                    time_to_master_s=time_to_master_s,
+                    graph_infeasible_flight_ids=tuple(graph_infeasible),
+                )
+                result.stats.update(astar_stats)
+                return result
+        # Keep one pool across initialization and pricing. Register cleanup before startup:
+        # seeding, canonical insertion and warm-start validation can all exit early.
+        pricing_requests = tuple(r for r in ordered_requests if r.flight_id in graphs)
+        sweep_pool = (
+            None
+            if params.pricing_device == "gpu" or params.n_pricing_workers == 0 or not graphs
+            else PricingPool(pricing_requests, cfg, params, static_catalog)
+        )
+        if sweep_pool is not None:
+            resources.callback(sweep_pool.close)
+        worker_seeds = (
+            sweep_pool.seed_routes(tuple(graphs), pricing_deadline)
+            if params.worker_seed_routes and params.seed_nominal_routes and sweep_pool is not None
+            and params.initial_routes == "nominal"
+            else None
+        )
+        if worker_seeds is not None and worker_seeds.kernel_counters.get("pool_worker_lost"):
+            raise RuntimeError("pricing worker lost during initial-route generation")
+        seed_results = ({} if worker_seeds is None
+                        else dict(zip(worker_seeds.flight_ids, worker_seeds.columns)))
         for flight_id in (graphs if params.seed_nominal_routes else ()):
             try:
-                seed_builder = _shortest_seed if params.pricing_device == "gpu" else seed_column
-                seed = seed_builder(
-                    graphs[flight_id], cfg, deadline=pricing_deadline, model=model
-                )
+                if params.initial_routes == "astar" and time.monotonic() >= pricing_deadline:
+                    raise PricingTimeout
+                if flight_id in astar_bases:
+                    seed = astar_bases[flight_id]
+                elif worker_seeds is not None:
+                    # Parent insertion has its own cost; a finished worker batch must not
+                    # bypass the solve's cutoff while canonicalizing a long seed prefix.
+                    if (flight_id == worker_seeds.timeout_flight_id
+                            or time.monotonic() >= pricing_deadline):
+                        raise PricingTimeout
+                    seed = seed_results[flight_id]
+                else:
+                    seed_builder = _shortest_seed if params.pricing_device == "gpu" else seed_column
+                    seed = seed_builder(
+                        graphs[flight_id], cfg, deadline=pricing_deadline, model=model
+                    )
+                    if seed is not None and params.initial_routes == "astar":
+                        astar_fallbacks += 1
                 if seed is None:
                     seedless_flights.add(flight_id)
                     continue
             except PricingTimeout:
-                return _pre_master_timeout_result(
+                result = _pre_master_timeout_result(
                     flight_ids,
                     started,
                     params,
@@ -1363,6 +1438,7 @@ class ColGenSolver:
                     catalog=static_catalog,
                     graph_build_elapsed_s=graph_build_elapsed_s,
                     seed_elapsed_s=time.monotonic() - seed_started,
+                    seed_pool_setup_s=0.0 if worker_seeds is None else worker_seeds.pool_setup_s,
                     seeds_completed=len(seeds),
                     seed_flights_processed=len(seeds) + len(seedless_flights),
                     master=master,
@@ -1370,6 +1446,9 @@ class ColGenSolver:
                     seedless_flight_ids=tuple(seedless_flights),
                     graph_infeasible_flight_ids=tuple(graph_infeasible),
                 )
+                result.stats.update(astar_stats)
+                result.stats["astar_nominal_fallback_routes"] = astar_fallbacks
+                return result
             except ValueError:
                 # A disconnected/static-blocked graph is a legitimate
                 # optimizer-verdict denial, not a batch-wide solver failure.
@@ -1403,6 +1482,7 @@ class ColGenSolver:
         greedy_elapsed_s = 0.0
         initial_heuristic = dict(shifted_seed_heuristic)
         initial_heuristic_strategy = (
+            "astar_routes" if params.initial_routes == "astar" else
             "shifted_seeds" if params.seed_nominal_routes else "provided_only"
         )
         best_heuristic = dict(initial_heuristic)
@@ -1547,16 +1627,6 @@ class ColGenSolver:
         pricing_timeout_flight_id: int | None = None
         iteration_ip_records: list[dict[str, Any]] = []
 
-        # ONE pool for the whole solve, not one per sweep.  Constructed here but not
-        # STARTED: `spawn` happens on the first sweep, so no worker process exists during
-        # the parent-only greedy stage and peak RSS is where it was.  See `PricingPool`
-        # for what a solve-scoped pool buys and why each flight is pinned to a worker.
-        pricing_requests = tuple(r for r in ordered_requests if r.flight_id in graphs)
-        sweep_pool = (
-            None
-            if params.pricing_device == "gpu" or params.n_pricing_workers == 0 or not graphs
-            else PricingPool(pricing_requests, cfg, params, static_catalog)
-        )
         pricing_platform = make_pricing_platform(params) if params.pricing_device == "gpu" else None
         try:
             for iteration in range(params.max_iterations):
@@ -2547,6 +2617,9 @@ class ColGenSolver:
             "preprocessing_stage": "complete",
             "graph_build_elapsed_s": graph_build_elapsed_s,
             "seed_elapsed_s": seed_elapsed_s,
+            **astar_stats,
+            "astar_nominal_fallback_routes": astar_fallbacks,
+            "seed_pool_setup_s": 0.0 if worker_seeds is None else worker_seeds.pool_setup_s,
             "time_to_master_s": time_to_master_s,
             "corridor_domains_materialized": corridor_domains_materialized,
             "static_terminal_count": len(static_catalog.entries),

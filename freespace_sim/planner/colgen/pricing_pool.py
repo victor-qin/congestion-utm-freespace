@@ -123,6 +123,7 @@ from .pricing import (
     last_search_record,
     is_certified_column,
     price_flight,
+    seed_column,
 )
 from .translate import Column
 from .pricing_platform import PricingOptions, PricingPlatform, PricingProblem
@@ -287,24 +288,27 @@ class _PipeCollector:
 
     def __init__(self, channels):
         self._channels = list(channels)
+        self._reported_dead: set[int] = set()
 
     def __call__(self, timeout: float | None):
-        """Wait up to ``timeout`` seconds, then return ``(results_by_worker, newly_dead)``.
+        """Return results and deaths not yet reported to this phase's collector.
 
-        ``results_by_worker`` maps a worker index to the result tuples it produced this call;
-        ``newly_dead`` is the set of worker indices whose sentinel or pipe reported an exit.
+        Death remains observable across phases, even if the prior phase received the
+        worker's last result and completed before noticing its exit. Report each death
+        once per collector so later waits can still block on earlier, live flights.
         """
+        died = {ch.index for ch in self._channels if ch.dead} - self._reported_dead
         live = [ch for ch in self._channels if not ch.dead]
         if not live:
-            return {}, set()
+            self._reported_dead.update(died)
+            return {}, died
         waitables: dict[Any, tuple[_WorkerChannel, bool]] = {}
         for ch in live:
             waitables[ch.conn] = (ch, True)
             waitables[ch.proc.sentinel] = (ch, False)
-        ready = mp_connection.wait(list(waitables), timeout)
+        ready = mp_connection.wait(list(waitables), 0.0 if died else timeout)
 
         collected: dict[int, list] = {}
-        died: set[int] = set()
         for handle in ready:
             channel, is_pipe = waitables[handle]
             if not is_pipe:
@@ -332,6 +336,7 @@ class _PipeCollector:
         # A worker that exited cleanly at the end of its assignment is not a failure, but
         # the merge cannot tell the difference and does not have to: it only consults
         # `died` when it is still WAITING on that worker for a flight.
+        self._reported_dead.update(died)
         return collected, died
 
 
@@ -818,6 +823,7 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
 
       ("sweep", epoch, duals_blob, flight_duals, known_columns, deadline, heuristic_only)
                                                         -> install duals and search mode
+      ("seed", epoch, flight_ids, chunksize, adopted) -> generate initial routes
       ("price", epoch, flight_ids, chunksize, adopted)
                                     -> adopt stolen flights, stream ("results", [...]) per chunk
       ("release", flight_ids)       -> drop flights another worker took over
@@ -872,14 +878,16 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
         if tag == "release":
             _release_flights(message[1])
             continue
-        if tag == "price":
+        if tag in {"price", "seed"}:
             _, epoch, flight_ids, chunksize, adopted = message
             try:
                 # Inside the try: a graph that fails to build is reported, not fatal.
                 _adopt_flights(epoch, adopted)
                 for start in range(0, len(flight_ids), chunksize):
                     chunk = flight_ids[start:start + chunksize]
-                    conn.send(("results", _price_batch((epoch, chunk))))
+                    results = ([_seed_one(epoch, flight_id) for flight_id in chunk]
+                               if tag == "seed" else _price_batch((epoch, chunk)))
+                    conn.send(("results", results))
                     # NOT polled for `stop` between chunks, which was tried and does not
                     # work: when the parent abandons a sweep it stops draining, the pipe
                     # fills, and the worker blocks inside `send` -- so it never reaches a
@@ -893,7 +901,73 @@ def _worker_main(conn, worker_index, requests, cfg, params, catalog) -> None:
             continue
 
 
-def _price_one(epoch: tuple, flight_id: int):
+def _worker_state(epoch: tuple, flight_id: int) -> tuple[FlightGraph, tuple]:
+    """Return a flight's retained graph and matching state, or reject stale work.
+
+    Parameters
+    ------------
+    - epoch (tuple): the dispatch identity required by the caller.
+    - flight_id (int): the flight this worker must own.
+
+    Return
+    --------
+    - output (tuple[FlightGraph, tuple]): the retained graph and current phase state;
+      initialization, state-load and ownership failures raise before any search.
+    """
+
+    init_error = _WORKER.get("init_error")
+    if init_error is not None:
+        # This worker never built its batch view.  Raising from here rather than from the
+        # initializer is the whole point -- see `_init_worker`.
+        raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
+    sweep_error = _WORKER.get("sweep_error")
+    if sweep_error is not None:
+        raise RuntimeError(f"pricing worker failed to load sweep state:\n{sweep_error}")
+    state = _WORKER.get("sweep")
+    if state is None or state[0] != epoch:
+        held = None if state is None else state[0]
+        raise StalePricingWorker(
+            f"worker {_WORKER.get('worker_index')!r} (pid {os.getpid()}) holds sweep state {held!r} "
+            f"but was asked to price flight {flight_id} for sweep {epoch!r}; it was almost "
+            f"certainly a dispatch against state it was never sent"
+        )
+    if flight_id not in _WORKER["worker_flights"]:
+        # A named error rather than a bare KeyError three frames down, and a real
+        # possibility: the worker split and the result merge are two expressions of one
+        # assignment, and this is the cheap place to catch them disagreeing.
+        raise StalePricingWorker(
+            f"flight {flight_id} is not in worker {_WORKER.get('worker_index')!r}"
+        )
+    return _WORKER["graphs"][flight_id], state
+
+
+def _seed_one(epoch: tuple, flight_id: int) -> tuple:
+    """Build an initial route on the graph retained for subsequent pricing.
+
+    Parameters
+    ------------
+    - epoch (tuple): the seed dispatch's state identity, verified before using its deadline.
+    - flight_id (int): the flight owned by this worker.
+
+    Return
+    --------
+    - output (tuple): the ordered-merge result shape, with a placeholder zero score;
+      infeasible seeds complete with None, while a timeout terminates the accepted prefix.
+    """
+
+    graph, state = _worker_state(epoch, flight_id)
+    started = time.perf_counter()
+    try:
+        column = seed_column(graph, _WORKER["cfg"], deadline=state[4],
+                             model=cost_model(_WORKER["cfg"], _WORKER["params"]))
+    except PricingTimeout:
+        return flight_id, False, 0.0, None, time.perf_counter() - started, {}, {}
+    except ValueError:
+        column = None
+    return flight_id, True, 0.0, column, time.perf_counter() - started, {}, {}
+
+
+def _price_one(epoch: tuple, flight_id: int) -> tuple:
     """Price one flight in a worker.
 
     Returns ``(flight_id, priced, rc, column, task_s, counter_deltas, search_record)``.
@@ -935,29 +1009,7 @@ def _price_one(epoch: tuple, flight_id: int):
       wrong sweep epoch.
     """
 
-    init_error = _WORKER.get("init_error")
-    if init_error is not None:
-        # This worker never built its batch view.  Raising from here rather than from the
-        # initializer is the whole point -- see `_init_worker`.
-        raise RuntimeError(f"pricing worker failed to initialise:\n{init_error}")
-    sweep_error = _WORKER.get("sweep_error")
-    if sweep_error is not None:
-        raise RuntimeError(f"pricing worker failed to load sweep state:\n{sweep_error}")
-    state = _WORKER.get("sweep")
-    if state is None or state[0] != epoch:
-        held = None if state is None else state[0]
-        raise StalePricingWorker(
-            f"worker {_WORKER.get('worker_index')!r} (pid {os.getpid()}) holds sweep state {held!r} "
-            f"but was asked to price flight {flight_id} for sweep {epoch!r}; it was almost "
-            f"certainly a dispatch against state it was never sent"
-        )
-    if flight_id not in _WORKER["worker_flights"]:
-        # A named error rather than a bare KeyError three frames down, and a real
-        # possibility: the worker split and the result merge are two expressions of one
-        # assignment, and this is the cheap place to catch them disagreeing.
-        raise StalePricingWorker(
-            f"flight {flight_id} is not in worker {_WORKER.get('worker_index')!r}"
-        )
+    graph, state = _worker_state(epoch, flight_id)
     _, dual_view, flight_duals, known_columns, deadline, heuristic_only = state
     # Deltas, not absolutes: the worker's tally is cumulative across every task it has run,
     # so shipping the absolute would double-count on the second task and beyond.
@@ -972,7 +1024,7 @@ def _price_one(epoch: tuple, flight_id: int):
                     if _WORKER["params"].columns_per_flight > 1 else {})
     try:
         reduced_cost, column = price_flight(
-            _WORKER["graphs"][flight_id],
+            graph,
             dual_view,
             flight_duals[flight_id],
             _WORKER["cfg"],
@@ -1651,8 +1703,9 @@ class PricingPool:
         return time.perf_counter() - started
 
     def run_sweep(
-        self, pricing_order, duals, flight_duals, known_columns, deadline,
-        heuristic_only=False,
+        self, pricing_order: Sequence[int], duals: Mapping, flight_duals: Mapping[int, float],
+        known_columns: Mapping[int, Column], deadline: float | None,
+        heuristic_only: bool = False,
     ) -> SweepResult:
         """Price one sweep across the workers, in ``pricing_order`` order.
 
@@ -1673,6 +1726,52 @@ class PricingPool:
         --------
         - output (SweepResult): the accepted prefix in ``pricing_order`` index order, with
           ``wall_s``, ``pool_setup_s`` and annotated ``flight_records`` filled in.
+        """
+
+        return self._run(pricing_order, duals, flight_duals, known_columns, deadline,
+                         heuristic_only=heuristic_only)
+
+    def seed_routes(self, flight_ids: Sequence[int], deadline: float | None) -> SweepResult:
+        """Seed flights on their persistent CPU workers, preserving completed-prefix order.
+
+        Startup is included in this call. Completed seeds are identical to serial seeds;
+        wall deadlines can retain a different prefix. The parent still canonicalizes and
+        inserts routes and departure ladders. Work stealing uses the same ownership rules
+        as pricing, retaining the graph on the worker that actually built the seed.
+
+        Parameters
+        ------------
+        - flight_ids (Sequence[int]): seed order, also defining the accepted prefix.
+        - deadline (float | None): absolute monotonic cutoff, including worker startup.
+
+        Return
+        --------
+        - output (SweepResult): seed columns (None for infeasible flights), timings and
+          worker diagnostics. Scores are placeholders, never certified pricing bounds.
+        """
+
+        return replace(self._run(flight_ids, {}, {}, {}, deadline, seed=True), certified=False)
+
+    def _run(
+        self, pricing_order: Sequence[int], duals: Mapping, flight_duals: Mapping[int, float],
+        known_columns: Mapping[int, Column], deadline: float | None,
+        heuristic_only: bool = False, *, seed: bool = False,
+    ) -> SweepResult:
+        """Run one ordered phase using the existing bounded transport and ownership policy.
+
+        Parameters
+        ------------
+        - pricing_order (Sequence[int]): ordered flights for the phase.
+        - duals (Mapping): capacity prices; empty for seeds.
+        - flight_duals (Mapping[int, float]): flight prices; empty for seeds.
+        - known_columns (Mapping[int, Column]): incumbent routes; empty for seeds.
+        - deadline (float | None): absolute monotonic cutoff including startup.
+        - heuristic_only (bool): use cheap pricing when requested.
+        - seed (bool): dispatch initial-route generation instead of pricing.
+
+        Return
+        --------
+        - output (SweepResult): accepted prefix with timings and worker diagnostics.
         """
 
         if self._poisoned is not None:
@@ -1724,15 +1823,19 @@ class PricingPool:
                 # that read them. That ordering is the whole delivery mechanism, and it
                 # works because the worker is idle in `recv` at this moment -- so the send
                 # cannot block on a busy peer.
-                channel.send((
-                    "sweep",
-                    epoch,
-                    duals_blob,
-                    {f: flight_duals[f] for f in own if f in flight_duals},
-                    {f: c for f, c in known_columns.items() if f in own},
-                    deadline,
-                    heuristic_only,
-                ))
+                try:
+                    channel.send((
+                        "sweep",
+                        epoch,
+                        duals_blob,
+                        {f: flight_duals[f] for f in own if f in flight_duals},
+                        {f: c for f, c in known_columns.items() if f in own},
+                        deadline,
+                        heuristic_only,
+                    ))
+                except (BrokenPipeError, ConnectionError, OSError):
+                    # The ordered collector reports the dead owner's first missing flight.
+                    pass
             dispatch = _Dispatch(pricing_order, self._worker_of, self._n_workers, self._steal)
             chunksize = max(1, int(self._params.pricing_chunksize))
 
@@ -1755,7 +1858,8 @@ class PricingPool:
                 # reports that as a lost flight.
                 try:
                     self._channels[worker].send(
-                        ("price", epoch, list(flight_ids), chunksize, tuple(adopted)))
+                        ("seed" if seed else "price", epoch, list(flight_ids),
+                         chunksize, tuple(adopted)))
                 except (BrokenPipeError, ConnectionError, OSError):
                     pass
 

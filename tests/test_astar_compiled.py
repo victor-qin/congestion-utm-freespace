@@ -100,13 +100,35 @@ _EXACT_CASES = [
 
 
 @pytest.mark.parametrize("build", [c[1] for c in _EXACT_CASES], ids=[c[0] for c in _EXACT_CASES])
-def test_compiled_matches_reference_exact(build):
+@pytest.mark.parametrize("allow_holds", [True, False])
+def test_compiled_matches_reference_exact(build, allow_holds):
     """Compiled A* returns the reference's exact result across scenarios: identical status/denial,
     cost within 1e-9, identical last_expansions, byte-identical centerline (see _assert_exact)."""
     req, commits, cfg, expected_status = build()
+    cfg = dataclasses.replace(cfg, astar_allow_airborne_holds=allow_holds)
     a, _ = _assert_exact(req, commits, cfg=cfg)
+    if not allow_holds and a.accepted:
+        assert a.air_hold_s == 0.0
+        assert all(not np.array_equal(p, q) for (p, _), (q, _) in
+                   zip(a.centerline, a.centerline[1:]) if p[2] > cfg.ground_level_m)
     if expected_status is not None:
         assert a.status is expected_status
+
+
+def test_no_airborne_holds_removes_hover_but_preserves_ground_waiting():
+    """A busy destination that makes cheap hover attractive can still be served by ground delay."""
+    assert SimConfig().astar_allow_airborne_holds is True
+    cfg = dataclasses.replace(CFG, flight_levels_m=(150.0,), airspace_ceiling_m=165.0,
+                              cost_air_lateral_per_s=1.5, cost_air_hold_per_s=0.1)
+    commits = [(99, [Volume4D(CylinderSpec(2000, 0, 60, 0, 150), 0.0, 200.0)])]
+    enabled, _ = _assert_exact(_req(), commits, cfg)
+    disabled, _ = _assert_exact(
+        _req(), commits, dataclasses.replace(cfg, astar_allow_airborne_holds=False))
+    assert enabled.accepted and enabled.air_hold_s > 0.0
+    assert disabled.accepted and disabled.air_hold_s == 0.0
+    assert disabled.ground_delay_s > 0.0
+    assert all(not np.array_equal(p, q) for (p, _), (q, _) in
+               zip(disabled.centerline, disabled.centerline[1:]) if p[2] > cfg.ground_level_m)
 
 
 def test_compiled_deterministic():

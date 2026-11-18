@@ -349,7 +349,7 @@ def _search(
     # ---- ground / takeoff-fan (host masks) ----
     oq, orr, lane_q, lane_r, lane_lat, lane_stp, n_lanes, takeoff_steps, takeoff_cost, to_ok, n_gsteps, c_gd_dt,
     # ---- air edges ----
-    rung_steps, rung_cost, c_lat_pitch, c_hold_dt, vertical_edges,
+    rung_steps, rung_cost, c_lat_pitch, c_hold_dt, vertical_edges, allow_airborne_holds,
     # ---- goal (host masks) ----
     goal_q, goal_r, goal_lat, n_goal, land_ok,
     # ---- heuristic ----
@@ -402,6 +402,7 @@ def _search(
     - rung_cost (np.ndarray): per-rung cost for a ±1 level change.
     - c_lat_pitch (float): cost of one lateral reroute hop.
     - c_hold_dt (float): cost of one air-hover (same-level wait) step.
+    - allow_airborne_holds (bool): emit same-level airborne waits; ground waits are independent.
     - vertical_edges (bool): whether ±1 level-change edges are emitted.
     goal (host masks):
     - goal_q (np.ndarray): per-goal boundary-cell q.
@@ -595,7 +596,7 @@ def _search(
             if rc == -2:
                 return 0, 0.0, n_exp, FB_HEAP, -1
         # hover (same level)
-        if _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
+        if allow_airborne_holds and _blocked(q, r, L, ns, qmin, rmin, qspan, rspan, n_levels,
                     static_col, ov_own_gen, gen, read_bbox, win, wbox, win_stats) == 0:
             nkey = ((iq * rspan + ir) * nlp1 + (L + 1)) * step_span + (ns - base)
             ng = base_g + c_hold_dt

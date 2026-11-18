@@ -703,7 +703,8 @@ def _duals_that_reach_the_compiled_search(request, cfg, params):
     return {row: 3.0 for row in list(seed.claims)[:4]}
 
 
-def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
+@pytest.mark.parametrize("seed_first", [False, True])
+def test_the_packing_is_built_once_across_two_sweeps(monkeypatch, seed_first):
     """A second sweep must not rebuild the compiled packing, stated as a COUNT.
 
     Deliberately a count rather than a wall clock -- the packing is real work but far smaller
@@ -730,6 +731,19 @@ def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
         lambda *a, **k: (calls.append(1), real(*a, **k))[1],
     )
 
+    graph = pricing_pool._WORKER["graphs"][1]
+    if seed_first:
+        pricing_pool._load_sweep_state(("seed", 0), pickle.dumps({}), {}, {}, None)
+        seeded = pricing_pool._seed_one(("seed", 0), 1)
+        assert seeded[1] and seeded[3] is not None
+        assert graph._search_cache.seed_search_complete
+        # Pricing must use this cache rather than repeat the initial shortest-path search.
+        def repeated_seed(*args, **kwargs):
+            pytest.fail("pricing rebuilt a worker's completed initial route")
+        from freespace_sim.planner.colgen import pricing
+        original_shortest = pricing._shortest_seed
+        monkeypatch.setattr(pricing, "_shortest_seed", repeated_seed)
+
     blob = pickle.dumps(duals)
     per_sweep = []
     for sweep in (1, 2):
@@ -745,6 +759,9 @@ def test_the_packing_is_built_once_across_two_sweeps(monkeypatch):
     assert per_sweep[1] == 1, f"the packing was rebuilt: {per_sweep[1]} builds over 2 sweeps"
     graph = pricing_pool._WORKER["graphs"][1]
     assert graph._search_cache.prepared is not None
+
+    if seed_first:
+        monkeypatch.setattr(pricing, "_shortest_seed", original_shortest)
 
     # A stolen flight: adopted with its inputs, priced on a graph built here, and later
     # released by this worker when another takes one of its flights. The worker always
@@ -833,7 +850,8 @@ def _sweep_key(sweep):
 
 
 @pytest.mark.parametrize("steal", [False, True])
-def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, steal):
+@pytest.mark.parametrize("seed_first", [False, True])
+def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, steal, seed_first):
     """The end-to-end shape of the fix: same processes, one owner per flight, every sweep.
 
     Driven through `PricingPool` directly rather than through a solve, because how many
@@ -885,7 +903,19 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, 
 
     monkeypatch.setattr(pricing_pool._WorkerChannel, "send", record)
     with PricingPool(requests, cfg, params, catalog) as pool:
+        if seed_first:
+            seeded = pool.seed_routes(order, None)
+            assert seeded.complete and not seeded.certified
+            assert seeded.flight_ids == tuple(order)
+            assert seeded.columns == tuple(pricing_pool.seed_column(
+                graphs[f], cfg, model=pricing_pool.cost_model(cfg, params)) for f in order)
+            assert seeded.pool_setup_s > 0.0
         sweeps = [pool.run_sweep(order, d, flight_duals, {}, None) for d in sweep_duals]
+        if seed_first:
+            assert all(sweep.pool_setup_s == 0.0 for sweep in sweeps)
+            assert [(r["flight_id"], r["worker"], r["pid"]) for r in seeded.flight_records] == [
+                (r["flight_id"], r["worker"], r["pid"]) for r in sweeps[0].flight_records]
+
         owners = pool.worker_of
 
     assert [_sweep_key(sweep) for sweep in sweeps] == expected
@@ -908,7 +938,7 @@ def test_a_persistent_pool_reuses_its_workers_and_pins_each_flight(monkeypatch, 
         first = [tag for _w, tag, _f in messages[starts[0]:starts[1]]]
         assert messages[starts[1] - 1] == (0, "release", (3,))
         assert first.count("release") == 1
-        assert max(i for i, tag in enumerate(first) if tag == "price") < first.index("release")
+        assert max(i for i, tag in enumerate(first) if tag == ("seed" if seed_first else "price")) < first.index("release")
         assert sum(1 for m in messages if m[1] == "release") == 1, "ownership moved again"
     else:
         # Two workers over three flights, so the split is 2/1 and neither worker is empty.
@@ -1018,7 +1048,8 @@ def test_a_pool_that_raised_mid_sweep_refuses_another(monkeypatch):
             pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
 
 
-def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch):
+@pytest.mark.parametrize("seed_first", [False, True])
+def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch, seed_first):
     """A partial `start()` must leave what it built reachable by `close()`.
 
     `MemoryError` while spawning the nth worker is the realistic trigger -- it is what the
@@ -1048,7 +1079,10 @@ def test_a_pool_that_fails_to_start_does_not_leak_its_workers(monkeypatch):
         })(),
     )
     with pytest.raises(MemoryError):
-        pool.start()
+        if seed_first:
+            pool.seed_routes([1, 2, 3], None)
+        else:
+            pool.start()
     # `close()` ran on the way out, so nothing is left holding worker processes.
     assert pool._channels is None
     pool.close()
@@ -1114,7 +1148,8 @@ def test_a_dead_worker_is_worker_loss_and_a_slow_one_is_a_timeout():
     assert accepted.kernel_counters.get("pool_worker_lost", 0) == 0
 
 
-def test_a_killed_worker_is_detected_immediately_and_not_replaced():
+@pytest.mark.parametrize("seed_first", [False, True])
+def test_a_killed_worker_is_detected_immediately_and_not_replaced(seed_first):
     """The transport's whole point: death is an event, not an inference.
 
     Under `mp.Pool` a dead worker was silently REPLACED with one holding no duals, and the
@@ -1152,9 +1187,17 @@ def test_a_killed_worker_is_detected_immediately_and_not_replaced():
         assert not pool._channels[0].proc.is_alive()
         assert pool._channels[1].proc.is_alive(), "an untouched worker was disturbed"
         assert pool._worker_pid[1] == original[1]
+        if seed_first:
+            with pytest.warns(RuntimeWarning, match="died mid-sweep"):
+                seeded = pool.seed_routes([1, 2], time.monotonic() + 30)
+            assert not seeded.complete and seeded.flight_ids == ()
+            assert seeded.kernel_counters["pool_worker_lost"] == 1
+            with pytest.raises(RuntimeError, match="no longer usable"):
+                pool.seed_routes([1, 2], None)
 
 
-def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
+@pytest.mark.parametrize("seed_first", [False, True])
+def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep(seed_first):
     """A startup that misses the deadline must look like a timeout, not raise.
 
     `pool.apply()` has no timeout, so a worker killed rather than raised during its
@@ -1168,9 +1211,10 @@ def test_startup_bounded_by_the_deadline_yields_a_timed_out_sweep():
     with PricingPool(
         requests, cfg, _params(n_pricing_workers=2), StaticTerminalCatalog((), cfg)
     ) as pool:
-        result = pool.run_sweep(
-            [1, 2], {}, {1: 0.0, 2: 0.0}, {}, time.monotonic() - 1.0
-        )
+        result = (pool.seed_routes([1, 2], time.monotonic() - 1.0) if seed_first
+                  else pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, time.monotonic() - 1.0))
+        with pytest.raises(RuntimeError, match="no longer usable"):
+            pool.run_sweep([1, 2], {}, {1: 0.0, 2: 0.0}, {}, None)
     assert not result.complete
     assert result.timeout_flight_id == 1
     assert result.flight_ids == ()
@@ -1418,3 +1462,32 @@ def test_gpu_sweep_rejects_an_invalid_certified_bound(monkeypatch, bound):
     with pytest.raises(ValueError, match="certificate"):
         price_sweep([7], [request], {7: graph}, cfg, params, catalog, {}, DualView({}, cfg),
                     {7: 0.0}, {}, platform=platform)
+
+
+@pytest.mark.parametrize("outcome", ["missing", "infeasible", "timeout", "error"])
+def test_worker_seeds_distinguish_infeasible_timeout_and_error(monkeypatch, outcome):
+    """Only a missing route completes with None; timeout ends the prefix and errors propagate."""
+    cfg = _cfg()
+    monkeypatch.setattr(pricing_pool, "_WORKER", {})
+    _worker_fixture(cfg)
+    pricing_pool._load_sweep_state(("seed", 0), pickle.dumps({}), {}, {}, None)
+
+    def build(*args, **kwargs):
+        if outcome == "infeasible":
+            raise ValueError("no path")
+        if outcome == "timeout":
+            raise pricing_pool.PricingTimeout
+        if outcome == "error":
+            raise MemoryError("seed allocation")
+        return None
+
+    monkeypatch.setattr(pricing_pool, "seed_column", build)
+    if outcome == "error":
+        with pytest.raises(MemoryError, match="seed allocation"):
+            pricing_pool._seed_one(("seed", 0), 1)
+    else:
+        result = _accepted_prefix([pricing_pool._seed_one(("seed", 0), 1), _row(2)])
+        assert result.complete == (outcome != "timeout")
+        assert result.flight_ids == (() if outcome == "timeout" else (1, 2))
+        if result.complete:
+            assert result.columns[0] is None

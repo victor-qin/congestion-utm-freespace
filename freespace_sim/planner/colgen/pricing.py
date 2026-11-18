@@ -42,17 +42,20 @@ import numpy as np
 
 from ...config import SimConfig
 from ...conflict import volumes_conflict
-from ...types import IntentStatus, Terminal, as_terminal
+from ...types import IntentStatus, as_terminal
 from ...volumes import (
     column_dwell_s,
     enroute_detour_m,
     enroute_flown_m,
     enroute_reference_m,
-    exit_radius,
     hover_reservation,
     terminal_radius,
 )
 from .. import hexgrid as hg
+from ..route_geometry import (
+    _fold_leg_s as _fold_leg_s,
+    _terminal_fold_leg_s as _terminal_fold_leg_s,
+)
 from . import dp_prepare
 from .network import (
     _MAX_ENDPOINT_CLAIMS,
@@ -776,72 +779,6 @@ def _path_delay_s(
         ground_s=(label.departure_step - fg.base_step) * cfg.dt_s,
         air_detour_s=detour / cfg.nominal_speed_mps,
     )
-
-
-def _fold_leg_s(point, terminal: Terminal | None, lane_dist: float | None, cfg: SimConfig) -> float:
-    """Return the endpoint leg charged by the arc-form delay objective.
-
-    Parameters
-    ------------
-    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
-    - terminal (Terminal | None): the endpoint's terminal, or ``None`` for a customer endpoint.
-    - lane_dist (float | None): the lane distance; required when ``terminal`` is set and must
-      be ``None`` otherwise.
-    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
-
-    Return
-    --------
-    - output (float): the endpoint leg time in seconds charged by the arc-form objective.
-    """
-
-    if terminal is not None:
-        assert lane_dist is not None
-        return max(0.0, lane_dist - exit_radius(terminal, cfg)) / cfg.nominal_speed_mps
-    assert lane_dist is None
-    radius = hg.circumradius(cfg)
-    cell = hg.enu_to_axial(float(point[0]), float(point[1]), radius)
-    center = hg.hex_center(*cell, radius)
-    return (
-        math.hypot(float(point[0]) - float(center[0]), float(point[1]) - float(center[1]))
-        / cfg.nominal_speed_mps
-    )
-
-
-def _terminal_fold_leg_s(
-    point,
-    terminal: Terminal,
-    cell: Cell,
-    cfg: SimConfig,
-) -> tuple[float, bool]:
-    """Return a terminal fold leg and whether folding retains its lane cell.
-
-    ``fold_corners_to_columns`` drops endpoint corners that are even slightly
-    inside the exit radius.  Boundary-lane construction permits a sub-nanometre
-    inward round-off, so using ``Lane.dist`` (or a tolerance) to decide this can
-    revive the terminal fold-replacement pruning bug.  Recompute the scalar
-    distance with the same ``sqrt(dx*dx + dy*dy)`` predicate as folding and
-    enable the arc lower bound only when the lane is retained exactly.
-
-    Parameters
-    ------------
-    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
-    - terminal (Terminal): the endpoint's terminal.
-    - cell (Cell): the lane cell whose centre the fold measures from.
-    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
-
-    Return
-    --------
-    - output (tuple[float, bool]): the fold leg time in seconds, and whether folding retains
-      the lane cell exactly (distance >= the exit radius).
-    """
-
-    radius = hg.circumradius(cfg)
-    x, y = hg.hex_center(*cell, radius)
-    dx = float(x) - float(point[0])
-    dy = float(y) - float(point[1])
-    distance = math.sqrt(dx * dx + dy * dy)
-    edge_radius = exit_radius(terminal, cfg)
-    return max(0.0, distance - edge_radius) / cfg.nominal_speed_mps, distance >= edge_radius
 
 
 def _air_detour_lb_s(

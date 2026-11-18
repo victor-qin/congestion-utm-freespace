@@ -98,6 +98,7 @@ reserved; `colgen` instead solves the whole schedule at once.
 | `astar_heading_shortcut` | `OperationalIntent`-equivalent legacy ordering; skips same-heading probes only when reservation sampling is exactly unchanged (the run config retains the distinct public planner name) |
 | `astar_batched_shortcut` | experimental A\* shortcut: seed at 3D turns, then batch maximal straight runs for A/B evaluation |
 | `astar_milp_shortcut` | the sandwich: A\* → shortcut → MILP → shortcut. Pre-shortcut speeds MILP gap-certification; post-shortcut crosses residual lock slack + halves the knots |
+| `zeta` | opt-in [finite-waypoint Zeta search](experiments/ZETA_PACKAGE.md), shared with experimental CG; full-volume reservation claims, FCFS, one cruise level |
 | `colgen` | **whole-schedule** column generation (Balakrishnan–Chandran): a route is a column, the master is a set-packing LP over them, pricing is an exact label DP per flight. Single flight level; needs `terminal_airspace_always_active` for hub endpoints |
 
 `colgen` is not FCFS — it optimizes every flight jointly, so it answers a different question from the

@@ -1,5 +1,8 @@
 # Shared native Zeta state index
 
+Implementation now lives in the shared [Zeta package](ZETA_PACKAGE.md), usable
+by column generation and standalone FCFS planning.
+
 `ZetaOptions(native_state_index=True)` (CLI `--native-state-index`) enables an
 experimental representation change in the shared compact pricing loop. It requires
 `compiled_loop=True`; it works with either Python or compiled history comparisons.

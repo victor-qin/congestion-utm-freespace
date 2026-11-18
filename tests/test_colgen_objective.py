@@ -858,6 +858,21 @@ def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
     assert result.upper_bound >= expected - 1e-6
     assert result.upper_bound <= expected + 1e-6
     assert result.column is not None and result.column in legal
+    if terminal == "customer" and merge and not forbid and not lazy and not prune_snap:
+        from freespace_sim.planner.zeta import SearchSettings, ZetaGraph as SharedGraph, search
+
+        shared_graph = SharedGraph(fg, cfg, row_index, replace(options, early_return=True))
+        for current in (prices, {row: -value for row, value in prices.items()}):
+            direct = search(shared_graph, current, SearchSettings(model=cost_model(cfg, params)))
+            optimum = min(c.delay_s + math.fsum(current.get(row, 0.0) for row in c.claims)
+                          for c in legal)
+            assert direct.complete and direct.reason == "optimal"
+            assert direct.route is not None
+            assert direct.priced_cost == pytest.approx(optimum, abs=1e-6)
+            assert direct.lower_bound == pytest.approx(optimum, abs=1e-6)
+            assert direct.priced_cost == pytest.approx(
+                direct.route.physical_cost + math.fsum(current.get(row, 0.0)
+                                                       for row in direct.route.claims))
     assert len(columns) > 3
     assert any(hg.hex_distance(a, b) > 1 for c in columns
                for a, b in zip(c.cell_path, c.cell_path[1:]))
@@ -1540,9 +1555,8 @@ def test_anyangle_shorter_histories_preserve_full_and_interrupted_pricing(
         assert HistoryGuard(graph, negative_air, prices).margin(None, None) is not None
         with monkeypatch.context() as reversed_objective:
             reversed_objective.setattr(zeta, "cost_model", lambda _cfg, _params: negative_air)
-            negative_result = price_zeta(graph, prices, 0.0, params)
-        assert negative_result.shorter_histories_merged == 0
-        assert negative_result.merge_error_bound == 0.0
+            with pytest.raises(ValueError, match="finite and positive"):
+                price_zeta(graph, prices, 0.0, params)
     for capped in (replace(options, max_labels=result.generated - 1),
                    replace(options, max_expansions=result.expanded - 1)):
         limited = price_zeta(ZetaGraph(fg, cfg, rows, capped), prices, 0.0, params)
@@ -1628,7 +1642,7 @@ def test_anyangle_shorter_histories_preserve_canonical_length_budget(
         pytest.importorskip("numba")
     if compiled_loop:
         pytest.importorskip("Cython")
-    from freespace_sim.planner.colgen.zeta import _Part
+    from freespace_sim.planner.zeta.search import _Part
 
     cfg = _cfg(max_ground_delay_s=0.0, max_detour_factor=4.0)
     fg, params = _graph(cfg, dest=(2, 0), overrun=3)
@@ -1673,7 +1687,7 @@ def test_anyangle_shorter_histories_preserve_canonical_length_budget(
         return tuple(replace(part, length=length) for part, length in zip(parts, lengths))
 
     monkeypatch.setattr(graph, "parts", budget_parts)
-    monkeypatch.setattr(graph, "seed_columns", lambda *_args: ())
+    monkeypatch.setattr(graph, "seed_routes", lambda *_args: ())
     model = cost_model(cfg, params)
     assert HistoryGuard(graph, model, {}).margin(None, None) is not None
     bad = Column(fg.request.flight_id, fg.base_step, 0, None, None, (origin, over_budget, goal), 0.0)
@@ -2239,7 +2253,7 @@ def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(nativ
     assert found.column is not None and found.reduced_cost > params.epsilon
     assert found.reason == "improving_column" and not found.complete
     discovered = ZetaGraph(fg, cfg, rows, replace(options, early_return=True))
-    monkeypatch.setattr(discovered, "seed_columns", lambda *_args: ())
+    monkeypatch.setattr(discovered, "seed_routes", lambda *_args: ())
     import heapq
     with monkeypatch.context() as no_queue:
         def reject_heap(*_args):
@@ -2256,7 +2270,7 @@ def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(nativ
     expired = price_zeta(early, prices, 0.0, params, deadline=time.perf_counter()-1)
     assert not expired.complete and expired.reason == "deadline"
     interrupted_graph = ZetaGraph(fg, cfg, rows, options)
-    monkeypatch.setattr(interrupted_graph, "seed_columns", lambda *_args: ())
+    monkeypatch.setattr(interrupted_graph, "seed_routes", lambda *_args: ())
     real_parts = interrupted_graph.parts
     clock = [0.0]
     def expire_after_edge(*args):

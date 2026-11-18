@@ -1,5 +1,8 @@
 # Simulator-backed any-angle column-generation prototype
 
+Implementation now lives in the shared [Zeta package](ZETA_PACKAGE.md), usable
+by column generation and standalone FCFS planning.
+
 This is an explicit experimental entry point. The production planner and its DP remain the default. `solve_zeta` runs a live column-generation loop using the existing `RestrictedMaster`, with physical any-angle route pricing in place of the neighbouring-hop DP. It follows Zetahex's finite-waypoint, any-angle and paid-row-history approach; it is a Python reference implementation adapted to this simulator, not a call to Zetahex's native integer-clock kernel.
 
 For the search model and the proposed reusable terminal-to-cell route caches, see

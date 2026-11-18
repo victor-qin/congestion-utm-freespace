@@ -1,5 +1,8 @@
 # Forward-only twelve-direction dynamic programming experiment
 
+Implementation now lives in the shared [Zeta package](ZETA_PACKAGE.md), usable
+by column generation and standalone FCFS planning.
+
 This is an opt-in Zeta experiment. Production DP and the default Zeta best-first
 traversal are unchanged. Select `ZetaOptions(backend="compiled",
 connection_mode="hex12", forward_cruise=True, traversal="forward_dp", ...)`, or

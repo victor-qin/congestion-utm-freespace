@@ -702,7 +702,8 @@ def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
     # `_static_hop_allowed_roles`, NOT the `_static_hop_forbidden` wrapper: the lazy oracle
     # calls the former directly, so a sentinel on the wrapper can never fire and the guard
     # would pass no matter how eager construction became.
-    monkeypatch.setattr(network_module, "_static_hop_allowed_roles", fail_if_checked)
+    from freespace_sim.planner import route_domain
+    monkeypatch.setattr(route_domain, "_static_hop_allowed_roles", fail_if_checked)
     graph = build_flight_graph(
         req,
         cfg,
@@ -780,7 +781,10 @@ def test_many_far_walls_never_reach_narrow_phase(monkeypatch, planner):
         ColGenParams(max_air_overrun_hops=2),
     )
     calls = 0
-    module = network_module if planner == "dp" else zeta
+    import importlib
+    module = importlib.import_module(
+        "freespace_sim.planner.route_domain" if planner == "dp"
+        else "freespace_sim.planner.zeta.search")
     original_conflict = module.volumes_conflict
 
     def count_conflicts(*args, **kwargs):

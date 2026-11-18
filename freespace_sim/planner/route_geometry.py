@@ -1,0 +1,545 @@
+"""Translate shared route geometry into ledger-ready operational intents.
+
+The pricing network uses an integer clock, while reservations and metrics use wall-clock
+seconds.  Keeping that conversion here gives a column one unambiguous interpretation and,
+in particular, preserves A*'s distinction between the delay used to anchor a reservation and
+the delay reported to users (which excludes departure-time rounding).
+"""
+
+from __future__ import annotations
+
+import math
+import operator
+from dataclasses import replace
+from typing import Protocol
+
+import numpy as np
+
+from ..config import SimConfig
+from ..cost import endpoint_altitude_change_m, trajectory_cost
+from ..types import (
+    DenialReason,
+    FlightRequest,
+    IntentStatus,
+    OperationalIntent,
+    Terminal,
+    TimedPoint,
+    Vec,
+    as_terminal,
+)
+from ..volumes import (
+    Volume4D,
+    build_reservation_from_corners,
+    column_dwell_s,
+    enroute_detour_m,
+    enroute_flown_m,
+    enroute_reference_m,
+    lattice_subdivision,
+    exit_radius,
+)
+from . import hexgrid as hg
+
+Cell = tuple[int, int]
+
+
+class RouteGeometry(Protocol):
+    """Discrete route choices needed to build an authoritative simulator intent.
+
+    Attributes
+    ------------
+    - flight_id (int): request identity.
+    - departure_step (int): takeoff step on the configured departure clock.
+    - level (int): index into configured flight levels.
+    - origin_lane_idx (int | None): selected origin terminal lane, if applicable.
+    - dest_lane_idx (int | None): selected destination terminal lane, if applicable.
+    - cell_path (tuple[Cell, ...]): ordered candidate waypoint coordinates.
+    """
+
+    flight_id: int
+    departure_step: int
+    level: int
+    origin_lane_idx: int | None
+    dest_lane_idx: int | None
+    cell_path: tuple[Cell, ...]
+
+
+def _index_field(value: object, name: str) -> int:
+    """Normalize one discrete-network field without truncating fractions."""
+
+    try:
+        return operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"column {name} must be an integer") from exc
+
+
+
+def _selected_lane(
+    cell: Cell, lane_idx: int | None, lanes: list[hg.Lane], endpoint: str,
+    *, _validate: bool = True,
+) -> hg.Lane:
+    """Validate and return the terminal lane encoded by a column endpoint.
+
+    Parameters
+    ------------
+    - cell (Cell): the column endpoint cell that must equal the selected lane's cell.
+    - lane_idx (int | None): index of the chosen lane; ``None`` is rejected.
+    - lanes (list[hg.Lane]): the terminal's exit lanes to index into.
+    - endpoint (str): endpoint label ("origin"/"dest") used in error messages.
+    - _validate (bool): check endpoint agreement; indexing remains checked for construction.
+
+    Return
+    --------
+    - output (hg.Lane): the selected lane. Raises ``ValueError`` when ``lane_idx`` is ``None``,
+      out of range, or names a lane whose cell differs from ``cell``.
+    """
+    if lane_idx is None:
+        raise ValueError(f"{endpoint}_lane_idx is required for a terminal endpoint")
+    lane_idx = _index_field(lane_idx, f"{endpoint}_lane_idx")
+    if not 0 <= lane_idx < len(lanes):
+        raise ValueError(
+            f"{endpoint}_lane_idx {lane_idx} is outside the available lane range [0, {len(lanes)})"
+        )
+    lane = lanes[lane_idx]
+    if _validate and cell != lane.cell:
+        raise ValueError(
+            f"column {endpoint} cell {cell} does not match selected terminal lane {lane.cell}"
+        )
+    return lane
+
+
+def route_to_corners(
+    col: RouteGeometry,
+    req: FlightRequest,
+    cfg: SimConfig,
+    *,
+    _validate: bool = True,
+    _any_angle: bool = False,
+) -> tuple[list[Vec], float, float, float, Terminal | None, Terminal | None]:
+    """Convert a discrete column to hex-centre corners and A*-equivalent timing metadata.
+
+    The returned delays deliberately differ when ``req.t_departure`` is not on the integer clock:
+    ``build_g_delay`` anchors the takeoff cylinder at ``departure_step * dt``; the reported delay
+    counts only ground-hold steps after ``ceil(t_departure / dt)``.  ``corridor_t0`` includes the
+    quantised climb and, for a hub origin, the chosen lane's quantised traverse.
+
+    Parameters
+    ------------
+    - col (RouteGeometry): the discrete route to expand; its cells, level, and departure step are read.
+    - req (FlightRequest): the flight this column serves, checked to match ``col.flight_id``.
+    - cfg (SimConfig): supplies the clock, flight levels, and lattice/terminal geometry.
+    - _validate (bool): enforce route feasibility; False is internal diagnostic construction.
+      Required types, indices and supported terminal configuration are still checked.
+    - _any_angle (bool): internal prototype mode permitting nonadjacent candidate waypoints;
+      endpoint and lane validation are unchanged.
+
+    Return
+    --------
+    - output (tuple[list[Vec], float, float, float, Terminal | None, Terminal | None]): the
+      hex-centre corner polyline, build-anchor ground delay (s), reported ground delay (s),
+      corridor start stamp (s), and the origin/destination terminals (``None`` for a customer
+      endpoint).  Raises ``ValueError`` when the column does not match the request or lattice,
+      and ``NotImplementedError`` for terminal endpoints without the required colgen-v1 flags.
+    """
+    flight_id = _index_field(col.flight_id, "flight_id")
+    departure_step = _index_field(col.departure_step, "departure_step")
+    level = _index_field(col.level, "level")
+    if _validate and flight_id != req.flight_id:
+        raise ValueError(f"column flight_id {col.flight_id} does not match request {req.flight_id}")
+    if not 0 <= level < len(cfg.flight_levels_m):
+        raise ValueError(
+            f"column level {col.level} is outside the flight-level range "
+            f"[0, {len(cfg.flight_levels_m)})"
+        )
+    if len(col.cell_path) < 2:
+        # Defensive backstop for callers that bypassed the frozen dataclass constructor.
+        raise ValueError("a column path must contain at least two cells")
+
+    dt = cfg.dt_s
+    base = int(math.ceil(req.t_departure / dt))
+    if _validate and departure_step < base:
+        raise ValueError(
+            f"column departs at step {col.departure_step}, before request base step {base}"
+        )
+
+    origin_term = as_terminal(req.origin_terminal)
+    dest_term = as_terminal(req.dest_terminal)
+    if not cfg.terminal_airspace_always_active and (
+        origin_term is not None or dest_term is not None
+    ):
+        raise NotImplementedError(
+            "colgen v1 requires terminal_airspace_always_active=True for terminal endpoints"
+        )
+    if not cfg.fixed_exit_lanes and (origin_term is not None or dest_term is not None):
+        raise NotImplementedError("colgen v1 requires fixed_exit_lanes=True for terminal endpoints")
+    lane_steps = 0
+    if origin_term is not None:
+        origin_lanes = hg.terminal_lanes(req.origin, origin_term, cfg)
+        lane_steps = _selected_lane(
+            col.cell_path[0], col.origin_lane_idx, origin_lanes, "origin", _validate=_validate
+        ).steps
+    elif _validate and col.origin_lane_idx is not None:
+        raise ValueError("origin_lane_idx must be None for a non-terminal endpoint")
+
+    if _validate and dest_term is not None:
+        dest_lanes = hg.terminal_lanes(req.dest, dest_term, cfg)
+        _selected_lane(col.cell_path[-1], col.dest_lane_idx, dest_lanes, "dest")
+    elif _validate and col.dest_lane_idx is not None:
+        raise ValueError("dest_lane_idx must be None for a non-terminal endpoint")
+
+    z = cfg.flight_levels_m[level]
+    radius = hg.circumradius(cfg)
+    if _validate and origin_term is None:
+        expected = hg.enu_to_axial(float(req.origin[0]), float(req.origin[1]), radius)
+        if col.cell_path[0] != expected:
+            raise ValueError(
+                f"column origin cell {col.cell_path[0]} does not match customer cell {expected}"
+            )
+    if _validate and dest_term is None:
+        expected = hg.enu_to_axial(float(req.dest[0]), float(req.dest[1]), radius)
+        if col.cell_path[-1] != expected:
+            raise ValueError(
+                f"column destination cell {col.cell_path[-1]} does not match customer cell {expected}"
+            )
+    for first, second in (zip(col.cell_path, col.cell_path[1:]) if _validate else ()):
+        if first == second or (not _any_angle and hg.hex_distance(first, second) != 1):
+            raise ValueError(
+                f"column paths must use {'distinct waypoints' if _any_angle else 'adjacent lateral hex hops'}; "
+                f"found {first} -> {second}"
+            )
+    corners = [np.array([*hg.hex_center(q, r, radius), z], dtype=float) for q, r in col.cell_path]
+
+    build_g_delay = departure_step * dt - req.t_departure
+    report_g_delay = (departure_step - base) * dt
+    takeoff_steps = cfg.climb_steps_to(z)
+    corridor_t0 = (departure_step + takeoff_steps + lane_steps) * dt
+    return (
+        corners,
+        build_g_delay,
+        report_g_delay,
+        corridor_t0,
+        origin_term,
+        dest_term,
+    )
+
+
+def _retime_lattice_reservation(
+    volumes: list[Volume4D],
+    centerline: list[TimedPoint],
+    corners: list[Vec],
+    corridor_t0: float,
+    origin_t0: float,
+    origin_dwell_s: float,
+    destination_dwell_s: float,
+    cfg: SimConfig,
+) -> tuple[list[Volume4D], list[TimedPoint]]:
+    """Stamp resampled geometry onto the pricing network's exact lattice clock.
+
+    ``build_reservation_from_corners`` deliberately times arbitrary polylines from their
+    floating-point lengths.  A colgen corner pair, however, is one discrete lateral edge and its
+    row claims therefore represent exactly one ``dt``.  A rare round-off-induced resample can make
+    the builder accumulate a few femtoseconds across that edge.  Reusing its subdivision arithmetic
+    here preserves every shape and terminal tag while distributing the fixed edge duration across
+    its sub-boxes.  In particular, every original corner boundary and the landing cylinder start on
+    the exact discrete arrival clock rather than on an accumulated distance clock.
+
+    Parameters
+    ------------
+    - volumes (list[Volume4D]): builder reservation boxes (origin cylinder, one per lattice
+      sub-edge, destination cylinder) to be re-stamped onto the discrete clock.
+    - centerline (list[TimedPoint]): builder timed centreline points, re-stamped in step.
+    - corners (list[Vec]): hex-centre corner polyline; its edge lengths set each hop's sub-box
+      count.
+    - corridor_t0 (float): corridor start stamp (s), rounded to the nearest discrete step.
+    - origin_t0 (float): takeoff stamp (s) anchoring the origin cylinder's ``t_start``.
+    - origin_dwell_s (float): origin terminal dwell added to the origin cylinder's ``t_end``.
+    - destination_dwell_s (float): destination dwell added to the landing cylinder's ``t_end``.
+    - cfg (SimConfig): supplies ``dt_s``, ``corridor_segment_len_m``, ``hover_time_s``, and
+      ``time_buffer_s``.
+
+    Return
+    --------
+    - output (tuple[list[Volume4D], list[TimedPoint]]): the retimed reservation volumes and
+      timed centreline. Raises ``RuntimeError`` when the builder output length does not match
+      the column's lattice subdivisions.
+    """
+    segment_len = cfg.corridor_segment_len_m
+    nsubs = [len(lattice_subdivision(first, second, segment_len))
+             for first, second in zip(corners, corners[1:])]
+
+    edge_count = sum(nsubs)
+    if len(volumes) != edge_count + 2 or len(centerline) != edge_count + 1:
+        raise RuntimeError(
+            "reservation builder output does not match the column's lattice subdivisions"
+        )
+
+    corridor_start_step = int(round(corridor_t0 / cfg.dt_s))
+    exact_corridor_t0 = corridor_start_step * cfg.dt_s
+    retimed_volumes = [
+        replace(
+            volumes[0],
+            t_start=origin_t0,
+            t_end=origin_t0 + cfg.hover_time_s + origin_dwell_s,
+        )
+    ]
+    retimed_centerline: list[TimedPoint] = [(centerline[0][0], exact_corridor_t0)]
+    edge_index = 0
+    for hop_index, nsub in enumerate(nsubs):
+        # Multiplying the absolute integer step mirrors ``column_claims`` exactly;
+        # repeated float addition would reintroduce drift for non-binary ``dt_s``.
+        hop_t0 = (corridor_start_step + hop_index) * cfg.dt_s
+        hop_t1 = (corridor_start_step + hop_index + 1) * cfg.dt_s
+        for sub_index in range(nsub):
+            # Pin both original-hop boundaries explicitly; interpolate only interior cuts.
+            raw_t0 = hop_t0 if sub_index == 0 else hop_t0 + cfg.dt_s * sub_index / nsub
+            raw_t1 = hop_t1 if sub_index + 1 == nsub else hop_t0 + cfg.dt_s * (sub_index + 1) / nsub
+            edge = volumes[edge_index + 1]
+            retimed_volumes.append(
+                replace(
+                    edge,
+                    t_start=raw_t0 - cfg.time_buffer_s,
+                    t_end=raw_t1 + cfg.time_buffer_s,
+                )
+            )
+            point, _old_time = centerline[edge_index + 1]
+            retimed_centerline.append((point, raw_t1))
+            edge_index += 1
+
+    arrival_t = (corridor_start_step + len(nsubs)) * cfg.dt_s
+    destination = volumes[-1]
+    retimed_volumes.append(
+        replace(
+            destination,
+            t_start=arrival_t,
+            # Match ``hover_reservation``'s operation order exactly so parity
+            # holds even when the dwell duration is not binary-exact.
+            t_end=arrival_t + cfg.hover_time_s + destination_dwell_s,
+        )
+    )
+    # The final sub-box timestamp is the same expression in normal operation; pin it to the one
+    # arrival value used by the destination cylinder to keep their shared boundary bit-identical.
+    final_point, _old_time = retimed_centerline[-1]
+    retimed_centerline[-1] = (final_point, arrival_t)
+    return retimed_volumes, retimed_centerline
+
+
+def lattice_centerline(
+    cell_path: tuple[tuple[int, int], ...], z: float, cfg: SimConfig
+) -> list[tuple[float, float, float]]:
+    """The centreline points :func:`route_to_intent` measures, without building any volume.
+
+    ``build_reservation_from_corners`` stamps the first hex-centre corner and then the end of
+    every sub-segment; :func:`_retime_lattice_reservation` changes only their times.  These are
+    the same points, bit for bit (the subdivision is :func:`lattice_subdivision`), so
+    ``enroute_flown_m`` over them reproduces the intent's flown distance exactly.
+
+    Parameters
+    ------------
+    - cell_path (tuple[tuple[int, int], ...]): the column's axial cells, at least two.
+    - z (float): the column's flight-level altitude.
+    - cfg (SimConfig): supplies the lattice radius and segment length.
+
+    Return
+    --------
+    - output (list[tuple[float, float, float]]): the centreline points in flight order.
+    """
+    radius = hg.circumradius(cfg)
+    corners = []
+    for q, r in cell_path:
+        x, y = hg.hex_center(q, r, radius)
+        corners.append((float(x), float(y), float(z)))
+    points = [corners[0]]
+    segment_len = cfg.corridor_segment_len_m
+    for a, b in zip(corners, corners[1:]):
+        points.extend(end for _start, end in lattice_subdivision(a, b, segment_len))
+    return points
+
+
+def route_to_intent(
+    col: RouteGeometry,
+    req: FlightRequest,
+    cfg: SimConfig,
+    solve_share_s: float = 0.0,
+    *,
+    _validate: bool = True,
+    _any_angle: bool = False,
+    planner: str = "route",
+) -> OperationalIntent:
+    """Build the exact reservation and reported metrics represented by ``col``.
+
+    Parameters
+    ------------
+    - col (RouteGeometry): the route to realise.
+    - req (FlightRequest): the flight this column serves.
+    - cfg (SimConfig): supplies geometry, clock, and cost weights.
+    - solve_share_s (float): this route's share of solve wall time, recorded on the intent.
+    - planner (str): caller identity recorded on accepted and rejected intents.
+    - _validate (bool): enforce route and budget checks; False is internal diagnostic
+      construction, with identical geometry, timing and cost calculations.
+    - _any_angle (bool): internal prototype mode using nominal-speed arbitrary segments,
+      retaining the existing departure, climb, terminal-lane and objective rules.
+
+    Return
+    --------
+    - output (OperationalIntent): an ACCEPTED intent carrying the reservation volumes, timed
+      centreline, delays, and cost; or a REJECTED intent (``BUDGET_EXCEEDED``) when the ground
+      hold exceeds ``max_ground_delay_s`` or the detour exceeds ``max_detour_factor``.
+    """
+    (
+        corners,
+        build_g_delay,
+        report_g_delay,
+        corridor_t0,
+        origin_term,
+        dest_term,
+    ) = route_to_corners(
+        col, req, cfg,
+        **({} if _validate else {"_validate": False}),
+        **({"_any_angle": True} if _any_angle else {}),
+    )
+    level = _index_field(col.level, "level")
+    departure_step = _index_field(col.departure_step, "departure_step")
+    z = cfg.flight_levels_m[level]
+
+    base = int(math.ceil(req.t_departure / cfg.dt_s))
+    max_ground_steps = int(math.floor(cfg.max_ground_delay_s / cfg.dt_s + 1e-12))
+    if _validate and departure_step > base + max_ground_steps:
+        return OperationalIntent(
+            request=req,
+            status=IntentStatus.REJECTED,
+            denial_reason=DenialReason.BUDGET_EXCEEDED,
+            planner=planner,
+            solve_time_s=solve_share_s,
+        )
+
+    volumes, centerline, _cum_horiz, cum_dz = build_reservation_from_corners(
+        corners,
+        req.origin,
+        req.dest,
+        req.t_departure,
+        build_g_delay,
+        cfg,
+        origin_term=origin_term,
+        dest_term=dest_term,
+        corridor_t0=corridor_t0,
+    )
+    if _any_angle:
+        # Preserve the integer takeoff anchor even when subtraction/addition would drift.
+        volumes[0] = replace(
+            volumes[0],
+            t_start=departure_step * cfg.dt_s,
+            t_end=departure_step * cfg.dt_s + cfg.hover_time_s
+            + column_dwell_s(req.origin, origin_term, cfg, z),
+        )
+    else:
+        volumes, centerline = _retime_lattice_reservation(
+            volumes,
+            centerline,
+            corners,
+            corridor_t0,
+            departure_step * cfg.dt_s,
+            column_dwell_s(req.origin, origin_term, cfg, z),
+            column_dwell_s(req.dest, dest_term, cfg, z),
+            cfg,
+        )
+    reference = enroute_reference_m(req.origin, req.dest, origin_term, dest_term, cfg)
+    flown = enroute_flown_m(
+        [point for point, _time in centerline],
+        req.origin,
+        req.dest,
+        origin_term,
+        dest_term,
+        cfg,
+    )
+    if _validate and reference > 1e-9 and flown / reference > cfg.max_detour_factor:
+        return OperationalIntent(
+            request=req,
+            status=IntentStatus.REJECTED,
+            denial_reason=DenialReason.BUDGET_EXCEEDED,
+            planner=planner,
+            solve_time_s=solve_share_s,
+        )
+    detour = enroute_detour_m(flown, reference)
+    intent = OperationalIntent(
+        request=req,
+        status=IntentStatus.ACCEPTED,
+        volumes=volumes,
+        centerline=centerline,
+        ground_delay_s=report_g_delay,
+        air_hold_s=0.0,
+        air_detour_m=detour,
+        lattice_overhead_m=(
+            0.0 if _any_angle
+            else hg.lattice_overhead_m(col.cell_path, cfg.corridor_segment_len_m, detour)
+        ),
+        altitude_change_m=endpoint_altitude_change_m(z, z, cum_dz, cfg),
+        planner=planner,
+        solve_time_s=solve_share_s,
+    )
+    intent.cost = trajectory_cost(intent, cfg)
+    return intent
+
+
+def _fold_leg_s(point: Vec, terminal: Terminal | None, lane_dist: float | None, cfg: SimConfig) -> float:
+    """Return the endpoint leg charged by the arc-form delay objective.
+
+    Parameters
+    ------------
+    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
+    - terminal (Terminal | None): the endpoint's terminal, or ``None`` for a customer endpoint.
+    - lane_dist (float | None): the lane distance; required when ``terminal`` is set and must
+      be ``None`` otherwise.
+    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
+
+    Return
+    --------
+    - output (float): the endpoint leg time in seconds charged by the arc-form objective.
+    """
+
+    if terminal is not None:
+        assert lane_dist is not None
+        return max(0.0, lane_dist - exit_radius(terminal, cfg)) / cfg.nominal_speed_mps
+    assert lane_dist is None
+    radius = hg.circumradius(cfg)
+    cell = hg.enu_to_axial(float(point[0]), float(point[1]), radius)
+    center = hg.hex_center(*cell, radius)
+    return (
+        math.hypot(float(point[0]) - float(center[0]), float(point[1]) - float(center[1]))
+        / cfg.nominal_speed_mps
+    )
+
+
+def _terminal_fold_leg_s(
+    point: Vec,
+    terminal: Terminal,
+    cell: Cell,
+    cfg: SimConfig,
+) -> tuple[float, bool]:
+    """Return a terminal fold leg and whether folding retains its lane cell.
+
+    ``fold_corners_to_columns`` drops endpoint corners that are even slightly
+    inside the exit radius.  Boundary-lane construction permits a sub-nanometre
+    inward round-off, so using ``Lane.dist`` (or a tolerance) to decide this can
+    revive the terminal fold-replacement pruning bug.  Recompute the scalar
+    distance with the same ``sqrt(dx*dx + dy*dy)`` predicate as folding and
+    enable the arc lower bound only when the lane is retained exactly.
+
+    Parameters
+    ------------
+    - point (Vec): the endpoint position in local ENU metres; only x/y are used.
+    - terminal (Terminal): the endpoint's terminal.
+    - cell (Cell): the lane cell whose centre the fold measures from.
+    - cfg (SimConfig): supplies the geometry, exit radius, and nominal speed.
+
+    Return
+    --------
+    - output (tuple[float, bool]): the fold leg time in seconds, and whether folding retains
+      the lane cell exactly (distance >= the exit radius).
+    """
+
+    radius = hg.circumradius(cfg)
+    x, y = hg.hex_center(*cell, radius)
+    dx = float(x) - float(point[0])
+    dy = float(y) - float(point[1])
+    distance = math.sqrt(dx * dx + dy * dy)
+    edge_radius = exit_radius(terminal, cfg)
+    return max(0.0, distance - edge_radius) / cfg.nominal_speed_mps, distance >= edge_radius

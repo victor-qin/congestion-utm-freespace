@@ -1799,8 +1799,11 @@ def test_zeta_expired_sweep_cannot_certify_or_leave_workers_running(started, com
         if phase == "seed":
             assert expired.results == expected
         else:
-            assert tuple((fid, replace(result, wall_s=0.0)) for fid, result in expired.results) == tuple(
-                (fid, replace(result, wall_s=0.0)) for fid, result in expected
+            # Parent and worker elapsed times differ; every result and work counter must match.
+            timers = dict(wall_s=0.0, bound_build_s=0.0,
+                          topology_setup_s=0.0, incumbent_setup_s=0.0)
+            assert tuple((fid, replace(result, **timers)) for fid, result in expired.results) == tuple(
+                (fid, replace(result, **timers)) for fid, result in expected
             )
         assert all(not process.is_alive() for process in processes)
         with pytest.raises(RuntimeError):

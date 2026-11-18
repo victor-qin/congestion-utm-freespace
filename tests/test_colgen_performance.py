@@ -23,6 +23,7 @@ from freespace_sim.planner.colgen.objective import CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView, price_flight, seed_column
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 from freespace_sim.planner.colgen.windows import derive_cell_window, endpoint_claim_cells
+from freespace_sim.planner.turn_rule import path_turns_valid
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from freespace_sim.volumes import exit_radius
 from tests._colgen_support import with_air_hops
@@ -561,6 +562,12 @@ def _exhaustive_columns(graph, cfg):
                     continue
                 if neighbour in path[-revisit_depth:]:
                     continue
+                if graph.turn_below_90 and hops >= 1:
+                    # Independent physical test of the strict turn rule on hex centres.
+                    radius = hg.circumradius(cfg)
+                    a, b, c = (hg.hex_center(*cell, radius) for cell in (path[-2], path[-1], neighbour))
+                    if float(np.dot(b - a, c - b)) <= 1e-9 * float(np.dot(b - a, b - a)):
+                        continue
                 if (path[-1], neighbour) in graph.forbidden_hops:
                     continue
                 visit((*path, neighbour))
@@ -675,8 +682,9 @@ def _weighted_cost(column, graph, cfg, model: CostModel) -> float:
 @pytest.mark.parametrize(
     "ground_weight,air_weight", [(1.0, 1.0), (1.0, 3.0), (3.0, 1.0)]
 )
+@pytest.mark.parametrize("turn", [False, True])
 def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
-    ground_weight, air_weight
+    ground_weight, air_weight, turn
 ):
     """The search's answer must be the objective's argmin, whichever way it leans.
 
@@ -705,15 +713,25 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
         max_air_overrun_hops=1,
         objective="total_cost",
         time_limit_s=60.0,
+        turn_below_90=turn,
     )
     request = FlightRequest(7, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)
     graph = build_flight_graph(request, cfg, (), params)
+    assert graph.turn_below_90 is turn
     # The oracle enumerates every W-valid column; the search is bounded by
     # `max_air_hops`, so compare over the domain the search is actually allowed to reach.
     # Enumerating first and filtering second keeps the count assertion honest about what
     # the cap removes: 567 columns exist, and the search may choose among those within it.
     all_columns = _exhaustive_columns(graph, cfg)
-    assert len(all_columns) == 567, "a shrunken universe would hide a miss rather than fail"
+    if turn:
+        # The strict turn rule must bind: a proper, nonempty subset of the free universe.
+        free = _exhaustive_columns(replace(graph, turn_below_90=False), cfg)
+        assert len(free) == 567 and 0 < len(all_columns) < len(free)
+        assert {c.cell_path for c in all_columns} < {c.cell_path for c in free}
+        assert all(path_turns_valid(c.cell_path) for c in all_columns)
+        assert path_turns_valid(pricing.seed_column(graph, cfg).cell_path)
+    else:
+        assert len(all_columns) == 567, "a shrunken universe would hide a miss rather than fail"
     columns = [c for c in all_columns if len(c.cell_path) - 1 <= graph.max_air_hops]
     assert columns, "the air-time ceiling cannot rule out every column"
 
@@ -744,3 +762,11 @@ def test_pricing_returns_the_exhaustive_optimum_under_any_weighting(
 
     assert priced is not None
     assert reduced_cost == pytest.approx(best, abs=1e-9)
+    if turn:
+        assert path_turns_valid(priced.cell_path)
+        ref_rc, ref_column = pricing._best_column(
+            graph, view, pi_f, cfg, params.M, frozenset(), seed=False, incumbent=None,
+            model=model,
+        )
+        assert ref_rc == pytest.approx(best, abs=1e-9)
+        assert path_turns_valid(ref_column.cell_path)

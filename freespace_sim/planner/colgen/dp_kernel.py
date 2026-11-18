@@ -653,6 +653,21 @@ def _role_allows(roles, first, last):
 
 
 @njit(cache=True, nogil=True)
+def _turn_ok(cell_q, cell_r, previous, current, following):
+    """Exact strictly-below-90-degree test through one interior cruise cell.
+
+    Mirrors ``planner.turn_rule.turn_allowed_at`` on interned cell ids: the integer
+    ``2*dq1*dq2 + dq1*dr2 + dr1*dq2 + 2*dr1*dr2`` is twice the pointy-top Euclidean dot
+    product in pitch-squared units, so perpendicular continuations (zero) are rejected.
+    """
+    iq = np.int64(cell_q[current]) - np.int64(cell_q[previous])
+    ir = np.int64(cell_r[current]) - np.int64(cell_r[previous])
+    oq = np.int64(cell_q[following]) - np.int64(cell_q[current])
+    orr = np.int64(cell_r[following]) - np.int64(cell_r[current])
+    return 2 * iq * oq + iq * orr + ir * oq + 2 * ir * orr > 0
+
+
+@njit(cache=True, nogil=True)
 def _layer_lt(
     a, b, depth,
     label_score, label_cell, label_parent, label_hops, label_departure, label_lane,
@@ -1380,6 +1395,7 @@ def _price_dag(
     dest_mask: np.ndarray, dest_lane_start: np.ndarray, dest_lane_idx: np.ndarray,
     air_hop_limit: int, revisit_depth: int, state_history_depth: int, track_first_hop: bool,
     min_step: int, max_step: int,
+    turn_rule: bool, cell_q: np.ndarray, cell_r: np.ndarray,
     # --- roots, pre-bucketed by start step
     root_order: np.ndarray, root_bucket_start: np.ndarray,
     var_cell: np.ndarray, var_score: np.ndarray, var_paid_class: np.ndarray,
@@ -1794,6 +1810,12 @@ def _price_dag(
                         banned = True
                         break
                 if banned:
+                    continue
+                # The predecessor is ``recent_a[1]``, already part of the dominance key.
+                if turn_rule and not first_arc and not _turn_ok(
+                    cell_q, cell_r, label_cell[label_parent[label]], cell, neighbour
+                ):
+                    out_counts[3] += 1
                     continue
                 roles = arc_roles[a]
                 finish_allowed = dest_mask[neighbour] != 0 and _role_allows(
@@ -2238,7 +2260,7 @@ def _feasible_dag(
     arc_start, arc_target, hex_remaining,
     dest_mask, dest_lane_start,
     air_hop_limit, revisit_depth, state_history_depth, track_first_hop,
-    max_step,
+    max_step, turn_rule, cell_q, cell_r,
     # --- roots, already filtered by the host in the reference's own order
     root_cell, root_step, root_departure, root_lane, root_bound, root_remaining,
     # --- delay bound
@@ -2512,6 +2534,10 @@ def _feasible_dag(
                     break
             if banned:
                 continue
+            if turn_rule and hops > 0 and not _turn_ok(
+                cell_q, cell_r, label_cell[label_parent[popped]], cell, neighbour
+            ):
+                continue
             remaining = hex_remaining[neighbour]
             if next_step + remaining > max_step:
                 continue
@@ -2595,13 +2621,17 @@ class DagResult:
 
     __slots__ = (
         "status", "n_labels", "candidates", "paths", "incumbent", "attempts", "budget",
+        "turn_rejected",
     )
 
     def __init__(
-        self, status, n_labels, candidates, paths, incumbent=None, attempts=1, budget=None
+        self, status, n_labels, candidates, paths, incumbent=None, attempts=1, budget=None,
+        turn_rejected=0,
     ):
         self.status = status
         self.n_labels = n_labels
+        # Arcs skipped by the opt-in turn rule, summed over every attempt of this call.
+        self.turn_rejected = turn_rejected
         # `(label_capacity, log2cap, candidate_capacity)` this run settled on.  Handing it
         # back to the next call for the same graph is what stops every colgen iteration
         # from re-discovering the same 13.3M-label pool by restarting into it.
@@ -2880,7 +2910,8 @@ def price_dag(
     order, bucket_start = _root_buckets(variants, topology)
     if cancel is None:
         cancel = np.zeros(1, dtype=np.uint8)
-    out_counts = np.zeros(3, dtype=np.int64)
+    # [labels, candidates, last relaxed step, turn-rule rejections]
+    out_counts = np.zeros(4, dtype=np.int64)
     resume = np.zeros(8, dtype=np.int64)
     out_sink = np.zeros(8, dtype=np.int64)
     cutoff = np.zeros(1, dtype=np.float64)
@@ -3056,6 +3087,7 @@ def price_dag(
                 topology.dest_lane_idx,
                 topology.air_hop_limit, topology.revisit_depth, depth,
                 bool(topology.track_first_hop), topology.min_step, topology.max_step,
+                bool(topology.turn_below_90), topology.cell_q, topology.cell_r,
                 order, bucket_start,
                 variants.cell, variants.score, variants.paid_class,
                 variants.departure_step, variants.lane_idx,
@@ -3133,7 +3165,7 @@ def price_dag(
     _drain()
     return DagResult(
         status, int(out_counts[0]), candidates, paths, incumbent, attempt + 1,
-        (label_capacity, log2cap, candidate_capacity),
+        (label_capacity, log2cap, candidate_capacity), int(out_counts[3]),
     )
 
 
@@ -3266,6 +3298,7 @@ def feasible_dag(
                 topology.dest_mask, topology.dest_lane_start,
                 topology.air_hop_limit, topology.revisit_depth, depth,
                 bool(topology.track_first_hop), topology.max_step,
+                bool(topology.turn_below_90), topology.cell_q, topology.cell_r,
                 root_cell, root_step, root_departure, root_lane, root_bound, root_remaining,
                 lane_fold_s, lane_fold_exact, float(destination_fold_lb),
                 float(reference_time_s), float(dt_s), float(ground_weight),

@@ -52,6 +52,7 @@ from ...volumes import (
     terminal_radius,
 )
 from .. import hexgrid as hg
+from ..turn_rule import path_turns_valid, turn_allowed_at
 from ..route_geometry import (
     _fold_leg_s as _fold_leg_s,
     _terminal_fold_leg_s as _terminal_fold_leg_s,
@@ -632,31 +633,39 @@ def _shortest_cell_path(
 
     if start == destination:
         return None  # A column must contain a real lateral hop.
+    turn_rule = fg.turn_below_90
     start_path = (start,)
+
+    def state(path: tuple[Cell, ...]) -> Hashable:
+        """Key a waypoint by its incoming link only when the turn rule limits its future."""
+        return path[-2:] if turn_rule else path[-1]
+
     # (f=g+h, h, path, cell): preferring smaller h on equal f follows one
     # promising geodesic instead of breadth-expanding every equal-f cell.
     frontier: list[tuple[int, int, tuple[Cell, ...], Cell]] = [
         (hg.hex_distance(start, destination), hg.hex_distance(start, destination), start_path, start)
     ]
-    best: dict[Cell, tuple[int, tuple[Cell, ...]]] = {start: (0, start_path)}
+    best: dict[Hashable, tuple[int, tuple[Cell, ...]]] = {state(start_path): (0, start_path)}
     while frontier:
         _check_deadline(deadline)
         _estimate, _remaining, path, cell = heapq.heappop(frontier)
         distance = len(path) - 1
-        if best.get(cell) != (distance, path):
+        if best.get(state(path)) != (distance, path):
             continue
         if cell == destination:
             return path
         for neighbour in sorted(fg.outgoing_neighbors(cell)):
+            if turn_rule and distance and not turn_allowed_at(path[-2], cell, neighbour):
+                continue
             next_distance = distance + 1
             next_path = (*path, neighbour)
-            previous = best.get(neighbour)
+            previous = best.get(state(next_path))
             if previous is not None and (
                 previous[0] < next_distance
                 or (previous[0] == next_distance and previous[1] <= next_path)
             ):
                 continue
-            best[neighbour] = next_distance, next_path
+            best[state(next_path)] = next_distance, next_path
             remaining = hg.hex_distance(neighbour, destination)
             heapq.heappush(
                 frontier,
@@ -1423,6 +1432,8 @@ def _goal_directed_bootstrap_python(
             for neighbor in fg.outgoing_neighbors(path[-1]):
                 if revisit_depth and neighbor in path[-revisit_depth:]:
                     continue
+                if fg.turn_below_90 and hops and not turn_allowed_at(path[-2], path[-1], neighbor):
+                    continue
                 distance = remaining(neighbor)
                 next_step = step + 1
                 if hops + 1 + distance > fg.max_air_hops or next_step + distance > fg.max_step:
@@ -1732,6 +1743,9 @@ def _canonical_route_metrics(
     request = fg.request
     path = label.path
     if len(path) < 2:
+        return _DEFER
+    # The reference validator rejects these; never certify them on the fast path.
+    if fg.turn_below_90 and not path_turns_valid(path):
         return _DEFER
     origin_terminal = as_terminal(request.origin_terminal)
     dest_terminal = as_terminal(request.dest_terminal)
@@ -2955,6 +2969,9 @@ def _best_column(
             for neighbour in fg.outgoing_neighbors(cell):
                 if neighbour in recent[:revisit_depth]:
                     continue
+                # ``recent[1]`` (the predecessor) is part of this label's dominance key.
+                if fg.turn_below_90 and hops and not turn_allowed_at(recent[1], cell, neighbour):
+                    continue
                 first_arc = hops == 0
                 finish_allowed = (
                     neighbour in destination_options
@@ -3596,6 +3613,7 @@ def _best_column_compiled(
         n_labels=int(result.n_labels),
         attempts=int(result.attempts),
         label_budget=int(result.budget[0]),
+        turn_rejected=int(result.turn_rejected),
         status=kernel.STATUS_NAMES.get(result.status, str(result.status)),
     )
 
@@ -4190,6 +4208,8 @@ def find_feasible_column(
             continue
         for neighbour in fg.outgoing_neighbors(cell):
             if neighbour in recent[:revisit_depth]:
+                continue
+            if fg.turn_below_90 and hops and not turn_allowed_at(recent[1], cell, neighbour):
                 continue
             next_step = step + 1
             remaining = remaining_distance(neighbour)

@@ -150,6 +150,9 @@ def solve_zeta(
         raise ValueError("flight ids must be unique")
     if not params.seed_nominal_routes and not any((seed_columns or {}).values()):
         raise ValueError("seed_nominal_routes=False requires supplied columns")
+    # Graphs copy the parameter flag; one solve must not mix two route domains.
+    if params.turn_below_90 != options.turn_below_90:
+        raise ValueError("ColGenParams.turn_below_90 and ZetaOptions.turn_below_90 must agree")
     deadline = started + params.time_limit_s
     reserve = params.ip_reserve_s
     if reserve is None:
@@ -515,6 +518,7 @@ def solve_zeta(
         "merge_equivalent_histories": options.merge_equivalent_histories,
         "merge_shorter_histories": options.merge_shorter_histories,
         "forward_cruise": options.forward_cruise,
+        "turn_below_90": options.turn_below_90,
         "pricing_traversal": options.traversal,
         "native_state_index": options.native_state_index,
         "lattice_distance_bound": options.lattice_distance_bound,
@@ -524,6 +528,7 @@ def solve_zeta(
         "connection_mode": options.connection_mode,
         "certificate_scope": (
             ("forward-only cruise; " if options.forward_cruise else "") +
+            ("interior cruise turns strictly below 90 degrees; " if options.turn_below_90 else "") +
             ("configured connection graph union fixed supplied seed pool"
              if options.seed_validation_radius_m is not None else
              "full configured radius" if options.connection_mode == "full" else

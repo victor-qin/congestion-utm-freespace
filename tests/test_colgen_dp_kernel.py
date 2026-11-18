@@ -15,6 +15,7 @@ import random
 import time
 import types
 from collections import Counter
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -26,6 +27,7 @@ from freespace_sim.planner.colgen.network import RowKey, build_flight_graph
 from freespace_sim.planner.colgen.params import ColGenParams
 from freespace_sim.planner.colgen.objective import DELAY_MODEL, CostModel, cost_model
 from freespace_sim.planner.colgen.pricing import DualView
+from freespace_sim.planner.turn_rule import path_turns_valid
 from freespace_sim.types import FlightRequest, Terminal, vec
 from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
 
@@ -2177,7 +2179,10 @@ def _random_case(rng, index):
 
 
 @pytest.mark.parametrize("bootstrap", [0, 1])
-def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs(bootstrap):
+@pytest.mark.parametrize("turn", [False, True])
+def test_compiled_path_returns_the_same_column_as_the_reference_over_random_graphs(
+    bootstrap, turn,
+):
     """The load-bearing sweep: the same COLUMN, not merely the same reduced cost.
 
     Reduced-cost equality is the weak claim and the one that hides the real failure. Two
@@ -2222,9 +2227,13 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
     # sweep of declined no-ops cannot read as green, and that risk grows as N shrinks.
     cases = int(os.environ.get("KERNEL_FUZZ_CASES", "5"))
     rng = random.Random(20260810)
-    compared = nontrivial = 0
+    compared = nontrivial = rejected = 0
     for index in range(cases):
         cfg, graph, model, view = _random_case(rng, index)
+        if turn:
+            # Same instance in the strict-turn domain; the dominance key already holds the
+            # predecessor, so both searches must still agree column-for-column.
+            graph = replace(graph, turn_below_90=True)
         incumbent = None
         if index % 3 == 0:
             try:
@@ -2253,6 +2262,7 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
         )
         if isinstance(outcome, pricing.Declined):
             continue
+        rejected += pricing.last_search_record().get("turn_rejected", 0)
         rc, column = outcome
         ref_rc, ref_column = pricing._best_column(
             graph, view, 0.0, cfg, 100.0, frozenset(), seed=False,
@@ -2262,6 +2272,8 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
         nontrivial += column is not None
         assert column == ref_column, f"case {index}: different column"
         assert rc == ref_rc, f"case {index}: {rc!r} != {ref_rc!r}"
+        if turn and column is not None:
+            assert path_turns_valid(column.cell_path)
 
     # Held at the original 75% / 50% of the case count, so shrinking the sweep cannot
     # quietly shrink what it proves.
@@ -2273,6 +2285,31 @@ def test_compiled_path_returns_the_same_column_as_the_reference_over_random_grap
     assert nontrivial >= min_nontrivial, (
         f"only {nontrivial} of {cases} cases found a column at all"
     )
+    # The restricted sweep must actually reject arcs, or it proves nothing about the rule.
+    assert (rejected > 0) is turn
+
+
+def test_compiled_turn_test_matches_the_shared_exact_rule():
+    """The numba arc filter and the Python rule agree on every lattice turn, including 90."""
+    from freespace_sim.planner.colgen.dp_kernel import _turn_ok
+    from freespace_sim.planner.turn_rule import turn_allowed_at
+
+    cells = [(q, r) for q in range(-3, 4) for r in range(-3, 4)]
+    cell_q = np.asarray([q for q, _r in cells], dtype=np.int32)
+    cell_r = np.asarray([r for _q, r in cells], dtype=np.int32)
+    centre = cells.index((0, 0))
+    perpendicular = 0
+    for previous, before in enumerate(cells):
+        for following, after in enumerate(cells):
+            if previous == centre or following == centre:
+                continue
+            expected = turn_allowed_at(before, (0, 0), after)
+            for check in (_turn_ok, _turn_ok.py_func):
+                assert check(cell_q, cell_r, previous, centre, following) == expected
+            radius = hg.circumradius(_cfg())
+            a, b, c = (hg.hex_center(*cell, radius) for cell in (before, (0, 0), after))
+            perpendicular += abs(float(np.dot(b - a, c - b))) < 1e-6
+    assert perpendicular > 0
 
 
 # ------------------------------------------------------ the compiled feasible search
@@ -2300,7 +2337,8 @@ def _feasible_both(graph, cfg, model, **kwargs):
 
 
 @pytest.mark.parametrize("shape", sorted(GRAPH_SHAPES))
-def test_compiled_feasible_search_returns_the_reference_column(shape):
+@pytest.mark.parametrize("turn", [False, True])
+def test_compiled_feasible_search_returns_the_reference_column(shape, turn):
     """The greedy's incumbent search, compiled, returns the same column.
 
     A best-first search rather than the priced DP's layered one, so almost none of
@@ -2312,10 +2350,14 @@ def test_compiled_feasible_search_returns_the_reference_column(shape):
 
     cfg = _cfg()
     graph, params = GRAPH_SHAPES[shape](cfg)
+    if turn:
+        graph = replace(graph, turn_below_90=True)
     model = cost_model(cfg, params)
     compiled, reference = _feasible_both(graph, cfg, model)
     assert compiled == reference
     assert compiled is not None, "the fixture has no feasible column, so this proves nothing"
+    if turn:
+        assert path_turns_valid(compiled.cell_path)
 
 
 def test_compiled_feasible_search_honours_the_early_improvement_exit():

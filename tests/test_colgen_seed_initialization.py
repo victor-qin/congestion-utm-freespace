@@ -44,6 +44,15 @@ def test_seed_policy_defaults_and_cli():
         "--colgen-initial-routes", "astar", "--colgen-worker-seeds",
     ])
     assert colgen_params_from_args(args, "colgen").initial_routes == "astar"
+    assert params.turn_below_90 is False
+    turned = colgen_params_from_args(parse_args([
+        "--scenario", "metro_uniform", "--planner", "colgen", "--colgen-turn-below-90",
+    ]), "colgen")
+    assert turned.turn_below_90 is True
+    with pytest.raises(TypeError, match="turn_below_90"):
+        ColGenParams(turn_below_90=1)
+    with pytest.raises(ValueError, match="turn_below_90"):
+        ColGenParams(pricing_device="gpu", pricing_gpu_backend="metal", turn_below_90=True)
 
 
 @pytest.mark.parametrize("value", [1, "false", None])

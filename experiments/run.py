@@ -432,6 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="colgen: break pricing's price ties toward the routes through the least "
                         "master-LP traffic (default on for CPU pricing, off for GPU). "
                         "Answer-affecting; --no-colgen-emptiest-airspace turns it off")
+    p.add_argument("--colgen-turn-below-90", action="store_true", default=None,
+                   help="colgen: opt-in route-domain restriction; every interior cruise cell must "
+                        "turn strictly less than 90 degrees (straight or +-60 on the hex lattice). "
+                        "The first hop and terminal lanes stay free. CPU pricing only")
     p.add_argument("--colgen-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="colgen: seed each flight's column with STEPS retimed copies of itself "
                         "before the first LP (default 20; 0 disables). Pure clock translation, so "
@@ -526,6 +530,7 @@ def _colgen_overrides(args) -> dict:
             ("emptiest_airspace_tiebreak", args.colgen_emptiest_airspace),
             ("worker_seed_routes", args.colgen_worker_seeds),
             ("initial_routes", args.colgen_initial_routes),
+            ("turn_below_90", args.colgen_turn_below_90),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),

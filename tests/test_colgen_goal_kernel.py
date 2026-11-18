@@ -1,11 +1,14 @@
 """Native goal search must reproduce the bounded Python oracle, including its failures."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from freespace_sim.planner.colgen import dp_prepare, pricing
 from freespace_sim.planner.colgen.objective import cost_model
+from freespace_sim.planner.turn_rule import path_turns_valid
 from tests.test_colgen_dp_kernel import GRAPH_SHAPES, _cfg, _random_duals
 from tests._colgen_support import check_canonical  # noqa: F401 -- fixture, used by pytestmark
 
@@ -14,10 +17,12 @@ pytestmark = pytest.mark.usefixtures("check_canonical")
 kernel = pytest.importorskip('freespace_sim.planner.colgen.bootstrap_kernel')
 
 
-def _case(shape, dual_case, *, forbidden=False):
+def _case(shape, dual_case, *, forbidden=False, turn=False):
     """Use existing customer/terminal fixtures with real endpoint windows and role masks."""
     cfg = _cfg(max_ground_delay_s=8.0)
     graph, params = GRAPH_SHAPES[shape](cfg, overrun=2)
+    if turn:
+        graph = replace(graph, turn_below_90=True)
     model = cost_model(cfg, params)
     raw = {} if dual_case == 'ties' else _random_duals(graph, cfg, 606)
     if dual_case == 'tiny':
@@ -74,9 +79,15 @@ def _run(case, *, native, budget, order_count=3, diagnostics=None, deadline=None
     ('ties', 20000, False), ('random', 20000, True), ('tiny', 1, False),
     ('ties', 0, False), ('ties', 4, False),
 ])
-def test_goal_kernel_preserves_certified_column_and_expansion_cap(shape, dual_case, budget, forbidden):
-    """Real certification, forbidden visits, tied queues and budget failure match exactly."""
-    case = _case(shape, dual_case, forbidden=forbidden)
+@pytest.mark.parametrize('turn', [False, True])
+def test_goal_kernel_preserves_certified_column_and_expansion_cap(
+    shape, dual_case, budget, forbidden, turn,
+):
+    """Real certification, forbidden visits, tied queues and budget failure match exactly.
+
+    With the strict turn rule, the native and Python goal searches filter the same arcs.
+    """
+    case = _case(shape, dual_case, forbidden=forbidden, turn=turn)
     expected = _run(case, native=False, budget=budget)
     diagnostics = {}
     actual = _run(case, native=True, budget=budget, diagnostics=diagnostics)
@@ -90,6 +101,8 @@ def test_goal_kernel_preserves_certified_column_and_expansion_cap(shape, dual_ca
     assert diagnostics['sinks_asked'] >= int(actual[0] is not None)
     if budget == 20000 and not forbidden:
         assert actual[0] is not None
+    if turn and actual[0] is not None:
+        assert path_turns_valid(actual[0][1].cell_path)
 
 
 @pytest.mark.parametrize('shape', sorted(GRAPH_SHAPES))

@@ -35,6 +35,8 @@ from .history import PriceHistory
 from .history_guard import HistoryGuard
 from .price_floor import prepare_price_floor, price_floor
 from .timing import edge_end_times
+from ..turn_rule import path_turns_valid
+from .turns import TurnClasses
 
 Cell = tuple[int, int]
 Point = tuple[float, float, float]
@@ -63,6 +65,9 @@ class ZetaOptions:
       the latter requires the compiled backend and forward-only twelve-link graph.
     - native_state_index (bool): intern exact continuation keys in native numeric tables;
       available to every connection mode and traversal using the compiled loop.
+    - turn_below_90 (bool): require every interior cruise waypoint to deflect strictly less
+      than 90 degrees (exact positive axial dot product). The first cruise link, climb,
+      descent and endpoint lanes are unconstrained; labels carry an incoming heading class.
     """
 
     connection_radius_m: float = 480.0
@@ -95,6 +100,7 @@ class ZetaOptions:
     merge_shorter_histories: bool = False
     traversal: str = "best_first"
     native_state_index: bool = False
+    turn_below_90: bool = False
 
     def __post_init__(self) -> None:
         """Reject nonfinite geometry and invalid enabled compute limits."""
@@ -165,6 +171,9 @@ class SearchResult:
     - equivalent_histories_merged (int): guarded equal-price histories represented by another prefix.
     - merge_error_bound (float): whole-route numerical allowance included in lower_bound.
     - shorter_histories_merged (int): subset of guarded merges comparing both lengths.
+    - turn_rejected (int): declared successors skipped by the turn rule before any geometry.
+    - waypoint_states, heading_states (int): distinct waypoints and waypoint/heading pairs
+      among enqueued labels; equal without the turn rule.
     """
 
     route: Route | None
@@ -207,6 +216,9 @@ class SearchResult:
     dp_waypoints: int = 0
     dp_peak_pending: int = 0
     raw_lower_bound: float = -math.inf
+    turn_rejected: int = 0
+    waypoint_states: int = 0
+    heading_states: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +344,9 @@ class ZetaGraph:
                                   if math.fsum(a*b for a, b in zip(
                                       hg.hex_center(q, r, radius), forward,
                                   )) > 1e-8)
+        # Classes are built over the final offsets, so forward filtering can only merge them.
+        self.turns = TurnClasses(self._offsets) if options.turn_below_90 else None
+        self._turn_neighbors: dict[tuple[Cell, int], tuple[Cell, ...]] = {}
 
     def point(self, cell: Cell) -> Point:
         """Return one stable physical waypoint without allocating NumPy arrays."""
@@ -347,6 +362,34 @@ class ZetaGraph:
             self._neighbors[cell] = tuple((q + dq, r + dr) for dq, dr in self._offsets
                                           if (q + dq, r + dr) in self.cells)
         return self._neighbors[cell]
+
+    def heading(self, path: Sequence[Cell], terminal: bool = False) -> int:
+        """Return a prefix's incoming heading class; 0 when no turn constrains its future.
+
+        Parameters
+        ------------
+        - path (Sequence[Cell]): prefix waypoints ending at the current waypoint.
+        - terminal (bool): whether the prefix already used its destination role.
+
+        Return
+        --------
+        - output (int): class 0 without the rule, at a root, or for a sink label.
+        """
+        if self.turns is None or terminal or len(path) < 2:
+            return 0
+        return self.turns.heading(path[-2], path[-1])
+
+    def turn_neighbors(self, cell: Cell, heading: int) -> tuple[Cell, ...]:
+        """Return the declared neighbors that remain legal after one heading class."""
+        if self.turns is None or heading == 0:
+            return self.neighbors(cell)
+        key = cell, heading
+        if key not in self._turn_neighbors:
+            allowed = self.turns.allowed[heading]
+            self._turn_neighbors[key] = tuple(
+                target for target in self.neighbors(cell)
+                if (target[0] - cell[0], target[1] - cell[1]) in allowed)
+        return self._turn_neighbors[key]
 
     def _hits_static_wall(self, volume: Volume4D) -> bool:
         """Use the graph's conservative wall index before the exact conflict predicate."""
@@ -476,6 +519,10 @@ class ZetaGraph:
         if key in self._canonical:
             return self._canonical[key]
         path = column.cell_path
+        # Supplied, seeded and imported routes obey the same restricted domain as search.
+        if self.options.turn_below_90 and not path_turns_valid(path):
+            self._canonical[key] = None
+            return None
         length = 0.0
         for i, (a, b) in enumerate(zip(path, path[1:])):
             parts = self.parts(a, b, i == 0, i + 2 == len(path))
@@ -498,29 +545,46 @@ class ZetaGraph:
         return result
 
     def _shortest_path(self, start: Cell, goal: Cell, deadline: float | None) -> tuple[Cell, ...] | None:
-        """Find a static shortest seed; failure never certifies dynamic infeasibility."""
+        """Find a static shortest seed; failure never certifies dynamic infeasibility.
+
+        With the turn rule, a free shortest path that already obeys it is also a shortest
+        restricted path, so both domains keep the same seed; the heading-aware search, which
+        visits many more states and edge geometries, runs only when that path turns 90 degrees
+        or more.
+        """
+        path = self._static_shortest(start, goal, deadline, headings=False)
+        if self.turns is None or path is None or path_turns_valid(path):
+            return path
+        return self._static_shortest(start, goal, deadline, headings=True)
+
+    def _static_shortest(
+        self, start: Cell, goal: Cell, deadline: float | None, *, headings: bool,
+    ) -> tuple[Cell, ...] | None:
+        """Run the static A* over waypoints, or over waypoint/heading states when requested."""
         serial = itertools.count()
         heap = [(math.dist(self.point(start), self.point(goal)), next(serial), 0.0, (start,))]
-        best = {start: 0.0}
+        best = {(start, 0): 0.0}
         while heap:
             if deadline is not None and time.perf_counter() >= deadline:
                 return None
             _, _, length, path = heapq.heappop(heap)
             node = path[-1]
-            if length > best.get(node, math.inf) + 1e-8:
+            heading = self.heading(path) if headings else 0
+            if length > best.get((node, heading), math.inf) + 1e-8:
                 continue
             if node == goal and len(path) > 1:
                 return path
-            for target in self.neighbors(node):
+            for target in (self.turn_neighbors(node, heading) if headings else self.neighbors(node)):
                 lower = length + math.dist(self.point(node), self.point(target))
                 remaining = math.dist(self.point(target), self.point(goal))
-                if lower + remaining > self.max_length + 1e-7 or lower >= best.get(target, math.inf) - 1e-8:
+                state = target, (self.heading((node, target)) if headings else 0)
+                if lower + remaining > self.max_length + 1e-7 or lower >= best.get(state, math.inf) - 1e-8:
                     continue
                 parts = self.parts(node, target, len(path) == 1, target == goal)
                 if parts is None:
                     continue
                 new_length = length + sum(p.length for p in parts)
-                best[target] = new_length
+                best[state] = new_length
                 heapq.heappush(heap, (new_length + remaining, next(serial), new_length, path + (target,)))
         return None
 
@@ -686,6 +750,9 @@ def _search(
     serial = itertools.count()
     heap: list[tuple[float, int, _Label | _Scan]] = []
     seen_states: set[tuple[object, ...]] = set()
+    turn_rejected = 0
+    waypoint_states: set[Cell] = set()
+    heading_states: set[tuple[Cell, int]] = set()
     history = (PriceHistory(prices, group_skips=graph.options.history_group_skips,
                             merge_equivalent=graph.options.merge_equivalent_histories,
                             merge_shorter=graph.options.merge_shorter_histories)
@@ -729,7 +796,9 @@ def _search(
                                  equivalent_histories_merged=0 if history is None else history.merged,
                                  merge_error_bound=uncertainty,
                                  lattice_bound_calls=int(lattice_bound is not None),
-                                 shorter_histories_merged=0 if history is None else history.shorter_merged, raw_lower_bound=min(best, floor))
+                                 shorter_histories_merged=0 if history is None else history.shorter_merged, raw_lower_bound=min(best, floor),
+                                 turn_rejected=turn_rejected, waypoint_states=len(waypoint_states),
+                                 heading_states=len(heading_states))
 
     def accept(column: Route, *, known: bool = False) -> None:
         """Validate supplied or discovered incumbents before using their cutoff."""
@@ -788,9 +857,13 @@ def _search(
                 return
             # A child's completions are a subset of its parent's, including deferred scans.
             label = replace(label, priced_floor=floor)
+        heading = graph.heading(label.path, label.terminal)
         if label.fold_m is not None or graph.reference <= 1e-9:
             # Both reduction orders must match the canonical cost and length-budget checks.
-            key = (label.path[-1], label.departure, label.origin_lane, label.dest_lane,
+            # Only labels with identical legal continuations may compare: the heading
+            # class joins the waypoint, and is 0 (absent) without the turn rule.
+            key = ((label.path[-1], heading) if graph.turns is not None else label.path[-1],
+                   label.departure, label.origin_lane, label.dest_lane,
                    label.stamp, label.length, label.canonical_length, label.terminal,
                    len(label.path) == 1, label.segment_lengths)
             if graph.options.history_dominance:
@@ -814,6 +887,8 @@ def _search(
         label = replace(label, history_id=generated)
         heapq.heappush(heap, (floor, next(serial), label))
         generated += 1
+        waypoint_states.add(label.path[-1])
+        heading_states.add((label.path[-1], heading))
 
     def extend(label: _Label, target: Cell) -> None:
         """Build one candidate connection, preserving both destination endpoint roles."""
@@ -970,9 +1045,12 @@ def _search(
                     raise AssertionError("incremental and canonical reservation prices disagree")
                 accept(canonical)
             continue
+        declared = graph.neighbors(node)
+        legal = graph.turn_neighbors(node, graph.heading(label.path))
+        turn_rejected += len(declared) - len(legal)
         if graph.options.lazy_successors:
             targets = []
-            for target in graph.neighbors(node):
+            for target in legal:
                 length = label.length + math.dist(graph.point(node), graph.point(target))
                 remaining = (math.dist(graph.point(target), graph.point(label.goal))
                              if lattice_bound is None else lattice_bound.remaining(target, label.goal))
@@ -986,6 +1064,6 @@ def _search(
                 heapq.heappush(heap, (targets[0][0], next(serial), _Scan(label, tuple(targets))))
             continue
         # Complete each expansion before honoring a cap: every remaining child stays in the heap.
-        for target in graph.neighbors(node):
+        for target in legal:
             extend(label, target)
     return finish(True, "optimal" if incumbent else "infeasible", best)

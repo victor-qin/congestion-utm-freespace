@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import operator
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 
 # Planners whose schedule colgen can translate into a warm start. A module constant so
@@ -271,6 +271,27 @@ class ColGenParams:
     # A* is serial, forbids airborne holds, and uses nominal fallback for missing imports.
     initial_routes: str = "nominal"
 
+    # Opt-in route-domain restriction: every interior cruise waypoint must deflect strictly
+    # less than 90 degrees (exact positive axial dot product; on the six-neighbour lattice,
+    # straight or +-60 degrees). The first cruise hop, climb/descent and terminal lanes stay
+    # free. CPU DP only; it changes the priced route set, so certificates cover this domain.
+    turn_below_90: bool = False
+
+    def __setstate__(self, state: list[object]) -> None:
+        """Restore positional slot state; fields appended after archiving take defaults.
+
+        Slotted dataclasses pickle values by position, so a parameter object archived
+        before an appended field (for example ``turn_below_90``) would otherwise leave
+        that slot unset rather than at its backward-compatible default.
+        """
+        names = fields(self)
+        if len(state) > len(names):
+            raise ValueError("ColGenParams pickle state has more values than fields")
+        for item, value in zip(names, state):
+            object.__setattr__(self, item.name, value)
+        for item in names[len(state):]:
+            object.__setattr__(self, item.name, item.default)
+
     @property
     def effective_emptiest_airspace_tiebreak(self) -> bool:
         """Whether pricing nudges prices toward empty airspace; None follows the device."""
@@ -383,6 +404,8 @@ class ColGenParams:
                 raise ValueError("GPU pricing currently requires columns_per_flight=1")
             if self.cheap_pricing:
                 raise ValueError("GPU pricing does not support cheap_pricing")
+            if self.turn_below_90:
+                raise ValueError("GPU pricing does not support turn_below_90")
         if isinstance(self.max_air_overrun_hops, bool):
             raise TypeError("max_air_overrun_hops must be an integer")
         try:
@@ -408,7 +431,8 @@ class ColGenParams:
 
         for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
                      "seed_nominal_routes", "pricing_work_stealing", "min_price_duals",
-                     "min_norm_duals", "worker_seed_routes"):
+                     "min_norm_duals", "worker_seed_routes",
+                     "turn_below_90"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if self.emptiest_airspace_tiebreak is not None and not isinstance(

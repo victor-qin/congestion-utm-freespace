@@ -20,6 +20,7 @@ from freespace_sim.planner.colgen.zeta import ZetaGraph, ZetaOptions, ZetaPricin
 from freespace_sim.planner.zeta.geometry import anyangle_to_intent, reservation_claims
 from freespace_sim.planner.zeta.history import PriceHistory
 from freespace_sim.planner.zeta.history_guard import HistoryGuard
+from freespace_sim.planner.turn_rule import axial_dot, path_turns_valid
 from freespace_sim.types import FlightRequest, Terminal, vec
 from freespace_sim.volumes import enroute_flown_m, exit_radius
 
@@ -110,6 +111,14 @@ def _exhaustive_anyangle_columns(
             offset = target[0] - path[-1][0], target[1] - path[-1][1]
             if options.connection_mode != "full" and offset not in restricted:
                 continue
+            if options.turn_below_90 and len(path) > 1:
+                # Independent physical check: a relative tolerance far above round-off
+                # rejects exactly perpendicular continuations without trusting axial_dot.
+                incoming = np.subtract(points[path[-1]], points[path[-2]])[:2]
+                outgoing = np.subtract(points[target], points[path[-1]])[:2]
+                if float(np.dot(incoming, outgoing)) <= 1e-9 * float(
+                        np.linalg.norm(incoming) * np.linalg.norm(outgoing)):
+                    continue
             distance = math.dist(points[path[-1]], points[target])
             remaining = math.dist(points[target], points[goal])
             if 0 < distance <= radius + 1e-8 and length + distance + remaining <= limit + 1e-7:
@@ -368,6 +377,13 @@ def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
     ("reference-hex12-lattice", True, False, False, ()),
     ("compiled-radius240-lattice", True, True, False, ()),
     ("compiled-strong-native-history-hex12-forward-lattice", True, True, True, ()),
+    ("reference-turn", False, False, False, ()),
+    ("compiled-turn", True, False, False, ()),
+    ("compiled-strong-native-history-turn", True, True, True, ()),
+    ("reference-hex12-turn", True, True, False, ()),
+    ("compiled-radius240-lattice-turn", True, True, False, ()),
+    ("compiled-strong-native-history-hex12-forward-lattice-turn", True, True, True, ()),
+    ("compiled-turn", True, True, False, ("arrival", "resource", "selected", "crossing")),
 ], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy",
         "reference-pruned-snapped", "compiled-pruned-snapped",
         "compiled-loop-eager", "compiled-loop-pruned-snapped", "arrival-bound",
@@ -377,11 +393,20 @@ def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
         "native-strong-history", "compiled-history-helper", "hex12-reference",
         "hex12-long-native-history", "forward-hex12-reference", "forward-hex12-compact",
         "forward-hex12-long-native-history", "lattice-hex12-reference",
-        "lattice-radius240-compact", "lattice-forward-hex12-native"])
+        "lattice-radius240-compact", "lattice-forward-hex12-native", "turn-reference-eager",
+        "turn-compact-lazy", "turn-native-strong-history", "turn-hex12-reference",
+        "turn-lattice-radius240-compact", "turn-lattice-forward-hex12-native",
+        "turn-all-bounds-compact"])
 def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
     objective, forbid, merge, terminal, backend, lazy, prune_snap, compiled_loop, completion_bounds,
 ):
-    """Finite-domain certification must match full physical union pricing, including credits."""
+    """Finite-domain certification must match full physical union pricing, including credits.
+
+    Turn variants compare against an independent exhaustive walk over the restricted domain:
+    every interior cruise waypoint deflects strictly below 90 degrees.
+    """
+    turn = backend.endswith("-turn")
+    backend = backend.removesuffix("-turn")
     lattice_distance_bound = backend.endswith("-lattice")
     backend = backend.removesuffix("-lattice")
     radius = 240.0 if backend.endswith("-radius240") else 480.0
@@ -428,9 +453,20 @@ def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
                           completion_bounds=completion_bounds,
                           leg_cache=shared, persistent_timing_cache=shared,
                           connection_mode=connection_mode, forward_cruise=forward_cruise,
-                          lattice_distance_bound=lattice_distance_bound)
+                          lattice_distance_bound=lattice_distance_bound, turn_below_90=turn)
     graph = ZetaGraph(fg, cfg, row_index, options)
     columns = _exhaustive_anyangle_columns(fg, cfg, params, row_index, radius, options)
+    if turn:
+        free = _exhaustive_anyangle_columns(fg, cfg, params, row_index, radius,
+                                            replace(options, turn_below_90=False))
+        # The rule must bind here, including at least one exactly perpendicular turn.
+        assert set(columns) < set(free)
+        assert all(path_turns_valid(c.cell_path) for c in columns)
+        assert any(axial_dot((b[0] - a[0], b[1] - a[1]), (c[0] - b[0], c[1] - b[1])) == 0
+                   for column in free
+                   for a, b, c in zip(column.cell_path, column.cell_path[1:], column.cell_path[2:]))
+        assert all(graph.canonical_column(c, cost_model(cfg, params)) is None
+                   for c in set(free) - set(columns))
     rows = sorted({r for c in columns for r in c.claims})
     rng = np.random.default_rng(54)
     prices = {r: float(rng.choice([-0.25, 0.0, 0.5, 3.0, 8.0])) for r in rows}
@@ -495,7 +531,10 @@ def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
                 direct.route.physical_cost + math.fsum(current.get(row, 0.0)
                                                        for row in direct.route.claims))
     assert len(columns) > 3
-    assert any(hg.hex_distance(a, b) > 1 for c in columns
+    # With the turn rule, a twelve-link customer domain can legitimately lose every long
+    # link (each diagonal detour to (2, 0) needs a 90-degree turn); the declared universe
+    # must still contain them.
+    assert any(hg.hex_distance(a, b) > 1 for c in (free if turn else columns)
                for a, b in zip(c.cell_path, c.cell_path[1:]))
     if (forward_cruise or lattice_distance_bound) and terminal == "customer" and merge and not forbid:
         changed_prices = {row: -price for row, price in prices.items()}
@@ -1803,10 +1842,75 @@ def test_anyangle_route_coverage_cache_reprices_complete_unions(
             assert view.price(claims) == expected_extreme
 
 
+@pytest.mark.parametrize("backend", ["reference", "compact", "native-indexed", "forward12-native"])
+@pytest.mark.parametrize("domain", ["adjacent", "hex12"])
+@pytest.mark.parametrize("history", [False, True])
+def test_turn_rule_keeps_heading_distinct_arrivals_under_sparse_prices(backend, domain, history):
+    """Equal prefixes arriving from different headings must not merge or dominate.
+
+    Mostly zero prices make such prefixes tie on time, lengths and paid rows, as in real
+    pricing. Their legal continuations differ, so merging them by waypoint alone loses the
+    restricted optimum (dropping the heading from the keys fails here); the search must
+    still match an independent exhaustive walk with signed prices and both endpoint roles.
+    """
+    if backend != "reference":
+        pytest.importorskip("numba")
+    native = backend.endswith("native") or backend == "native-indexed"
+    if native:
+        pytest.importorskip("Cython")
+    if backend == "forward12-native" and domain != "hex12":
+        pytest.skip("forward DP is defined on the twelve-link graph")
+    cfg = _cfg(max_ground_delay_s=4.0, max_detour_factor=3.0)
+    dest, radius, mode = ((3, 0), 120.0, "full") if domain == "adjacent" else ((3, -1), 480.0, "hex12")
+    fg, params = _graph(cfg, dest=dest, overrun=2)
+    rows = network_mod.RowIndex()
+    strong = history and native
+    options = ZetaOptions(
+        connection_radius_m=radius, connection_mode=mode, backend="reference" if backend == "reference"
+        else "compiled", compiled_loop=native, compiled_history=strong,
+        native_state_index=backend in {"native-indexed", "forward12-native"},
+        expire_history=history or backend == "forward12-native",
+        history_dominance=history or backend == "forward12-native",
+        strong_history_dominance=strong or backend == "forward12-native",
+        merge_equivalent_histories=strong or backend == "forward12-native",
+        merge_shorter_histories=strong or backend == "forward12-native",
+        forward_cruise=backend == "forward12-native",
+        traversal="forward_dp" if backend == "forward12-native" else "best_first",
+        lazy_successors=backend == "compact", max_expansions=None, max_labels=None,
+        turn_below_90=True,
+    )
+    columns = _exhaustive_anyangle_columns(fg, cfg, params, rows, radius, options)
+    claims = sorted({row for column in columns for row in column.claims})
+    graph = ZetaGraph(fg, cfg, rows, options)
+    split = False
+    for seed in range(24):
+        rng = np.random.default_rng(seed)
+        prices = {row: float(rng.choice([-3.0, -1.0, 2.0, 6.0, 100.0]))
+                  for row in claims if rng.random() < 0.08}
+        expected = max(params.M - c.delay_s - math.fsum(prices.get(r, 0.0) for r in c.claims)
+                       for c in columns)
+        result = price_zeta(graph, prices, 0.0, params)
+        # Guarded equivalent-history merges keep their explicit numerical allowance.
+        assert result.complete or (result.reason == "merge_uncertainty"
+                                   and 0.0 < result.merge_error_bound < 1e-8)
+        assert result.column in columns
+        assert result.reduced_cost == pytest.approx(expected, abs=1e-6), seed
+        assert expected - 1e-6 <= result.upper_bound <= expected + 1e-5
+        split |= result.heading_states > result.waypoint_states
+    assert split
+
+
 @pytest.mark.parametrize("native", [False, True, "indexed"])
 @pytest.mark.parametrize("snap", [0.0, 1.0])
-def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(native, snap, monkeypatch):
-    """A waypoint sweep retains asynchronous histories, signed unions and all pending bounds."""
+@pytest.mark.parametrize("turn", [False, True])
+def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(
+    native, snap, turn, monkeypatch,
+):
+    """A waypoint sweep retains asynchronous histories, signed unions and all pending bounds.
+
+    With the turn rule, labels also carry incoming headings; certificates, caps, deadlines
+    and early returns refer to the restricted domain's exhaustive optimum.
+    """
     pytest.importorskip("numba")
     if native:
         pytest.importorskip("Cython")
@@ -1820,10 +1924,14 @@ def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(nativ
         compiled_history=bool(native), native_state_index=native == "indexed",
         merge_equivalent_histories=True, merge_shorter_histories=True,
         lattice_distance_bound=True, max_expansions=None, max_labels=None,
-        leg_cache=True, persistent_timing_cache=True,
+        leg_cache=True, persistent_timing_cache=True, turn_below_90=turn,
     )
     columns = _exhaustive_anyangle_columns(fg, cfg, params, rows, 480.0, options)
     assert len(columns) > 2
+    if turn:
+        free = _exhaustive_anyangle_columns(fg, cfg, params, rows, 480.0,
+                                            replace(options, turn_below_90=False))
+        assert set(columns) < set(free)
     all_rows = sorted({row for column in columns for row in column.claims})
     prices = {row: (-2.0 if i % 3 else 8.0) for i, row in enumerate(all_rows)}
     graph = ZetaGraph(fg, cfg, rows, options)

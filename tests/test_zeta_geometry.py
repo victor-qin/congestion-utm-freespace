@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+import pickle
+from dataclasses import fields, replace
 
 import numpy as np
 import pytest
@@ -318,6 +319,119 @@ def test_anyangle_arrival_grid_reconstructs_each_candidate_leg(
     canonical = graph.canonical_column(column, cost_model(cfg, params))
     assert canonical is not None
     assert canonical.claims == reservation_claims(intent.volumes, cfg, row_index=graph.row_index)
+
+
+@pytest.mark.parametrize("connection_mode,radius,classes", [
+    ("hex12", 480.0, 12), ("full", 240.0, 12), ("full", 480.0, None),
+])
+@pytest.mark.parametrize("forward_cruise", [False, True])
+def test_strict_turn_rule_controls_successors_seeds_and_column_admission(
+    connection_mode, radius, classes, forward_cruise,
+):
+    """Interior cruise turns must be strictly below 90 degrees; 90 exactly is rejected.
+
+    Heading classes group incoming links only when their legal next links are identical,
+    successor lists follow the incoming heading, and supplied, nominal and canonical routes
+    obey the same restricted domain as search. Forward progress remains an independent rule.
+    """
+    from freespace_sim.planner.colgen.objective import cost_model
+    from freespace_sim.planner.colgen.zeta import ZetaGraph, ZetaOptions
+    from freespace_sim.planner.colgen.zeta_pool import build_seed_columns
+    from freespace_sim.planner.turn_rule import axial_dot, path_turns_valid, turn_allowed
+
+    cfg = replace(_cfg(), dt_s=4.0, nominal_speed_mps=30.0, max_detour_factor=4.0)
+    params = ColGenParams(max_air_overrun_hops=4)
+    request = FlightRequest(807, _ground_point((0, 0), cfg), _ground_point((4, 0), cfg), 0.0)
+    fg = build_flight_graph(request, cfg, [], params)
+    fg = replace(fg, corridor_cells=frozenset((q, r) for q in range(-6, 7) for r in range(-6, 7)))
+    options = ZetaOptions(connection_radius_m=radius, connection_mode=connection_mode,
+                          forward_cruise=forward_cruise, turn_below_90=True)
+    graph = ZetaGraph(fg, cfg, RowIndex(), options)
+    free = ZetaGraph(fg, cfg, RowIndex(), replace(options, turn_below_90=False))
+    assert free.turns is None and free.heading(((0, 0), (1, 0))) == 0
+    offsets = graph._offsets
+    assert offsets == free._offsets
+    centre = {offset: np.asarray(graph.point(offset)[:2]) - graph.point((0, 0))[:2]
+              for offset in offsets}
+    perpendicular = 0
+    for incoming in offsets:
+        for outgoing in offsets:
+            physical = float(np.dot(centre[incoming], centre[outgoing]))
+            scale = float(np.linalg.norm(centre[incoming]) * np.linalg.norm(centre[outgoing]))
+            assert turn_allowed(incoming, outgoing) is (physical > 1e-9 * scale)
+            if abs(physical) <= 1e-9 * scale:
+                perpendicular += 1
+                assert axial_dot(incoming, outgoing) == 0
+    # Exactly perpendicular pairs exist in every searched lattice and are all rejected.
+    assert perpendicular > 0 or forward_cruise
+    assert all(turn_allowed(offset, offset) for offset in offsets)
+    assert not any(turn_allowed(offset, (-offset[0], -offset[1])) for offset in offsets)
+    turns = graph.turns
+    if classes is not None and not forward_cruise:
+        assert turns.count - 1 == classes
+    for offset, heading in turns.classes.items():
+        legal = {o for o in offsets if turn_allowed(offset, o)}
+        assert turns.allowed[heading] == legal
+        assert set(graph.turn_neighbors((0, 0), heading)) == {
+            target for target in graph.neighbors((0, 0)) if (target[0], target[1]) in legal}
+        assert graph.heading(((0, 0), offset)) == heading
+        assert graph.heading(((0, 0), offset), terminal=True) == 0
+        # Collinear links of different lengths share one class when futures are identical.
+        assert all(turns.classes[o] == heading for o in offsets
+                   if o[0] * offset[1] == o[1] * offset[0] and axial_dot(o, offset) > 0)
+    assert graph.turn_neighbors((0, 0), 0) == graph.neighbors((0, 0))
+    model = cost_model(cfg, params)
+    straight = Column(request.flight_id, 0, 0, None, None,
+                      ((0, 0), (1, 0), (2, 0), (3, 0), (4, 0)), 0.0)
+    sixty = replace(straight, cell_path=((0, 0), (1, 0), (2, -1), (3, -1), (4, -1), (4, 0)))
+    right = replace(straight, cell_path=((0, 0), (2, -1), (2, 0), (3, 0), (4, 0)))
+    assert axial_dot((2, -1), (0, 1)) == 0
+    assert graph.canonical_column(right, model) is None
+    assert free.canonical_column(right, model) is not None
+    assert graph.canonical_column(straight, model) is not None
+    assert graph.canonical_column(sixty, model) is not None
+    seeds = build_seed_columns(
+        ZetaGraph(fg, cfg, RowIndex(), replace(options, seed_validation_radius_m=480.0)),
+        replace(params, seed_nominal_routes=True), (right, sixty),
+    )
+    assert seeds.complete
+    supplied = {column.cell_path for column in seeds.columns[:1]}
+    assert supplied == {sixty.cell_path}
+    assert right.cell_path not in {column.cell_path for column in seeds.columns}
+    assert all(path_turns_valid(column.cell_path) for column in seeds.columns)
+    assert all(path_turns_valid(column.cell_path) for column in graph.seed_columns(params))
+    # A legal free shortest seed is kept, so both domains start from the same seed.
+    free_seeds = free.seed_columns(params)
+    if all(path_turns_valid(column.cell_path) for column in free_seeds):
+        assert graph.seed_columns(params) == free_seeds
+    # An illegal free shortest path falls back to the exact heading-aware search.
+    calls = []
+    static = graph._static_shortest
+
+    def illegal_first(start, goal, deadline, *, headings):
+        calls.append(headings)
+        return static(start, goal, deadline, headings=True) if headings else right.cell_path
+
+    graph._static_shortest = illegal_first
+    fallback = graph._shortest_path((0, 0), (4, 0), None)
+    assert calls == [False, True] and fallback != right.cell_path
+    assert fallback is not None and path_turns_valid(fallback)
+    del graph._static_shortest
+    # Production DP types still load positional slot pickles written before the flag
+    # existed, as the free domain; Zeta types read only captures made by current code.
+    restricted = replace(fg, turn_below_90=True)
+    assert pickle.loads(pickle.dumps(restricted)) == restricted
+    names = [item.name for item in fields(fg)]
+    legacy = [value for name, value in zip(names, fg.__getstate__()) if name != "turn_below_90"]
+    restored = object.__new__(type(fg))
+    restored.__setstate__(legacy)
+    assert restored == fg and restored.turn_below_90 is False
+    assert type(restored._search_cache) is type(fg._search_cache)
+    value = replace(params, turn_below_90=True)
+    assert pickle.loads(pickle.dumps(value)) == value
+    older = object.__new__(type(value))
+    older.__setstate__(value.__getstate__()[:-1])
+    assert older == replace(value, turn_below_90=False)
 
 
 @pytest.mark.parametrize("connection_mode,radius,count", [

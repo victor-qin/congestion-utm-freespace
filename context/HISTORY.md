@@ -12,6 +12,20 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   `freespace_sim/planner/zeta/{planner,native}.py`, `freespace_sim/planner/colgen/solver.py`,
   `tests/test_zeta_planner.py`, `tests/test_colgen_iteration_ip.py`.
 
+- 2026-11-18T22:30Z [CODE/TOOL] Frozen `slots=True` dataclasses pickle field values by
+  position. Appending a field to `FlightGraph` or `ColGenParams` silently shifted or left unset
+  values in archived captures (an old `capture-fixed.pkl` FlightGraph put its search cache into
+  the new field). Append new fields last and keep their `__setstate__` default adapters. Zeta
+  types are exempt: they read only captures made by current code (`context/zeta.md`). Files:
+  `freespace_sim/planner/route_domain.py`, `freespace_sim/planner/colgen/params.py`.
+
+- 2026-11-18T22:30Z [TOOL] Exhaustive Zeta tests with dense random prices never exercise
+  dominance ties: a mutation dropping the turn heading from every history key passed all
+  of them. Realistic sparse or zero prices tie equal-length prefixes on time, lengths and paid
+  rows, and the mutation then lost the restricted optimum in 50/2,400 cases. State-key changes
+  need a sparse-price test (`test_turn_rule_keeps_heading_distinct_arrivals_under_sparse_prices`).
+  Files: `freespace_sim/planner/zeta/{search,compact}.py`, `tests/test_zeta_search.py`.
+
 - 2026-11-18T02:10Z [CODE/TOOL] Zeta's variable-duration links cannot reuse production DP's
   hop-derived clock/length or fixed recent-hop history. Preserve exact arrival times, both length
   accumulations, endpoint/context roles and the union of buffered reservation rows. Native group

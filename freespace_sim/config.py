@@ -132,6 +132,9 @@ class SimConfig:
     # inside a foreign column (unreachable).
     terminal_airspace_always_active: bool = False
 
+    # Remove same-level airborne waits from A*'s search; ground waiting remains legal.
+    astar_allow_airborne_holds: bool = True
+
     # ----- DERIVED (kept inside SimConfig) -----
     @property
     def corridor_segment_len_m(self) -> float:

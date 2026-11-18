@@ -43,7 +43,8 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Mapping
+import time
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from freespace_sim.planner import hexgrid as hg
 from freespace_sim.planner.colgen.network import column_claims
@@ -51,6 +52,99 @@ from freespace_sim.planner.colgen.translate import Column, column_to_intent
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from freespace_sim.config import SimConfig
+    from freespace_sim.types import FlightRequest, OperationalIntent
+    from .network import FlightGraph
+    from .objective import CostModel
+
+
+def astar_initial_routes(
+    requests: Sequence[FlightRequest],
+    cfg: SimConfig,
+    static_terms: Sequence[Any],
+    graphs: Mapping[int, FlightGraph],
+    model: CostModel,
+    deadline: float,
+    *,
+    stats: dict[str, Any] | None = None,
+) -> tuple[dict[int, Column], dict[str, Any]]:
+    """Run serial no-hold A* and import individually valid bases for the solver to repair.
+
+    Parameters
+    ------------
+    - requests (Sequence[FlightRequest]): original requests; sim preserves FCFS priority.
+    - cfg (SimConfig): physical settings, copied so other planners retain their hold policy.
+    - static_terms (Sequence[Any]): the solver's complete static terminal catalog.
+    - graphs (Mapping[int, FlightGraph]): already-built authoritative DP route domains.
+    - model (CostModel): common ground/air weights for both planning and imported columns.
+    - deadline (float): absolute solver pricing cutoff, including this preparation.
+    - stats (dict[str, Any] | None): optional live diagnostics, retained on timeout.
+
+    Return
+    --------
+    - output (tuple[dict[int, Column], dict[str, Any]]): imported bases and diagnostics.
+      Missing imports need nominal fallback. Bases need joint row-capacity repair before
+      becoming an incumbent. Raises PricingTimeout on cutoff; never certifies pricing.
+    """
+    # Local import avoids sim -> batch -> solver -> warm_start -> sim at module load.
+    from freespace_sim import sim
+    from .pricing import PricingTimeout
+
+    started = time.monotonic()
+    stats = {} if stats is None else stats
+    rejected: Counter[str] = Counter()
+    stats.update(astar_initialization_s=0.0, astar_accepted_routes=0,
+                 astar_imported_routes=0, astar_rejected_routes=rejected,
+                 astar_initialization_complete=False)
+
+    def check() -> None:
+        """Check between atomic flight searches/imports; one flight may overrun the cutoff."""
+        stats["astar_initialization_s"] = time.monotonic() - started
+        if time.monotonic() >= deadline:
+            raise PricingTimeout
+
+    def progress(done: int, total: int, intent: OperationalIntent) -> None:
+        """Stop FCFS between flights without changing its planning or filing semantics."""
+        if intent.accepted:
+            stats["astar_accepted_routes"] += 1
+        else:
+            rejected["not accepted by A*"] += 1
+        check()
+
+    check()
+    seed_cfg = replace(
+        cfg, astar_allow_airborne_holds=False,
+        cost_ground_delay_per_s=model.ground_weight,
+        cost_air_lateral_per_s=model.air_weight,
+        cost_air_hold_per_s=model.air_weight,
+    )
+    result = sim.run(seed_cfg, requests=list(requests), planner_name="astar",
+                     static_terminals=list(static_terms), progress=progress)
+    # The private ledger/services form subscription cycles. Break them before the solver
+    # freezes its heap, which would otherwise retain the entire FCFS workspace during CG.
+    result.ledger.detach_subscribers()
+    check()
+    if not result.verified:
+        raise RuntimeError("A* initialization failed its physical audit")
+    bases: dict[int, Column] = {}
+    for intent in result.intents:
+        check()
+        if not intent.accepted:
+            continue
+        fid = intent.request.flight_id
+        graph = graphs.get(fid)
+        if graph is None:
+            rejected["no DP graph"] += 1
+            continue
+        column, why = _column_at(intent, graph, cfg, model, 0)
+        if column is None:
+            rejected[why or "unconvertible"] += 1
+        else:
+            bases[fid] = column
+            stats["astar_imported_routes"] = len(bases)
+    check()
+    stats["astar_rejected_routes"] = dict(rejected)
+    stats["astar_initialization_complete"] = True
+    return bases, stats
 
 
 def intent_to_column(intent, graph, cfg: "SimConfig", model=None):

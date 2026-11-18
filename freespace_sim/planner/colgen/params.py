@@ -267,6 +267,9 @@ class ColGenParams:
 
     # Opt-in CPU initialization on the persistent pricing owners. Serial/GPU unchanged.
     worker_seed_routes: bool = False
+    # Base routes for initialization only; pricing retains its full original domain.
+    # A* is serial, forbids airborne holds, and uses nominal fallback for missing imports.
+    initial_routes: str = "nominal"
 
     @property
     def effective_emptiest_airspace_tiebreak(self) -> bool:
@@ -292,6 +295,19 @@ class ColGenParams:
         - output (None): coerces fields via ``object.__setattr__``; raises ``TypeError`` on a
           wrong-typed field or ``ValueError`` on an out-of-range one.
         """
+        if not isinstance(self.initial_routes, str):
+            raise TypeError("initial_routes must be a string")
+        if self.initial_routes not in {"nominal", "astar"}:
+            raise ValueError("initial_routes must be 'nominal' or 'astar'")
+        if self.initial_routes == "astar" and (
+            self.warm_start_planner is not None or not self.seed_nominal_routes
+            or self.provided_seed_ladder_steps != 0
+        ):
+            raise ValueError(
+                "initial_routes='astar' supplies its own bases, nominal fallbacks and later "
+                "ladder; cannot combine with warm_start_planner, seed_nominal_routes=False "
+                "or provided_seed_ladder_steps"
+            )
         if self.bootstrap_method not in {"astar", "dp"}:
             raise ValueError("bootstrap_method must be 'astar' or 'dp'")
         for name in ("bootstrap_max_labels", "columns_per_flight"):

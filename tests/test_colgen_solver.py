@@ -2756,8 +2756,9 @@ def test_every_exit_reports_the_same_stats_keys():
 
 
 @pytest.mark.parametrize("collecting", [True, False])
+@pytest.mark.parametrize("initial_routes", ["nominal", "astar"])
 def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
-    collecting, monkeypatch
+    collecting, initial_routes, monkeypatch
 ):
     """The collector is process state that ``solve`` borrows; one process calls it many times.
 
@@ -2782,8 +2783,19 @@ def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
         return build(*args, **kwargs)
 
     monkeypatch.setattr(solver_module, "build_flight_graph", spy_build)
+    from freespace_sim import sim
+    original_run = sim.run
+    source_ledgers = []
+
+    def observe_source(*args, **kwargs):
+        result = original_run(*args, **kwargs)
+        source_ledgers.append(weakref.ref(result.ledger))
+        return result
+
+    monkeypatch.setattr(sim, "run", observe_source)
     cfg = _cfg(max_ground_delay_s=32.0)
     requests = [_request(1, (-4, 0), (4, 0), cfg)]
+    params = _params(initial_routes=initial_routes)
     in_loop: list[tuple[bool, bool, bool]] = []
     was_collecting = gc.isenabled()
     (gc.enable if collecting else gc.disable)()
@@ -2803,20 +2815,22 @@ def test_solve_freezes_its_heap_for_the_loop_and_restores_gc_on_every_exit(
 
     try:
         ColGenSolver().solve(
-            requests, cfg, (), _params(),
+            requests, cfg, (), params,
             on_iteration=lambda _s: in_loop.append(
-                (gc.get_freeze_count() > frozen_on_entry, gc.isenabled(), garbage_alive() is None)
+                (gc.get_freeze_count() > frozen_on_entry, gc.isenabled(),
+                 garbage_alive() is None and all(ref() is None for ref in source_ledgers))
             ),
         )
+        assert len(source_ledgers) == (1 if initial_routes == "astar" else 0)
         assert in_setup == [False]
         assert in_loop and set(in_loop) == {(True, collecting, True)}
         assert restored()
         with pytest.raises(Stop):
-            ColGenSolver().solve(requests, cfg, (), _params(), on_iteration=stop)
+            ColGenSolver().solve(requests, cfg, (), params, on_iteration=stop)
         assert restored()
-        ColGenSolver().solve(requests, cfg, (), _params(time_limit_s=1e-6))
+        ColGenSolver().solve(requests, cfg, (), replace(params, time_limit_s=1e-6))
         assert restored()
-        ColGenSolver().solve([], cfg, (), _params())
+        ColGenSolver().solve([], cfg, (), params)
         assert restored()
     finally:
         (gc.enable if was_collecting else gc.disable)()

@@ -83,6 +83,13 @@ def _pricing_selection_stats(params: ColGenParams) -> dict[str, Any]:
     """
     return {
         "worker_seed_routes": params.worker_seed_routes,
+        "initial_routes": params.initial_routes,
+        "astar_initialization_s": 0.0,
+        "astar_initialization_complete": False,
+        "astar_accepted_routes": 0,
+        "astar_imported_routes": 0,
+        "astar_rejected_routes": {},
+        "astar_nominal_fallback_routes": 0,
         "seed_pool_setup_s": 0.0,
         "pricing_device": params.pricing_device,
         "pricing_gpu_backend": params.pricing_gpu_backend,
@@ -1155,6 +1162,8 @@ class ColGenSolver:
         flight_ids = tuple(request.flight_id for request in ordered_requests)
         if len(set(flight_ids)) != len(flight_ids):
             raise ValueError("colgen requests must have unique flight_id values")
+        if params.initial_routes == "astar" and seed_columns:
+            raise ValueError("initial_routes='astar' cannot combine with seed_columns")
 
         if not ordered_requests:
             return ColGenResult(
@@ -1354,6 +1363,28 @@ class ColGenSolver:
         seedless_flights: set[int] = set(graph_infeasible)
         seeds: dict[int, Column] = {}
         ladder_columns = 0
+        astar_bases: dict[int, Column] = {}
+        astar_stats: dict[str, Any] = {}
+        astar_fallbacks = 0
+        seed_started = time.monotonic()
+        if params.initial_routes == "astar":
+            from .warm_start import astar_initial_routes
+
+            try:
+                astar_bases, astar_stats = astar_initial_routes(
+                    ordered_requests, cfg, static_term_snapshot, graphs, model, pricing_deadline,
+                    stats=astar_stats,
+                )
+            except PricingTimeout:
+                result = _pre_master_timeout_result(
+                    flight_ids, started, params, stage="astar_initialization", graphs=graphs,
+                    catalog=static_catalog, graph_build_elapsed_s=graph_build_elapsed_s,
+                    seed_elapsed_s=time.monotonic() - seed_started, master=master,
+                    time_to_master_s=time_to_master_s,
+                    graph_infeasible_flight_ids=tuple(graph_infeasible),
+                )
+                result.stats.update(astar_stats)
+                return result
         # Keep one pool across initialization and pricing. Register cleanup before startup:
         # seeding, canonical insertion and warm-start validation can all exit early.
         pricing_requests = tuple(r for r in ordered_requests if r.flight_id in graphs)
@@ -1364,10 +1395,10 @@ class ColGenSolver:
         )
         if sweep_pool is not None:
             resources.callback(sweep_pool.close)
-        seed_started = time.monotonic()
         worker_seeds = (
             sweep_pool.seed_routes(tuple(graphs), pricing_deadline)
             if params.worker_seed_routes and params.seed_nominal_routes and sweep_pool is not None
+            and params.initial_routes == "nominal"
             else None
         )
         if worker_seeds is not None and worker_seeds.kernel_counters.get("pool_worker_lost"):
@@ -1376,7 +1407,11 @@ class ColGenSolver:
                         else dict(zip(worker_seeds.flight_ids, worker_seeds.columns)))
         for flight_id in (graphs if params.seed_nominal_routes else ()):
             try:
-                if worker_seeds is not None:
+                if params.initial_routes == "astar" and time.monotonic() >= pricing_deadline:
+                    raise PricingTimeout
+                if flight_id in astar_bases:
+                    seed = astar_bases[flight_id]
+                elif worker_seeds is not None:
                     # Parent insertion has its own cost; a finished worker batch must not
                     # bypass the solve's cutoff while canonicalizing a long seed prefix.
                     if (flight_id == worker_seeds.timeout_flight_id
@@ -1388,11 +1423,13 @@ class ColGenSolver:
                     seed = seed_builder(
                         graphs[flight_id], cfg, deadline=pricing_deadline, model=model
                     )
+                    if seed is not None and params.initial_routes == "astar":
+                        astar_fallbacks += 1
                 if seed is None:
                     seedless_flights.add(flight_id)
                     continue
             except PricingTimeout:
-                return _pre_master_timeout_result(
+                result = _pre_master_timeout_result(
                     flight_ids,
                     started,
                     params,
@@ -1409,6 +1446,9 @@ class ColGenSolver:
                     seedless_flight_ids=tuple(seedless_flights),
                     graph_infeasible_flight_ids=tuple(graph_infeasible),
                 )
+                result.stats.update(astar_stats)
+                result.stats["astar_nominal_fallback_routes"] = astar_fallbacks
+                return result
             except ValueError:
                 # A disconnected/static-blocked graph is a legitimate
                 # optimizer-verdict denial, not a batch-wide solver failure.
@@ -1442,6 +1482,7 @@ class ColGenSolver:
         greedy_elapsed_s = 0.0
         initial_heuristic = dict(shifted_seed_heuristic)
         initial_heuristic_strategy = (
+            "astar_routes" if params.initial_routes == "astar" else
             "shifted_seeds" if params.seed_nominal_routes else "provided_only"
         )
         best_heuristic = dict(initial_heuristic)
@@ -2576,6 +2617,8 @@ class ColGenSolver:
             "preprocessing_stage": "complete",
             "graph_build_elapsed_s": graph_build_elapsed_s,
             "seed_elapsed_s": seed_elapsed_s,
+            **astar_stats,
+            "astar_nominal_fallback_routes": astar_fallbacks,
             "seed_pool_setup_s": 0.0 if worker_seeds is None else worker_seeds.pool_setup_s,
             "time_to_master_s": time_to_master_s,
             "corridor_domains_materialized": corridor_domains_materialized,

@@ -1604,6 +1604,816 @@ def fig_cpu_preparation_builders() -> None:
     _save(fig, "cpu_builder_solver")
 
 
+
+def fig_zeta_connectivity_comparison(forward: bool = False) -> None:
+    """Draw the four declared axial connection sets before any flight-specific filtering.
+
+    Parameters
+    ------------
+    - forward (bool): show positive progress along an example 17-degree OD direction.
+
+    Return
+    --------
+    - output (None): writes the original or separately named forward connection PNG.
+    """
+    pitch = 120.0
+    radius = pitch / SQRT3
+    fig, axes = plt.subplots(2, 2, figsize=(9.2, 8.8), constrained_layout=True)
+    variants = [("Full 480 m", None, 480.0), ("240 m radius", None, 240.0),
+                ("12 hex links", {1, 3}, 480.0), ("12 + 12 long links", {1, 3, 7}, 480.0)]
+    for ax, (label, norms, limit) in zip(axes.flat, variants, strict=True):
+        count = 0
+        for q in range(-5, 6):
+            for r in range(-5, 6):
+                x, y = _axial_to_xy(q, r, radius)
+                distance = np.hypot(x, y)
+                if distance > 505:
+                    continue
+                ax.add_patch(RegularPolygon((x, y), 6, radius=radius, orientation=0,
+                                             facecolor="white", edgecolor=HEXGRID, linewidth=.5))
+                norm = q*q + q*r + r*r
+                allowed = norm > 0 and distance <= limit + 1e-8 and (norms is None or norm in norms)
+                if forward:
+                    angle = np.deg2rad(17.0)
+                    allowed = allowed and x*np.cos(angle) + y*np.sin(angle) > 1e-8
+                if allowed:
+                    color = ORANGE if norms is not None and norm == 7 else BLUE
+                    ax.plot([0, x], [0, y], color=color, alpha=.65, lw=1)
+                    ax.scatter(x, y, color=color, s=20, zorder=4)
+                    count += 1
+        ax.add_patch(Circle((0, 0), limit, fill=False, color=INK, ls="--", lw=1))
+        ax.scatter(0, 0, c=INK, s=36, zorder=5)
+        if forward:
+            ax.annotate("toward destination", (480*np.cos(angle), 480*np.sin(angle)),
+                        (200, -430), arrowprops={"arrowstyle": "->", "color": INK},
+                        fontsize=8, color=INK)
+        ax.set_title(f"{label} · {count} destinations", fontsize=12)
+        ax.set_aspect("equal")
+        ax.set(xlim=(-540, 540), ylim=(-540, 540), xlabel="x (m)", ylabel="y (m)")
+        ax.set_xticks([-480, 0, 480])
+        ax.set_yticks([-480, 0, 480])
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.suptitle("Forward cruise · example OD direction 17°" if forward else
+                 "Connection choices at 120 m center pitch", fontsize=15)
+    _save(fig, "zeta_forward_connections_20261117" if forward else "zeta_connectivity_20261117")
+
+def fig_zeta_pricing_results(data_path: str) -> None:
+    """Plot measured phase times and one actual flight from the compared schedules.
+
+    Parameters
+    ------------
+    - data_path (str): JSON with per-arm timing samples and selected centerlines.
+
+    Return
+    --------
+    - output (None): writes timing and route PNGs for the 100-flight comparison.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    fig, ax = plt.subplots(figsize=(10.2, 5.6), constrained_layout=True)
+    labels = [arm["label"] for arm in data["arms"]]
+    ys = np.arange(len(labels))
+    left = np.zeros(len(labels))
+    phases = [("common_seed", "Shared seed preparation", RAW),
+              ("graph_seed", "Graph + seed validation", ORANGE),
+              ("pricing", "Pricing", BLUE),
+              ("remaining", "Master, final IP, audits, other", GREEN)]
+    for key, label, color in phases:
+        values = np.array([arm[key] for arm in data["arms"]])
+        ax.barh(ys, values, left=left, label=label, color=color, height=.6)
+        left += values
+    for y, arm in zip(ys, data["arms"], strict=True):
+        ax.plot(arm["totals"], [y] * len(arm["totals"]), "|", color=INK, ms=12, mew=1.4)
+        ax.text(max(arm["totals"]) + 2, y, f'{np.mean(arm["totals"]):.1f} s',
+                va="center", fontsize=10, color=INK)
+    ax.set_yticks(ys, labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0, max(max(a["totals"]) for a in data["arms"]) * 1.16)
+    ax.set_xlabel("Elapsed seconds · total includes shared seed preparation")
+    ax.set_title("100 actual flights · 12 pricing workers", loc="left", fontsize=14)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.set_axisbelow(True)
+    ax.grid(axis="x", alpha=.2)
+    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.14), ncol=2, frameon=False)
+    fig.text(.5, -.04, "* One run; other arms two runs. Marks show individual total times.",
+             ha="center", fontsize=9, color=INK)
+    _save(fig, "zeta_pricing_timings_20261117")
+
+    fig_zeta_pricing_routes(data_path)
+
+
+def fig_zeta_pricing_routes(
+    data_path: str, output_name: str = "zeta_pricing_routes_20261117",
+) -> None:
+    """Compare selected centerlines with a second panel exposing overlapping Zeta routes.
+
+    Parameters
+    ------------
+    - data_path (str): JSON with selected centerlines, endpoint coordinates and optional notes.
+    - output_name (str): output PNG basename under context/figures.
+
+    Return
+    --------
+    - output (None): writes the comparison without shifting any route coordinates.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    routes = data["routes"]
+    origin = np.asarray(data["origin"], dtype=float)[:2]
+    destination = np.asarray(data["destination"], dtype=float)[:2]
+    direction = destination - origin
+    direction /= np.linalg.norm(direction)
+    perpendicular = np.array([-direction[1], direction[0]])
+    fig, axes = plt.subplots(2, 1, figsize=(10.2, 8.0), sharex=True)
+    styles = [(RAW, "-", ".", 1.5, 0), (BLUE, "-", "o", 3.0, 0),
+              (ORANGE, "-", ".", 1.8, 0), (GREEN, "--", "s", 1.8, 3),
+              (RED, ":", "^", 1.5, 6)]
+    for route, (color, linestyle, marker, width, offset) in zip(routes, styles):
+        points = np.asarray(route["centerline"], dtype=float)[:, :2] - origin
+        for panel, ax in enumerate(axes):
+            if panel == 1 and route["label"] == "Current DP":
+                continue
+            ax.plot(points @ direction / 1000.0, points @ perpendicular,
+                    color=color, ls=linestyle, lw=width, marker=marker, ms=4,
+                    markevery=(offset, 12), markerfacecolor="white",
+                    label=f'{route["label"]}: cost {route["cost"]:.2f}; departure {route["departure_s"]:.0f} s')
+    for ax in axes:
+        ax.axhline(0, color=GRID, ls="--", lw=.7)
+        ax.set_ylabel("Lateral displacement (m)")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(alpha=.16)
+    axes[0].set_title(f'Actual flight {data["flight_id"]} · selected cruise centerlines', loc="left")
+    axes[1].set_title("Zeta routes · closer vertical scale", loc="left", fontsize=11)
+    axes[1].set_xlabel("Distance along origin–destination direction (km)")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, fontsize=9, loc="lower left",
+               bbox_to_anchor=(.10, .045), ncol=2)
+    if data.get("route_notes"):
+        fig.text(.10, .012, "\n".join(data["route_notes"]), fontsize=9, color=INK)
+    fig.subplots_adjust(left=.10, right=.985, top=.95, bottom=.22, hspace=.25)
+    _save(fig, output_name)
+
+
+def fig_zeta_history_merge(data_path: str, forward: bool = False) -> None:
+    """Plot paired elapsed-time and certified-gap results for history merging.
+
+    Parameters
+    ------------
+    - data_path (str): task metrics JSON containing matched group means and samples.
+    - forward (bool): compare the forward-only domain instead of history merging.
+
+    Return
+    --------
+    - output (None): writes zeta_equivalent_merge_20261117.png beside existing figures.
+    """
+    import json
+    from pathlib import Path
+
+    groups = json.loads(Path(data_path).read_text())["groups"]
+    methods = [("hex12", "12 directions"), ("radius240", "240 m radius"),
+               ("full480", "Full 480 m")]
+    indexed = {(g["variant"], g["forward" if forward else "merge"]): g for g in groups}
+    fig, axes = plt.subplots(3, 1, figsize=(8.0, 8.8), constrained_layout=True)
+    specifications = [("pricing_s", "Pricing wall time", "seconds", 1),
+                      ("total_s", "Total wall time", "seconds", 1),
+                      ("global_integer_gap", "Certified integer gap", "percent", 100)]
+    for ax, (metric, title, unit, scale) in zip(axes, specifications, strict=True):
+        for enabled, offset, color, label in ((False, -.18, RAW, "Before"),
+                                               (True, .18, BLUE, "Forward cruise" if forward else "Merge enabled")):
+            ys = np.arange(len(methods)) + offset
+            values = [indexed[(method, enabled)]["means"][metric] * scale
+                      for method, _label in methods]
+            ax.barh(ys, values, height=.32, color=color, label=label)
+            for y, value, (method, _label) in zip(ys, values, methods, strict=True):
+                samples = np.array(indexed[(method, enabled)]["samples"][metric]) * scale
+                ax.plot(samples, [y] * len(samples), "|", color=INK, ms=7)
+                ax.text(max(samples) + max(values) * .025, y, f"{value:.1f}",
+                        va="center", fontsize=9, color=INK)
+        ax.set_yticks(np.arange(len(methods)), [label for _method, label in methods])
+        ax.invert_yaxis()
+        ax.set_title(title, loc="left", fontsize=12)
+        ax.set_xlabel(unit)
+        ax.set_xlim(right=ax.get_xlim()[1] * 1.16)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", alpha=.18)
+    axes[0].legend(loc="upper right", frameon=False)
+    fig.suptitle("100 actual flights · same 12 workers and search caps", x=.02, ha="left")
+    repeats = ("One exploratory pair per graph; merging enabled in both arms.\n" if forward else
+               "Two runs per restricted arm; one per full-480 m arm.\n")
+    fig.text(.02, -.055, repeats +
+             "Totals include shared seeds, startup and audit; cold compilation excluded.\n" +
+             ("Forward bounds cover only the forward domain plus the shared seed pool." if forward else
+              "Restricted bounds cover their graph plus the fixed shared seed pool."),
+             fontsize=9, color=INK)
+    _save(fig, "zeta_forward_results_20261117" if forward else "zeta_equivalent_merge_20261117")
+
+
+def fig_zeta_lattice_bound(data_path: str) -> None:
+    """Compare the distance bound and equivalent-history merging independently.
+
+    Parameters
+    ------------
+    - data_path (str): matched actual100 metrics JSON with group means and samples.
+
+    Return
+    --------
+    - output (None): writes the lattice-bound comparison PNG beside existing figures.
+    """
+    import json
+    from pathlib import Path
+
+    groups = json.loads(Path(data_path).read_text())["groups"]
+    indexed = {(g["variant"], g["lattice"], g["merge"]): g for g in groups}
+    combinations = [(False, False, "Baseline", RAW), (False, True, "Merging", ORANGE),
+                    (True, False, "Distance bound", BLUE), (True, True, "Both", GREEN)]
+    rows = [(indexed[(variant, bound, merge)], f"{label} · {name}", color)
+            for variant, label in (("hex12", "12 directions"), ("radius240", "240 m radius"))
+            for bound, merge, name, color in combinations]
+    fig, axes = plt.subplots(3, 1, figsize=(9.2, 11.5), constrained_layout=True)
+    specifications = [("pricing_s", "Pricing wall time", "seconds", 1),
+                      ("total_s", "Total wall time", "seconds", 1),
+                      ("global_integer_gap", "Certified integer gap", "percent", 100)]
+    for ax, (metric, title, unit, scale) in zip(axes, specifications, strict=True):
+        for y, (group, label, color) in enumerate(rows):
+            value = group["means"][metric] * scale
+            samples = np.asarray(group["samples"][metric]) * scale
+            ax.barh(y, value, color=color, height=.65)
+            ax.plot(samples, [y] * len(samples), "|", color=INK, ms=8)
+            ax.annotate(f"{value:.1f}", (max(samples), y), (5, 0),
+                        textcoords="offset points", va="center", fontsize=9)
+        ax.set_yticks(np.arange(len(rows)), [label for _group, label, _color in rows])
+        ax.invert_yaxis()
+        ax.axhline(3.5, color=GRID, lw=.8)
+        ax.set_title(title, loc="left", fontsize=12)
+        ax.set_xlabel(unit)
+        ax.set_xlim(right=ax.get_xlim()[1] * 1.12)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", alpha=.18)
+    fig.suptitle("100 actual flights · unchanged route domains and search caps", x=.02, ha="left")
+    fig.text(.02, -.045,
+             "Marks show individual runs; labels show means. All arms share the same 3,500 initial routes.\n"
+             "Totals include shared seeds, startup and audit; cold compilation excluded.\n"
+             "Each gap covers the restricted graph plus the fixed shared route pool, not full 480 m.",
+             fontsize=9, color=INK)
+    _save(fig, "zeta_lattice_bound_20261117")
+
+
+def fig_zeta_unresolved(data_path: str) -> None:
+    """Show repeated histories and residual length distinctions in capped searches.
+
+    Parameters
+    ------------
+    - data_path (str): per-flight summary from the fixed-price unresolved-search study.
+
+    Return
+    --------
+    - output (None): writes zeta_unresolved_20261117.png beside existing figures.
+    """
+    import json
+    from pathlib import Path
+
+    rows = json.loads(Path(data_path).read_text())["rows"]
+    remaining = [row for row in rows if row["merge_status"] == "cap"]
+    fig, axes = plt.subplots(2, 1, figsize=(9.0, 10.4),
+                             gridspec_kw={"height_ratios": [14, 6]})
+    panels = [
+        (rows, [("Surviving labels", RAW, [row["stored"] for row in rows]),
+                ("Equal state and paid charge", BLUE, [row["groups"] for row in rows])],
+         "Original 50,000-expansion cap · 14 unresolved searches"),
+        (remaining, [("Exact stored lengths", ORANGE,
+                      [row["remaining"]["exact_length_groups"] for row in remaining]),
+                     ("Diagnostic length grouping", GREEN,
+                      [row["remaining"]["rounded_1e7_m_groups"] for row in remaining])],
+         "After existing merging · six searches still capped"),
+    ]
+    for ax, (entries, series, title) in zip(axes, panels, strict=True):
+        ys = np.arange(len(entries))
+        for offset, (label, color, values) in zip((-.18, .18), series, strict=True):
+            ax.barh(ys + offset, np.asarray(values) / 1000, height=.32,
+                    color=color, label=label)
+            for y, value in zip(ys + offset, values, strict=True):
+                ax.text(value / 1000 + .6, y, f"{value:,}", va="center", fontsize=8)
+        ax.set_yticks(ys, [str(row["flight_id"]) for row in entries])
+        ax.invert_yaxis()
+        ax.set_ylabel("Flight")
+        ax.set_xlabel("Stored labels or groups (thousands)")
+        ax.set_xlim(0, 85)
+        ax.set_title(title, loc="left", fontsize=12, pad=34)
+        ax.legend(loc="lower left", bbox_to_anchor=(0, 1.015), ncol=2,
+                  frameon=False, fontsize=9, borderaxespad=0)
+        ax.spines[["top", "right", "left"]].set_visible(False)
+        ax.set_axisbelow(True)
+        ax.grid(axis="x", alpha=.18)
+    fig.subplots_adjust(left=.09, right=.98, top=.91, bottom=.13, hspace=.45)
+    fig.suptitle("Repeated histories consume the search budget", x=.09, ha="left", y=.988)
+    fig.text(.09, .015,
+             "Top: groups retain time, endpoint context, both lengths and paid reservations; sequence order is omitted.\n"
+             "Bottom: grouping lengths to 0.0000001 m is diagnostic only. Actual grouped spreads are ≤ 1.1 × 10⁻¹¹ m.\n"
+             "Counts include already-expanded labels. Diagnostic grouping is not a proved pruning rule.",
+             fontsize=8.5, color=INK)
+    _save(fig, "zeta_unresolved_20261117")
+
+
+def fig_zeta_unresolved_budget(data_path: str) -> None:
+    """Compare useful outcomes from merging and larger fixed-price work limits.
+
+    Parameters
+    ------------
+    - data_path (str): summary JSON with outcome counts for the same fourteen flights.
+
+    Return
+    --------
+    - output (None): writes zeta_unresolved_budget_20261117.png beside existing figures.
+    """
+    import json
+    from pathlib import Path
+
+    stages = json.loads(Path(data_path).read_text())["stages"]
+    fig, ax = plt.subplots(figsize=(8.5, 3.4))
+    left = np.zeros(len(stages))
+    ys = np.arange(len(stages))
+    for field, label, color in (("proof", "No-improvement proof", GREEN),
+                                ("column", "New useful route", BLUE),
+                                ("unfinished", "Still unfinished", ORANGE)):
+        values = np.asarray([stage[field] for stage in stages])
+        ax.barh(ys, values, left=left, color=color, label=label, height=.55)
+        for y, start, value in zip(ys, left, values, strict=True):
+            if value:
+                ax.text(start + value / 2, y, str(value), ha="center", va="center",
+                        color="white", weight="bold", fontsize=11)
+        left += values
+    ax.set_yticks(ys, [stage["label"] for stage in stages])
+    ax.invert_yaxis()
+    ax.set_xlim(0, 14)
+    ax.set_xticks(range(0, 15, 2))
+    ax.set_xlabel("Flights among the 14 originally capped searches")
+    ax.set_title("What additional search establishes at the same saved prices", loc="left", fontsize=12)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.legend(frameon=False, loc="lower left", bbox_to_anchor=(-.34, -.52), ncol=3, fontsize=9)
+    fig.subplots_adjust(left=.26, right=.985, top=.85, bottom=.35)
+    fig.text(.02, .015,
+             "Caps: up to 4 million expansions; cooperative deadlines up to 120 s. Each stage restarts.\n"
+             "A useful route advances pricing; it is not a no-improvement proof or a fleet-cost saving.",
+             fontsize=9, color=INK)
+    _save(fig, "zeta_unresolved_budget_20261117")
+
+
+def fig_zeta_shorter_history(data_path: str) -> None:
+    """Compare guarded shorter histories with the matched twelve-direction controls.
+
+    Parameters
+    ------------
+    - data_path (str): actual100 metrics with paired arm means and individual samples.
+
+    Return
+    --------
+    - output (None): writes desktop and mobile versions beside existing figures.
+    """
+    import json
+    from pathlib import Path
+
+    groups = json.loads(Path(data_path).read_text())["groups"]
+    arms = [("lattice", "Distance bound", RAW),
+            ("equivalent", "+ equal merge", BLUE),
+            ("shorter", "+ shorter merge", GREEN)]
+    specifications = [("pricing_s", "Pricing wall time", "seconds", 1),
+                      ("total_s", "Total wall time", "seconds", 1),
+                      ("global_integer_gap", "Certified cost gap", "percent", 100),
+                      ("search_expanded", "Expanded histories", "millions", 1e-6)]
+    for mobile in (False, True):
+        fig, axes = plt.subplots(4 if mobile else 2, 1 if mobile else 2,
+                                 figsize=(5.2, 10) if mobile else (10.5, 6.1))
+        for ax, (metric, title, unit, scale) in zip(axes.flat, specifications, strict=True):
+            largest = max(max(groups[arm]["samples"][metric]) * scale for arm, _label, _color in arms)
+            for y, (arm, _label, color) in enumerate(arms):
+                value = groups[arm]["means"][metric] * scale
+                samples = np.asarray(groups[arm]["samples"][metric]) * scale
+                ax.barh(y, value, height=.56, color=color)
+                ax.plot(samples, [y] * len(samples), "|", color=INK, ms=8)
+                ax.text(max(samples) + largest * .025, y, f"{value:.2f}", va="center", fontsize=9)
+            ax.set_yticks(range(len(arms)), [label for _arm, label, _color in arms])
+            ax.invert_yaxis()
+            ax.set_xlim(0, largest * 1.22)
+            ax.set_title(title, loc="left", fontsize=11)
+            ax.set_xlabel(unit)
+            ax.set_axisbelow(True)
+            ax.grid(axis="x", alpha=.18)
+            ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.suptitle("100 actual flights · 12-direction pricing", x=.02, ha="left")
+        fig.subplots_adjust(left=.25 if mobile else .13, right=.97,
+                            top=.94 if mobile else .88, bottom=.14 if mobile else .20,
+                            wspace=.47, hspace=.8 if mobile else .55)
+        note = (
+            "Two runs per arm; ticks show samples and labels show means.\n"
+            "Same 12 workers and 50k-expansion cap. Totals include shared\n"
+            "seed preparation, graph/startup and audit; cold build separate.\n"
+            "Gap = (feasible cost − lower bound) / feasible cost.\n"
+            "Scope: 12-direction graph plus fixed full480 seeds."
+        ) if mobile else (
+            "Two runs per arm; ticks show samples and labels show means. Same 12 workers and 50k-expansion cap.\n"
+            "Totals include shared seed preparation, graph/startup and audit; cold native compilation is separate.\n"
+            "Gap = (feasible cost − valid lower bound) / feasible cost. Scope: 12-direction graph plus fixed full480 seeds."
+        )
+        fig.text(.02, .025, note, fontsize=9, color=INK)
+        _save(fig, "zeta_shorter_history_20261117" + ("_mobile" if mobile else ""))
+
+
+def fig_zeta_dp_vs_search() -> None:
+    """Illustrate processing order on one additive-cost graph, not a measured flight.
+
+    Parameters
+    ------------
+    - None: the small acyclic example deliberately gives both algorithms the same graph.
+
+    Return
+    --------
+    - output (None): writes checked traces and a static process comparison PNG.
+    """
+    import heapq
+    import json
+    from pathlib import Path
+
+    nodes = {"S": (0, 1), "A": (1, 0), "B": (1, 2), "C": (2, 0),
+             "D": (2, 1), "E": (2, 2), "F": (3, 1), "G": (4, 1)}
+    edges = [("S", "A", 1), ("S", "B", 3), ("A", "C", 8), ("A", "D", 6),
+             ("B", "D", 1), ("B", "E", 2), ("C", "F", 1), ("D", "F", 1),
+             ("E", "F", 4), ("F", "G", 1)]
+    heuristic = {"S": 4, "A": 3, "B": 3, "C": 2, "D": 2, "E": 2, "F": 1, "G": 0}
+    assert all(heuristic[a] <= cost + heuristic[b] for a, b, cost in edges)
+
+    def solve(best_first: bool) -> list[dict]:
+        """Record either a forward layer sweep or a consistent-heuristic priority search."""
+        scores, parents, order = {"S": 0}, {}, []
+        queue = [(heuristic["S"], "S")]
+        frames = [{"order": [], "scores": dict(scores), "parents": {}, "done": False}]
+        sweep = iter(nodes)
+        while True:
+            if best_first:
+                if not queue:
+                    break
+                bound, node = heapq.heappop(queue)
+                if node in order or bound != scores[node] + heuristic[node]:
+                    continue
+            else:
+                node = next(sweep, None)
+                if node is None:
+                    break
+            order.append(node)
+            for source, target, cost in edges:
+                if source == node and scores[node] + cost < scores.get(target, float("inf")):
+                    scores[target] = scores[node] + cost
+                    parents[target] = node
+                    if best_first:
+                        heapq.heappush(queue, (scores[target] + heuristic[target], target))
+            frames.append({"order": list(order), "scores": dict(scores),
+                           "parents": dict(parents), "done": node == "G"})
+            if node == "G":
+                break
+        return frames
+
+    dp, astar = solve(False), solve(True)
+    assert dp[-1]["scores"]["G"] == astar[-1]["scores"]["G"] == 6
+    assert dp[-1]["order"] == list(nodes)
+    assert astar[-1]["order"] == ["S", "A", "B", "D", "F", "G"]
+    assert dp[2]["scores"]["D"] == 7 and dp[3]["scores"]["D"] == 4
+    data = {"nodes": nodes, "edges": edges, "heuristic": heuristic, "dp": dp, "astar": astar,
+            "best_path": ["S", "B", "D", "F", "G"], "optimal_cost": 6,
+            "scope": "Illustrative additive-cost DAG; same graph for both, not actual flight counts."}
+    Path(OUT, "zeta_dp_vs_search_20261117.json").write_text(json.dumps(data, indent=2) + "\n")
+    fig, axes = plt.subplots(2, 1, figsize=(9, 7))
+    for ax, title, frames in zip(axes, ["DP: sweep through time layers", "A*-style: smallest completion bound first"], [dp, astar], strict=True):
+        frame = frames[-1]
+        for a, b, cost in edges:
+            x, y = nodes[a]
+            tx, ty = nodes[b]
+            good = (a, b) in list(zip(data["best_path"], data["best_path"][1:]))
+            ax.annotate("", (tx, -ty), (x, -y), arrowprops={"arrowstyle": "->", "color": GREEN if good else HEXGRID,
+                                                         "lw": 2.2 if good else 1.2, "shrinkA": 14, "shrinkB": 14})
+            ax.text((x+tx)/2, -(y+ty)/2+.08, str(cost), ha="center", color=INK,
+                    bbox={"facecolor": "white", "edgecolor": "none", "pad": .5}, fontsize=10)
+        for node, (x, y) in nodes.items():
+            visited = node in frame["order"]
+            ax.scatter(x, -y, s=420, color=BLUE if visited else "white", edgecolor=BLUE if visited else GRID, zorder=5)
+            ax.text(x, -y, node, ha="center", va="center", color="white" if visited else INK, zorder=6)
+            if visited:
+                ax.text(x+.16, -y+.20, str(frame["order"].index(node)+1), fontsize=10, color=BLUE)
+        for t in range(5):
+            ax.text(t, .48, f"time {t}", ha="center", fontsize=10, color=INK)
+        ax.set_title(title, fontsize=13, loc="left")
+        ax.set(xlim=(-.35, 4.35), ylim=(-2.4, .7))
+        ax.axis("off")
+    fig.subplots_adjust(top=.88, bottom=.11, hspace=.35)
+    fig.suptitle("Both return the best route; neither enumerates every route", fontsize=15)
+    fig.text(.05, .025, "Same illustrative graph, additive costs. Numbers beside nodes show processing order; green is the cost-6 route.\n"
+             "Production DP also prunes; Zeta keeps reservation histories and can return an improving route before proving optimality.", fontsize=10)
+    _save(fig, "zeta_dp_vs_search_20261117")
+
+
+def fig_zeta_wall_time_with_dp(data_path: str) -> None:
+    """Compare recorded DP and twelve-direction pricing and total elapsed times.
+
+    Parameters
+    ------------
+    - data_path (str): verified timing samples and labels, with earlier DP identified.
+
+    Return
+    --------
+    - output (None): writes desktop and mobile wall-time comparison PNGs.
+    """
+    import json
+    from pathlib import Path
+
+    rows = json.loads(Path(data_path).read_text())["rows"]
+    colors = [ORANGE, RAW, BLUE, GREEN, "#805ad5"]
+    for mobile in (False, True):
+        fig, axes = plt.subplots(2 if mobile else 1, 1 if mobile else 2,
+                                 figsize=(6.3, 8.7) if mobile else (12.2, 5.5))
+        for ax, (key, title) in zip(axes.flat, [("pricing_s", "Pricing wall time"),
+                                               ("total_s", "Total wall time")], strict=True):
+            largest = max(max(row[key]) for row in rows)
+            for y, (row, color) in enumerate(zip(rows, colors, strict=True)):
+                samples = row[key]
+                value = float(np.mean(samples))
+                ax.barh(y, value, height=.58, color=color)
+                ax.plot(samples, [y]*len(samples), "|", color=INK, ms=9)
+                ax.text(max(samples)+largest*.025, y, f"{value:.2f} s", va="center",
+                        fontsize=10, color=INK)
+            ax.set_yticks(range(len(rows)), [row["label"] for row in rows], fontsize=10)
+            ax.invert_yaxis()
+            ax.set_xlim(0, largest*1.24)
+            ax.set_title(title, loc="left", fontsize=13)
+            ax.set_xlabel("Elapsed seconds")
+            ax.set_axisbelow(True)
+            ax.grid(axis="x", alpha=.18)
+            ax.spines[["top", "right", "left"]].set_visible(False)
+        fig.suptitle("100 actual flights · 12 pricing workers", x=.02, ha="left", fontsize=15)
+        fig.subplots_adjust(left=.30 if mobile else .16, right=.97,
+                            top=.92 if mobile else .85, bottom=.19 if mobile else .32,
+                            wspace=.75, hspace=.5)
+        note = (
+            "Bars: means; ticks: recorded runs. Two runs except forward-only (one).\n"
+            "DP is an earlier benchmark with a different route/reservation model.\n"
+            "All Zeta rows use 12 directions and the distance bound.\n"
+            "Forward-only also changes the seed pool (3,495 versus 3,500).\n"
+            "Totals include setup, seed work and audit; cold compilation separate."
+        )
+        fig.text(.02, .025, note, fontsize=9, color=INK, linespacing=1.5)
+        _save(fig, "zeta_wall_time_with_dp_20261117" + ("_mobile" if mobile else ""))
+
+
+def fig_zeta_expansion_atlas() -> None:
+    """Draw matched-scale cruise successor sets and separate algorithm illustrations.
+
+    Parameters
+    ------------
+    - None: uses the verified 120 m pitch and connection norms from the prototype.
+
+    Return
+    --------
+    - output (None): writes an overview, individual panels, and an offset manifest.
+    """
+    import json
+    from pathlib import Path
+
+    modes = {
+        "adjacent": ("A* / current DP", {1}, 1, "6 destinations · 120 m maximum"),
+        "hex12": ("12-direction Zeta*", {1, 3}, 4, "12 destinations · 208 m maximum"),
+        "radius240": ("Zeta* · 240 m radius", None, 2, "18 destinations · 240 m maximum"),
+        "long": ("12 + long Zeta*", {1, 3, 7}, 4, "24 destinations · 317 m maximum"),
+        "full480": ("Full Zeta* · 480 m radius", None, 4, "60 destinations · 480 m maximum"),
+        "demo600": ("Earlier small demo · 600 m", None, 5, "90 destinations · 600 m maximum"),
+        "hybrid": ("Hybrid · cheap then full", None, 4, "24 first → 60 on fallback; not 84"),
+        "forward": ("Forward-only · 12 directions", {1, 3}, 4, "6 of 12 · example heading 17°"),
+        "theta": ("Theta* · parent shortcuts", {1, 3}, 4, "Reference concept; not a 100-flight arm"),
+    }
+    extra_modes = {
+        "forward240": ("Forward-only · 240 m", None, 2, "9 of 18 · example heading 17°"),
+        "forward480": ("Forward-only · 480 m", None, 4, "30 of 60 · example heading 17°"),
+    }
+    angle = np.deg2rad(17.0)
+    grid = [(q, r) for q in range(-8, 9) for r in range(-8, 9)
+            if abs(q + r / 2) <= 5.6 and abs(SQRT3 * r / 2) <= 5.6]
+    manifest = {}
+
+    def draw(ax: plt.Axes, mode: str, definition: tuple) -> None:
+        """Render one declared set; keep the same spatial scale in every panel."""
+        title, norms, limit, subtitle = definition
+        allowed = [(q, r) for q, r in grid if 0 < q*q + q*r + r*r <= limit**2
+                   and (norms is None or q*q + q*r + r*r in norms)]
+        before = list(allowed)
+        is_forward = mode.startswith("forward")
+        if is_forward:
+            allowed = [(q, r) for q, r in allowed
+                       if (q+r/2)*np.cos(angle) + SQRT3*r/2*np.sin(angle) > 1e-8/120]
+        for q, r in grid:
+            x, y = _axial_to_xy(q, r, 1 / SQRT3)
+            ax.add_patch(RegularPolygon((x, y), 6, radius=1/SQRT3, orientation=0,
+                                        facecolor="white", edgecolor=HEXGRID, linewidth=.45))
+        if is_forward:
+            perpendicular = np.array([-np.sin(angle), np.cos(angle)]) * 5.5
+            ax.plot([-perpendicular[0], perpendicular[0]], [-perpendicular[1], perpendicular[1]],
+                    color=RAW, ls="--", lw=1)
+            for q, r in set(before) - set(allowed):
+                x, y = _axial_to_xy(q, r, 1/SQRT3)
+                ax.plot(x, y, "x", color=RAW, ms=4, zorder=3)
+            ax.annotate("", xy=(5.2*np.cos(angle), 5.2*np.sin(angle)),
+                        xytext=(3.7*np.cos(angle), 3.7*np.sin(angle)),
+                        arrowprops={"arrowstyle": "->", "color": GREEN, "lw": 1.5})
+            ax.text(4.3*np.cos(angle), 4.3*np.sin(angle)+.55, "forward", ha="center",
+                    color=GREEN, fontsize=9)
+        for q, r in allowed:
+            x, y = _axial_to_xy(q, r, 1/SQRT3)
+            norm = q*q + q*r + r*r
+            color = ORANGE if (mode == "long" and norm == 7) else BLUE
+            if mode == "hybrid":
+                color = ORANGE if norm in {1, 3, 7} else BLUE
+            ax.plot([0, x], [0, y], color=color, alpha=.65, lw=.95, zorder=2)
+            ax.scatter(x, y, color=color, s=16, zorder=4)
+        reach = max(np.sqrt(q*q + q*r + r*r) for q, r in allowed)
+        if mode != "theta":
+            ax.add_patch(Circle((0, 0), reach, fill=False, color=GRID, ls=(0, (3, 3)), lw=1))
+        else:
+            parent = (-3.5, -SQRT3/2)
+            for q, r in allowed:
+                x, y = _axial_to_xy(q, r, 1/SQRT3)
+                ax.plot([parent[0], x], [parent[1], y], color=ORANGE, alpha=.6, lw=.9, ls="--")
+            ax.plot([parent[0], 0], [parent[1], 0], color=INK, lw=1.3)
+            ax.scatter(*parent, color=ORANGE, marker="s", s=35, zorder=5)
+            ax.text(parent[0]-.15, parent[1]-.8, "parent p", fontsize=9, ha="center", color=ORANGE)
+            ax.text(.1, -.8, "current u", fontsize=9, color=INK)
+        ax.scatter(0, 0, color=INK, s=32, zorder=6)
+        ax.set_aspect("equal")
+        ax.set(xlim=(-5.65, 5.65), ylim=(-5.65, 5.65))
+        ax.axis("off")
+        ax.set_title(title + "\n" + subtitle, fontsize=11, loc="left", pad=7, color=INK)
+        ax.plot([-4.8, -3.8], [-5.05, -5.05], color=INK, lw=2)
+        ax.text(-4.3, -4.82, "120 m", fontsize=8, ha="center", color=INK)
+        manifest[mode] = {"offsets": sorted(allowed), "count": len(allowed),
+                          "max_link_m": None if mode == "theta" else float(reach * 120),
+                          "current_target_radius_m": float(reach * 120), "title": title}
+
+    all_modes = modes | extra_modes
+    order = ("adjacent", "hex12", "radius240", "long", "full480", "demo600",
+             "hybrid", "forward", "forward240", "forward480", "theta")
+    fig, axes = plt.subplots(4, 3, figsize=(14, 18))
+    for ax, mode in zip(axes.flat, order):
+        draw(ax, mode, all_modes[mode])
+    axes.flat[-1].axis("off")
+    axes.flat[-1].text(.05, .80, "Same connections, less search work", fontsize=13, color=INK,
+                       weight="bold", transform=axes.flat[-1].transAxes)
+    axes.flat[-1].text(.05, .70,
+                       "Distance bounds\nEqual-history merging\nShorter-history merging\nGeometry and row caches\n\n"
+                       "These change how we explore the graph;\nthey do not enlarge or shrink its link set.\n\n"
+                       "Forward-only is a graph restriction.\nAt special aligned headings, perpendicular\nlinks are excluded too, so counts can be lower.",
+                       fontsize=12, color=INK, va="top", linespacing=1.7,
+                       transform=axes.flat[-1].transAxes)
+    fig.suptitle("One expansion on the hex grid · same scale in every panel", fontsize=19, x=.035, ha="left")
+    fig.subplots_adjust(left=.025, right=.975, top=.925, bottom=.075, hspace=.25, wspace=.15)
+    fig.text(.035, .025,
+             "Black dot = current waypoint; colored dots = candidate cruise endpoints; dashed circle = longest offered link.\n"
+             "120 m center pitch. Counts precede walls, corridor, budget and time feasibility. This is one expansion, not total route reach.\n"
+             "Bounds, caches and history merging do not change these link sets. Altitude, departure and terminal choices are omitted.",
+             fontsize=11, color=INK)
+    _save(fig, "zeta_expansion_atlas_20261117")
+    for mode, definition in (modes | extra_modes).items():
+        fig, ax = plt.subplots(figsize=(4.7, 4.8))
+        draw(ax, mode, definition)
+        fig.subplots_adjust(left=.03, right=.97, top=.87, bottom=.02)
+        _save(fig, "zeta_expansion_20261117_" + mode)
+    assert [manifest[k]["count"] for k in ("adjacent", "hex12", "radius240", "long", "full480", "demo600")] == [6, 12, 18, 24, 60, 90]
+    assert [manifest[k]["count"] for k in ("forward", "forward240", "forward480")] == [6, 9, 30]
+    assert set(map(tuple, manifest["hex12"]["offsets"])) < set(map(tuple, manifest["radius240"]["offsets"]))
+    assert not set(map(tuple, manifest["radius240"]["offsets"])) <= set(map(tuple, manifest["long"]["offsets"]))
+    Path(OUT, "zeta_expansion_atlas_20261117.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def fig_forward_dp_experiment(data_path: str) -> None:
+    """Compare matched forward12 pricing wall time and retained search work.
+
+    Parameters
+    ------------
+    - data_path (str): audited zeta-forward-dp-20261118/summary.json result file.
+
+    Return
+    --------
+    - output (None): writes zeta_forward_dp_20261118.png with two-run means and ranges.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    means = data["means"]
+    arms = ("best_first", "forward_dp")
+    labels = ("Best-first", "Forward DP")
+    colors = (BLUE, ORANGE)
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8.3), gridspec_kw={"height_ratios": [1, 1.35]})
+    timing, operations = axes
+    for index, arm in enumerate(arms):
+        m = means[arm]
+        timing.barh(index, m["pricing_s"], color=colors[index], height=.52)
+        timing.barh(index, m["total_s"]-m["pricing_s"], left=m["pricing_s"],
+                    color=HEXGRID, height=.52)
+        timing.text(m["pricing_s"]*.5, index, f'{m["pricing_s"]:.2f} s pricing',
+                    ha="center", va="center", color="white", fontsize=12, weight="bold")
+        timing.text(m["total_s"]+1, index, f'{m["total_s"]:.2f} s total',
+                    ha="left", va="center", color=INK, fontsize=12)
+        lo, hi = m["total_range"]
+        timing.plot((lo, hi), (index, index), color=INK, lw=2)
+    timing.set_yticks(range(2), labels, fontsize=12)
+    timing.invert_yaxis()
+    timing.set_xlim(0, max(means[a]["total_s"] for a in arms)*1.25)
+    timing.set_xlabel("Elapsed seconds · means of two alternating runs", fontsize=11)
+    timing.set_title("100 requests · 12 persistent pricing workers", loc="left", fontsize=16, weight="bold")
+    timing.text(0, -.38, "Gray: startup, shared seeds, graph, master/IP, and audits. Black: total-time range.",
+                transform=timing.transAxes, fontsize=10, color=INK)
+    metrics = (("search_expanded", "Expanded histories"), ("search_generated", "Generated histories"),
+               ("edge_evaluations", "Edge checks"))
+    for index, (key, label) in enumerate(metrics):
+        for arm_index, arm in enumerate(arms):
+            value = means[arm][key]/1e6
+            position = index + (arm_index-.5)*.29
+            operations.barh(position, value, height=.25, color=colors[arm_index], label=labels[arm_index] if index==0 else None)
+            operations.text(value+.06, position, f"{value:.3f} M", va="center", fontsize=11, color=INK)
+    operations.set_yticks(range(3), [label for _, label in metrics], fontsize=12)
+    operations.invert_yaxis()
+    operations.set_xlim(0, max(means[a]["edge_evaluations"] for a in arms)/1e6*1.2)
+    operations.set_xlabel("Operations across all CG rounds (millions)", fontsize=11)
+    operations.legend(loc="lower left", bbox_to_anchor=(0, 1.03), ncol=2,
+                      frameon=False, fontsize=11)
+    for axis in axes:
+        axis.spines[["top", "right", "left"]].set_visible(False)
+        axis.grid(axis="x", alpha=.15)
+        axis.set_axisbelow(True)
+    notes = []
+    for arm, label in zip(arms, labels):
+        m=means[arm]
+        notes.append(f'{label}: {m["iterations"]:.0f} rounds; {m["completed_flights"]:.0f}/100 pricing proofs; '
+                     f'cost {m["objective_cost"]:.3f}; certified gap {100*m["global_integer_gap"]:.2f}%.')
+    fig.text(.06, .06, "\n".join(notes)+"\nScope: forward12 + the same 3,495 fixed forward seeds; longer seed links allowed.",
+             fontsize=11, color=INK, va="top")
+    fig.subplots_adjust(left=.23, right=.96, top=.94, bottom=.18, hspace=.65)
+    _save(fig, "zeta_forward_dp_20261118")
+
+
+def fig_zeta_native_index(data_path: str) -> None:
+    """Compare shared-index pricing and full elapsed wall in two unchanged Zeta domains.
+
+    Parameters
+    ------------
+    - data_path (str): audited zeta-native-index-20261118/summary.json result file.
+
+    Return
+    --------
+    - output (None): writes zeta_native_index_20261118.png with repeat ranges and work counts.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    groups = data["groups"]
+    modes = ("forward_dp", "full480")
+    names = ("Forward12 DP", "Full 480 m best-first")
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+    for axis, metric, title in zip(axes, ("matched_pricing_s", "total_s"),
+                                  ("Pricing wall on matching work", "Total wall including setup and audits")):
+        for i, mode in enumerate(modes):
+            for j, (arm, color) in enumerate((("off", BLUE), ("on", ORANGE))):
+                result = groups[mode][arm]
+                value = result[metric]
+                lo, hi = result[metric+"_range"]
+                y = i*1.3 + j*.35
+                axis.barh(y, value, height=.28, color=color,
+                          label="Index "+arm if i == 0 else None)
+                axis.plot((lo, hi), (y, y), color=INK, lw=2)
+                axis.text(value+1, y, f"{value:.2f} s", va="center", fontsize=11, color=INK)
+        axis.set_yticks([.175, 1.475], names, fontsize=11)
+        axis.invert_yaxis()
+        axis.set_xlim(0, max(groups[m][a][metric] for m in modes for a in ("off", "on"))*1.24)
+        axis.set_xlabel("Elapsed seconds", fontsize=11)
+        axis.set_title(title, fontsize=13, loc="left", weight="bold")
+        axis.spines[["top", "right", "left"]].set_visible(False)
+        axis.grid(axis="x", alpha=.16)
+        axis.set_axisbelow(True)
+    axes[0].legend(loc="lower left", bbox_to_anchor=(0, 1.11), ncol=2, frameon=False)
+    notes = ["100 fixed requests · 12 workers · DP: two runs per option; full480: one run per option"]
+    for mode, name in zip(modes, names):
+        result = groups[mode]["on"]
+        notes.append(f'{name}: {result["matched_rounds"]:.0f} matched rounds; '
+                     f'{result["matched_expanded"]/1e6:.3f} M expanded / '
+                     f'{result["matched_generated"]/1e6:.3f} M generated.')
+    notes.append("Forward12 scope includes 3,495 fixed forward seeds; full480 uses its fixed 3,500-seed pool.")
+    notes.append("Full480 totals hit the pricing budget; compare matching work, not total speed. Cold build is separate.")
+    fig.text(.02, .23, "\n".join(notes), fontsize=10, color=INK, va="top", linespacing=1.6)
+    fig.subplots_adjust(left=.19, right=.97, top=.80, bottom=.37, wspace=.65)
+    _save(fig, "zeta_native_index_20261118")
+
+
 FIX_CASES = f"{OUT}/occupancy_fix_cases_data.json"
 
 

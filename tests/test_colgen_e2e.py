@@ -155,6 +155,283 @@ def test_colgen_terminal_rows_enforce_pad_capacity():
     ) is None
 
 
+@pytest.mark.parametrize("shared_hub", [False, True], ids=["crossing", "terminal-pads"])
+@pytest.mark.parametrize("backend,lazy,workers,prune_snap,early_return,completion_bounds", [
+    ("reference", False, 0, False, False, ()), ("reference", True, 0, False, False, ()),
+    ("compiled", False, 0, False, False, ()), ("compiled", True, 0, False, False, ()),
+    ("compiled", True, 2, False, False, ()), ("compiled", True, 2, True, False, ()),
+    ("reference", True, 0, False, True, ()), ("compiled", True, 0, False, True, ()),
+    ("compiled", True, 2, True, True, ()),
+    ("compiled", True, 2, True, True, ("arrival", "resource", "selected", "crossing")),
+    ("reference", True, 0, True, True, ("arrival", "resource", "selected", "crossing")),
+    ("compiled-hybrid", True, 2, True, True, ()),
+    ("compiled-long24", True, 2, True, True, ()),
+    ("compiled-merge12", True, 2, True, True, ()),
+    ("compiled-merge240", True, 2, True, True, ()),
+    ("compiled-merge12-forward", True, 2, True, True, ()),
+    ("compiled-merge12-forward-dp", True, 2, True, True, ()),
+    ("compiled-merge240-forward", True, 2, True, True, ()),
+    ("compiled-forward", True, 2, True, True, ()),
+    ("compiled-merge12-lattice", True, 2, True, True, ()),
+    ("compiled-merge240-lattice", True, 2, True, True, ()),
+    ("compiled-indexed", True, 2, True, True, ()),
+    ("compiled-merge240-indexed", True, 2, True, True, ()),
+    ("compiled-merge12-forward-dp-indexed", True, 2, True, True, ()),
+], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy", "parallel",
+        "parallel-pruned-snapped", "early-reference", "early-compiled", "early-parallel", "all-bounds-parallel", "all-bounds-reference",
+        "hybrid-parallel", "long24-parallel", "merged-12-parallel", "merged-240-parallel",
+        "forward-12-parallel", "forward-dp-parallel", "forward-240-parallel", "forward-full-parallel",
+        "lattice-12-parallel", "lattice-240-parallel", "indexed-full-parallel",
+        "indexed-radius-parallel", "indexed-forward-dp-parallel"])
+def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
+    shared_hub, backend, lazy, workers, prune_snap, early_return, completion_bounds,
+):
+    """Any-angle selected routes preserve physical safety, objective and terminal capacity."""
+    from freespace_sim.planner.colgen.objective import cost_model
+    from freespace_sim.planner.colgen.zeta import ZetaOptions
+    from freespace_sim.planner.colgen.zeta_geometry import reservation_claims
+    from freespace_sim.planner.colgen.zeta_solver import solve_zeta
+
+    native_state_index = backend.endswith("-indexed")
+    backend = backend.removesuffix("-indexed")
+    forward_dp = backend.endswith("-dp")
+    backend = backend.removesuffix("-dp")
+    lattice = backend.endswith("-lattice")
+    backend = backend.removesuffix("-lattice")
+    forward = backend.endswith("-forward")
+    backend = backend.removesuffix("-forward")
+    hybrid = backend.endswith("-hybrid")
+    restricted = backend.endswith("-long24")
+    merge_equivalent = backend in {"compiled-merge12", "compiled-merge240"}
+    merged12 = backend.endswith("-merge12")
+    radius = 240.0 if backend.endswith("-merge240") else 480.0
+    if merge_equivalent:
+        backend = "compiled"
+    backend = backend.removesuffix("-hybrid").removesuffix("-long24")
+    if backend == "compiled":
+        pytest.importorskip("numba")
+    if native_state_index:
+        pytest.importorskip("Cython")
+    cfg = SimConfig(
+        planner="colgen", flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+        region_size_m=(6000.0, 6000.0), max_ground_delay_s=64.0,
+        terminal_airspace_always_active=True, fixed_exit_lanes=True,
+    )
+    terms = ()
+    if shared_hub:
+        hub = (3000.0, 3000.0)
+        terminal = Terminal("zeta-H", capacity=2, radius=180.0)
+        requests = [
+            replace(request, dest=vec(
+                hub[0] + 720.0 * np.cos(2.0 * np.pi * index / 3),
+                hub[1] + 720.0 * np.sin(2.0 * np.pi * index / 3), 0.0,
+            ))
+            for index, request in enumerate(_radial_deliveries(hub, terminal, 3))
+        ]
+        terms = ((vec(*hub, 0.0), terminal),)
+    else:
+        requests = [
+            FlightRequest(1, _point((-2, 0), cfg), _point((2, 0), cfg), 0.0, 0.0),
+            FlightRequest(2, _point((0, -2), cfg), _point((0, 2), cfg), 0.0, 0.0),
+        ]
+    params = ColGenParams(
+        solver="highs", max_air_overrun_hops=0, time_limit_s=25.0,
+        ip_time_limit_s=3.0, ip_reserve_s=4.0, iteration_ip_time_limit_s=0.0,
+        n_heuristic_tries=4, n_pricing_workers=workers,
+    )
+    options = ZetaOptions(connection_radius_m=radius, max_expansions=1000, max_labels=10000,
+                          backend=backend, lazy_successors=lazy, expire_history=prune_snap,
+                          history_dominance=prune_snap, arrival_snap_s=float(prune_snap),
+                          early_return=early_return, completion_bounds=completion_bounds,
+                          connection_mode="hex12" if merged12 else "hex12_long" if restricted else "full",
+                          cheap_connection_mode="hex12_long" if hybrid else None,
+                          strong_history_dominance=merge_equivalent,
+                          merge_equivalent_histories=merge_equivalent,
+                          forward_cruise=forward,
+                          traversal="forward_dp" if forward_dp else "best_first",
+                          lattice_distance_bound=lattice,
+                          compiled_loop=merge_equivalent or native_state_index,
+                          compiled_history=merge_equivalent,
+                          native_state_index=native_state_index)
+    result = solve_zeta(
+        requests, cfg, terms, params, options=options,
+    )
+    if forward:
+        assert result.stats["forward_cruise"]
+        assert result.stats["certificate_scope"].startswith("forward-only cruise;")
+        by_id = {request.flight_id: request for request in requests}
+        for fid, column in result.columns.items():
+            direction = by_id[fid].dest[:2] - by_id[fid].origin[:2]
+            direction = direction / np.linalg.norm(direction)
+            for first, last in zip(column.cell_path, column.cell_path[1:]):
+                assert np.dot((_point(last, cfg) - _point(first, cfg))[:2], direction) > 1e-8
+    if workers:
+        sequential = solve_zeta(
+            requests, cfg, terms, replace(params, n_pricing_workers=0),
+            options=replace(options, native_state_index=False),
+        )
+        assert result.master.columns == sequential.master.columns
+        assert result.columns == sequential.columns
+        for key in ("objective_cost", "global_cost_lower_bound", "termination_reason",
+                    "pricing_search_complete", "pricing_bound_certified"):
+            assert result.stats[key] == sequential.stats[key]
+        assert result.stats["pricing_search_complete"]
+    if prune_snap:
+        unpruned = solve_zeta(
+            requests, cfg, terms, replace(params, n_pricing_workers=0),
+            options=replace(options, expire_history=False, history_dominance=False,
+                            strong_history_dominance=False, merge_equivalent_histories=False),
+        )
+        for key in ("objective_cost", "global_cost_lower_bound"):
+            assert result.stats[key] == pytest.approx(unpruned.stats[key], abs=1e-6)
+        assert unpruned.stats["pricing_search_complete"]
+        assert result.stats["pricing_bound_certified"] == unpruned.stats["pricing_bound_certified"]
+    assert len(result.columns) == len(requests)
+    if early_return:
+        assert result.stats["pricing_search_complete"]
+        assert result.stats["history"][-1]["pricing_complete"]
+        assert result.stats["history"][-1]["new_columns"] == 0
+    assert result.stats["violated_rows"] == 0
+    assert verify.find_interflight_conflict(list(result.intents.values()), cfg, terms) is None
+    ledger = ReservationLedger(cfg)
+    for center, terminal in terms:
+        ledger.register_static_terminal(center, terminal)
+    dss = DSS(ledger, FCFSMechanism())
+    for intent in result.intents.values():
+        assert dss.commit(intent)
+    protected = frozenset(terminal.id for _point_, terminal in terms)
+    for flight_id, column in result.columns.items():
+        intent = result.intents[flight_id]
+        assert intent.accepted
+        assert column.claims == reservation_claims(
+            intent.volumes, cfg, row_index=result.master.row_index,
+            protected_terminal_ids=protected,
+        )
+        assert column.delay_s == pytest.approx(cost_model(cfg, params).intent_cost(intent, cfg))
+        for (start, before), (end, after) in zip(intent.centerline, intent.centerline[1:]):
+            horizontal = float(np.linalg.norm(end[:2] - start[:2]))
+            if horizontal > 1e-8 and abs(float(end[2] - start[2])) < 1e-8:
+                speed = horizontal / (after - before)
+                assert speed >= cfg.nominal_speed_mps * (1.0 - options.speed_fraction) - 1e-8
+                assert speed <= cfg.nominal_speed_mps * (1.0 + options.speed_fraction) + 1e-8
+    assert result.stats["global_cost_lower_bound"] <= result.stats["objective_cost"] + 1e-6
+    if shared_hub:
+        dwells = [
+            (volume.t_start, volume.t_end)
+            for intent in result.intents.values()
+            for volume in intent.volumes
+            if volume.terminal_id == terminal.id and isinstance(volume.shape, CylinderSpec)
+        ]
+        assert _max_concurrent(dwells) <= terminal.capacity
+
+
+@pytest.mark.parametrize("continue_after_improvement", [False, True])
+@pytest.mark.parametrize("early_return", [False, True])
+@pytest.mark.parametrize("backend,lazy", [
+    ("reference", False), ("reference", True), ("compiled", False), ("compiled", True),
+], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy"])
+def test_zeta_prototype_keeps_incumbent_without_claiming_capped_convergence(
+    monkeypatch, continue_after_improvement, early_return, backend, lazy,
+):
+    """A capped pricing sweep may improve the pool but cannot claim exhaustive convergence."""
+    from freespace_sim.planner.colgen import zeta_solver
+    from freespace_sim.planner.colgen.zeta import ZetaOptions
+    from freespace_sim.planner.colgen.translate import Column
+
+    if backend == "compiled":
+        pytest.importorskip("numba")
+    cfg = SimConfig(
+        planner="colgen", flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+        max_ground_delay_s=8.0,
+    )
+    requests = [FlightRequest(1, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)]
+    params = ColGenParams(
+        solver="highs", max_air_overrun_hops=0, time_limit_s=10.0,
+        ip_time_limit_s=1.0, ip_reserve_s=2.0, iteration_ip_time_limit_s=0.0,
+    )
+    real_price = zeta_solver.price_zeta
+    calls = 0
+
+    def capped(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = real_price(*args, **kwargs)
+        if continue_after_improvement and calls > 1:
+            return result
+        return replace(result, complete=False, reason="test_work_cap", upper_bound=result.upper_bound + 1.0)
+
+    monkeypatch.setattr(zeta_solver, "price_zeta", capped)
+    supplied = None
+    if continue_after_improvement:
+        params = replace(params, seed_nominal_routes=False, seed_ladder_steps=0)
+        supplied = {1: [Column(1, 1, 0, None, None, ((0, 0), (2, 0)), 4.0)]}
+    result = zeta_solver.solve_zeta(
+        requests, cfg, (), params,
+        options=ZetaOptions(backend=backend, lazy_successors=lazy, early_return=early_return),
+        seed_columns=supplied,
+    )
+    assert len(result.columns) == 1
+    assert result.stats["termination_reason"] == ("converged" if continue_after_improvement else "pricing_limit")
+    assert result.stats["pricing_search_complete"] is continue_after_improvement
+    assert result.stats["pricing_bound_certified"] is True
+    assert result.stats["capped_searches"] == 1
+    assert result.stats["global_cost_lower_bound"] <= result.stats["objective_cost"] + 1e-6
+    if continue_after_improvement:
+        assert calls >= 2 and result.columns[1].departure_step == 0
+
+
+@pytest.mark.parametrize("failure", ["worker_lost", "deadline"])
+@pytest.mark.parametrize("phase", ["seed", "price"])
+def test_zeta_solver_does_not_certify_a_partial_parallel_sweep(monkeypatch, failure, phase):
+    """Partial seeds or prices retain feasible routes without certifying missing flights."""
+    from freespace_sim.planner.colgen import zeta_solver
+    from freespace_sim.planner.colgen.zeta import ZetaPricingResult
+    from freespace_sim.planner.colgen.zeta_pool import (
+        ZetaSeedSweepResult, ZetaSweepResult, build_seed_columns,
+    )
+
+    cfg = SimConfig(planner="colgen", flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+                    max_ground_delay_s=8.0)
+    requests = [
+        FlightRequest(1, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0),
+        FlightRequest(2, _point((5, 0), cfg), _point((7, 0), cfg), 0.0, 0.0),
+    ]
+    params = ColGenParams(solver="highs", n_pricing_workers=2, max_air_overrun_hops=0,
+                          time_limit_s=10.0, ip_time_limit_s=1.0, ip_reserve_s=2.0,
+                          iteration_ip_time_limit_s=0.0)
+    received = ZetaPricingResult(None, 0.0, 0.0, True, "optimal", 0, 0, 0.0)
+    sweep = ZetaSweepResult(((1, received),), False, failure, 0.0, 0.0, 0.0)
+    closed = []
+
+    def make_pool(graphs, worker_params):
+        """Return one seed or pricing prefix without relying on clock-sensitive scheduling."""
+        seeds = tuple((fid, build_seed_columns(graph, worker_params))
+                      for fid, graph in sorted(graphs.items()))
+        seed_sweep = ZetaSeedSweepResult(
+            seeds[:1] if phase == "seed" else seeds,
+            phase != "seed", failure if phase == "seed" else None, 0.0, 0.0, 0.0,
+        )
+        return SimpleNamespace(
+            run_seed_sweep=lambda *_args, **_kwargs: seed_sweep,
+            run_sweep=lambda *_args, **_kwargs: sweep,
+            close=lambda: closed.append(True), setup_s=0.0, close_s=0.0,
+            worker_peak_rss_bytes={},
+        )
+
+    monkeypatch.setattr(zeta_solver, "ZetaPricingPool", make_pool)
+    result = zeta_solver.solve_zeta(requests, cfg, (), params)
+    assert closed
+    assert len(result.columns) == (1 if phase == "seed" else len(requests))
+    assert result.stats["termination_reason"] == ("seed_" if phase == "seed" else "pricing_") + failure
+    assert not result.stats["pricing_search_complete"]
+    assert not result.stats["pricing_bound_certified"]
+    assert result.stats["global_cost_lower_bound"] == 0.0
+    if phase == "seed":
+        assert result.stats["history"] == []
+    else:
+        assert result.stats["history"][0]["search_statuses"] == {1: "optimal"}
+
+
 def test_budget_denial_is_not_logged_as_a_covering_bug(caplog):
     cfg = SimConfig(
         planner="colgen",

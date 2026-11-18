@@ -159,6 +159,7 @@ def column_to_corners(
     cfg: SimConfig,
     *,
     _validate: bool = True,
+    _any_angle: bool = False,
 ) -> tuple[list[Vec], float, float, float, Terminal | None, Terminal | None]:
     """Convert a discrete column to hex-centre corners and A*-equivalent timing metadata.
 
@@ -174,6 +175,8 @@ def column_to_corners(
     - cfg (SimConfig): supplies the clock, flight levels, and lattice/terminal geometry.
     - _validate (bool): enforce route feasibility; False is internal diagnostic construction.
       Required types, indices and supported terminal configuration are still checked.
+    - _any_angle (bool): internal prototype mode permitting nonadjacent candidate waypoints;
+      endpoint and lane validation are unchanged.
 
     Return
     --------
@@ -244,9 +247,10 @@ def column_to_corners(
                 f"column destination cell {col.cell_path[-1]} does not match customer cell {expected}"
             )
     for first, second in (zip(col.cell_path, col.cell_path[1:]) if _validate else ()):
-        if hg.hex_distance(first, second) != 1:
+        if first == second or (not _any_angle and hg.hex_distance(first, second) != 1):
             raise ValueError(
-                f"column paths must use adjacent lateral hex hops; found {first} -> {second}"
+                f"column paths must use {'distinct waypoints' if _any_angle else 'adjacent lateral hex hops'}; "
+                f"found {first} -> {second}"
             )
     corners = [np.array([*hg.hex_center(q, r, radius), z], dtype=float) for q, r in col.cell_path]
 
@@ -403,6 +407,7 @@ def column_to_intent(
     solve_share_s: float = 0.0,
     *,
     _validate: bool = True,
+    _any_angle: bool = False,
 ) -> OperationalIntent:
     """Build the exact reservation and reported metrics represented by ``col``.
 
@@ -414,6 +419,8 @@ def column_to_intent(
     - solve_share_s (float): this column's share of solve wall time, recorded on the intent.
     - _validate (bool): enforce route and budget checks; False is internal diagnostic
       construction, with identical geometry, timing and cost calculations.
+    - _any_angle (bool): internal prototype mode using nominal-speed arbitrary segments,
+      retaining the existing departure, climb, terminal-lane and objective rules.
 
     Return
     --------
@@ -428,7 +435,11 @@ def column_to_intent(
         corridor_t0,
         origin_term,
         dest_term,
-    ) = column_to_corners(col, req, cfg, **({} if _validate else {"_validate": False}))
+    ) = column_to_corners(
+        col, req, cfg,
+        **({} if _validate else {"_validate": False}),
+        **({"_any_angle": True} if _any_angle else {}),
+    )
     level = _index_field(col.level, "level")
     departure_step = _index_field(col.departure_step, "departure_step")
     z = cfg.flight_levels_m[level]
@@ -455,16 +466,25 @@ def column_to_intent(
         dest_term=dest_term,
         corridor_t0=corridor_t0,
     )
-    volumes, centerline = _retime_lattice_reservation(
-        volumes,
-        centerline,
-        corners,
-        corridor_t0,
-        departure_step * cfg.dt_s,
-        column_dwell_s(req.origin, origin_term, cfg, z),
-        column_dwell_s(req.dest, dest_term, cfg, z),
-        cfg,
-    )
+    if _any_angle:
+        # Preserve the integer takeoff anchor even when subtraction/addition would drift.
+        volumes[0] = replace(
+            volumes[0],
+            t_start=departure_step * cfg.dt_s,
+            t_end=departure_step * cfg.dt_s + cfg.hover_time_s
+            + column_dwell_s(req.origin, origin_term, cfg, z),
+        )
+    else:
+        volumes, centerline = _retime_lattice_reservation(
+            volumes,
+            centerline,
+            corners,
+            corridor_t0,
+            departure_step * cfg.dt_s,
+            column_dwell_s(req.origin, origin_term, cfg, z),
+            column_dwell_s(req.dest, dest_term, cfg, z),
+            cfg,
+        )
     reference = enroute_reference_m(req.origin, req.dest, origin_term, dest_term, cfg)
     flown = enroute_flown_m(
         [point for point, _time in centerline],
@@ -491,7 +511,10 @@ def column_to_intent(
         ground_delay_s=report_g_delay,
         air_hold_s=0.0,
         air_detour_m=detour,
-        lattice_overhead_m=hg.lattice_overhead_m(col.cell_path, cfg.corridor_segment_len_m, detour),
+        lattice_overhead_m=(
+            0.0 if _any_angle
+            else hg.lattice_overhead_m(col.cell_path, cfg.corridor_segment_len_m, detour)
+        ),
         altitude_change_m=endpoint_altitude_change_m(z, z, cum_dz, cfg),
         planner="colgen",
         solve_time_s=solve_share_s,

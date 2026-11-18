@@ -265,6 +265,9 @@ class ColGenParams:
     # rounds and 595 s to 465 s for a final IP 0.02% costlier (HISTORY.md).
     emptiest_airspace_tiebreak: bool | None = None
 
+    # Opt-in CPU initialization on the persistent pricing owners. Serial/GPU unchanged.
+    worker_seed_routes: bool = False
+
     @property
     def effective_emptiest_airspace_tiebreak(self) -> bool:
         """Whether pricing nudges prices toward empty airspace; None follows the device."""
@@ -389,7 +392,7 @@ class ColGenParams:
 
         for name in ("iteration_ip_eager", "iteration_ip_search", "cheap_pricing",
                      "seed_nominal_routes", "pricing_work_stealing", "min_price_duals",
-                     "min_norm_duals"):
+                     "min_norm_duals", "worker_seed_routes"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
         if self.emptiest_airspace_tiebreak is not None and not isinstance(

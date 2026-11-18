@@ -18,14 +18,16 @@ from tests.test_colgen_solver import _cfg, _params, _request
 
 def test_seed_policy_defaults_and_cli():
     assert ColGenParams().seed_nominal_routes is True
+    assert ColGenParams().worker_seed_routes is False
     assert ColGenParams().warm_start_max_shift_steps == 8
     args = parse_args([
         "--scenario", "metro_uniform", "--planner", "colgen",
         "--colgen-warm-start", "astar", "--colgen-no-nominal-seeds",
         "--colgen-warm-start-max-shift", "0",
-        "--colgen-provided-seed-ladder", "10",
+        "--colgen-provided-seed-ladder", "10", "--colgen-worker-seeds",
     ])
     params = colgen_params_from_args(args, "colgen")
+    assert params.worker_seed_routes is True
     assert params.warm_start_planner == "astar"
     assert params.seed_nominal_routes is False
     assert params.warm_start_max_shift_steps == 0
@@ -33,9 +35,10 @@ def test_seed_policy_defaults_and_cli():
 
 
 @pytest.mark.parametrize("value", [1, "false", None])
-def test_seed_policy_requires_boolean(value):
-    with pytest.raises(TypeError, match="seed_nominal_routes"):
-        ColGenParams(seed_nominal_routes=value)
+@pytest.mark.parametrize("field", ["seed_nominal_routes", "worker_seed_routes"])
+def test_seed_policy_requires_boolean(value, field):
+    with pytest.raises(TypeError, match=field):
+        ColGenParams(**{field: value})
 
 
 @pytest.mark.parametrize("value, error", [(True, TypeError), (1.5, TypeError), (-1, ValueError)])
@@ -59,7 +62,8 @@ def test_provided_only_skips_nominal_ladder_and_greedy_but_prices_missing_flight
 ):
     cfg = _cfg()
     params = _params(
-        seed_nominal_routes=False, seed_ladder_steps=20,
+        seed_nominal_routes=False, seed_ladder_steps=20, worker_seed_routes=True,
+        n_pricing_workers=2,
         iteration_ip_time_limit_s=3, ip_time_limit_s=5, time_limit_s=60,
     )
     requests = [
@@ -76,6 +80,7 @@ def test_provided_only_skips_nominal_ladder_and_greedy_but_prices_missing_flight
     def forbidden(*args, **kwargs):
         pytest.fail("provided-only initialization called a nominal/greedy seed builder")
 
+    monkeypatch.setattr(solver_module.PricingPool, "seed_routes", forbidden)
     for name in ("seed_column", "_add_departure_ladder", "_initial_feasible_selection",
                  "_greedy_feasible_selection"):
         monkeypatch.setattr(solver_module, name, forbidden)
@@ -259,3 +264,76 @@ def test_departure_ladder_reuses_validation_with_cold_claim_and_cost_parity(monk
         assert column.delay_s == pytest.approx(
             model.intent_cost(original(column, request, cfg), cfg)
         )
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("objective", ["total_delay", "total_cost"])
+def test_worker_initial_routes_preserve_ladders_and_first_pricing(monkeypatch, workers, objective):
+    """The opt-in preserves initial insertion order, claims, costs and completed solver decisions."""
+    from freespace_sim.planner.colgen.pricing_pool import PricingPool
+    from tests.test_colgen_pricing_pool import _fingerprint
+
+    cfg = _cfg()
+    requests = [_request(3, (-3, 0), (3, 0), cfg), _request(1, (0, -3), (0, 3), cfg)]
+    params = _params(n_pricing_workers=workers, seed_ladder_steps=3, seed_ladder_stride=2,
+                     max_iterations=3, time_limit_s=120, objective=objective)
+    before, after = [], []
+    baseline = ColGenSolver().solve(requests, cfg, (), params, on_iteration=before.append)
+    if not workers:
+        def forbidden(*args, **kwargs):
+            pytest.fail("serial solve started worker seeds")
+        monkeypatch.setattr(PricingPool, "seed_routes", forbidden)
+    else:
+        def forbidden(*args, **kwargs):
+            pytest.fail("parallel seeding called the parent seed builder")
+        monkeypatch.setattr(solver_module, "seed_column", forbidden)
+    candidate = ColGenSolver().solve(
+        requests, cfg, (), replace(params, worker_seed_routes=True), on_iteration=after.append)
+    assert _fingerprint(candidate) == _fingerprint(baseline)
+    assert candidate.stats["ladder_columns"] == baseline.stats["ladder_columns"] > 0
+    assert [row["lp_columns"] for row in before] == [row["lp_columns"] for row in after]
+    assert [row["capacity_duals"] for row in before] == [row["capacity_duals"] for row in after]
+
+
+@pytest.mark.parametrize("exit_kind", ["timeout", "worker_lost", "canonical", "warm_start", "parent_deadline"])
+def test_early_worker_seed_exit_closes_the_live_pool(monkeypatch, exit_kind):
+    """Startup before the first LP must be cleaned up on partial seeds and insertion errors."""
+    from freespace_sim.planner.colgen.pricing_pool import PricingPool
+
+    cfg = _cfg()
+    requests = [_request(1, (-3, 0), (3, 0), cfg), _request(2, (0, -3), (0, 3), cfg)]
+    original = PricingPool.seed_routes
+    processes = []
+
+    def seed(pool, flight_ids, deadline):
+        result = original(pool, flight_ids, deadline)
+        processes.extend(channel.proc for channel in pool._channels)
+        if exit_kind in {"timeout", "worker_lost"}:
+            return replace(result, flight_ids=(1,), columns=result.columns[:1],
+                           reduced_costs=(0.0,), timeout_flight_id=2,
+                           kernel_counters={"pool_worker_lost": int(exit_kind == "worker_lost")})
+        return result
+
+    monkeypatch.setattr(PricingPool, "seed_routes", seed)
+    if exit_kind == "parent_deadline":
+        original_canonical = solver_module._canonical_column
+        def expire_after_insertion(*args, **kwargs):
+            column = original_canonical(*args, **kwargs)
+            monkeypatch.setattr(solver_module.time, "monotonic", lambda: 1e20)
+            return column
+        monkeypatch.setattr(solver_module, "_canonical_column", expire_after_insertion)
+    if exit_kind == "canonical":
+        def reject(*args, **kwargs):
+            raise ValueError("canonical rejection")
+        monkeypatch.setattr(solver_module, "_canonical_column", reject)
+    params = _params(n_pricing_workers=2, worker_seed_routes=True, seed_ladder_steps=0)
+    extras = {999: [None]} if exit_kind == "warm_start" else None
+    if exit_kind in {"timeout", "parent_deadline"}:
+        result = ColGenSolver().solve(requests, cfg, (), params)
+        assert result.stats["preprocessing_stage"] == "seeding"
+        assert result.stats["seed_flights_processed"] == result.stats["n_columns"] == 1
+    else:
+        with pytest.raises((ValueError, KeyError, RuntimeError)):
+            ColGenSolver().solve(requests, cfg, (), params, seed_columns=extras)
+    assert len(processes) == 2
+    assert all(not process.is_alive() for process in processes)

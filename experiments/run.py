@@ -388,6 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--colgen-provided-seed-ladder", type=int, default=None, metavar="STEPS",
                    help="Add up to this many departure alternatives on EACH side of each "
                         "imported seed, clipped to legal times (default 0; 10 adds up to 20).")
+    p.add_argument("--colgen-worker-seeds", action="store_true", default=None,
+                   help="Build nominal CPU routes on persistent pricing workers (opt-in; "
+                        "requires --colgen-workers). Completed routes are unchanged; "
+                        "deadline-truncated prefixes may differ.")
     p.add_argument("--colgen-workers", type=int, default=None, metavar="N",
                    help="colgen: fan each pricing sweep across N worker processes (default 0, "
                         "in-process). Note this is NOT --workers, which sizes the simulation's "
@@ -513,6 +517,7 @@ def _colgen_overrides(args) -> dict:
             ("min_price_duals", args.colgen_min_price_duals),
             ("min_norm_duals", args.colgen_min_norm_duals),
             ("emptiest_airspace_tiebreak", args.colgen_emptiest_airspace),
+            ("worker_seed_routes", args.colgen_worker_seeds),
             ("seed_ladder_steps", args.colgen_seed_ladder),
             ("greedy_budget_s_per_flight", args.colgen_greedy_budget_rate),
             ("warm_start_planner", args.colgen_warm_start),

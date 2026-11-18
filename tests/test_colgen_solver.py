@@ -741,7 +741,7 @@ def test_highs_flight_row_owns_its_maximize_dual():
 
 
 @pytest.mark.parametrize("rule", ["min_price", "min_norm"])
-def test_selected_duals_are_optimal_and_price_rows_by_their_rule(rule):
+def test_selected_duals_are_optimal_and_price_rows_by_their_rule(rule, monkeypatch):
     """The selected duals are optimal, dual-feasible, and price rows as their rule prefers.
 
     Row ``s`` is claimed only by flight 1's column, so its flight row and ``s`` bind together
@@ -791,6 +791,18 @@ def test_selected_duals_are_optimal_and_price_rows_by_their_rule(rule):
         assert (mu[a], mu[b]) == pytest.approx((6.0, 4.0), abs=1e-3)
     # The selection never touches the master's model, so the next LP returns its own duals.
     assert master.solve_lp()[1] == pytest.approx(lp_rows)
+
+    # A Gurobi error while selecting (e.g. out of memory) keeps the LP's duals, as a
+    # non-optimal status does, instead of ending the solve.
+    gp = master.backend._gp
+
+    def out_of_memory(*_args, **_kwargs):
+        raise gp.GurobiError(10001, "Out of memory")
+
+    monkeypatch.setattr(gp, "Model", out_of_memory)
+    failed = master.select_duals(rule)
+    assert failed.row_duals is None and "10001" in failed.status
+    assert master.last_row_duals == pytest.approx(lp_rows)
 
 
 def test_emptiest_airspace_duals_nudge_loaded_rows_and_keep_the_bound():
@@ -1306,7 +1318,7 @@ def test_repair_covers_all_feasible_flights(monkeypatch, min_norm):
 
     params = _params()
     if min_norm:
-        pytest.importorskip("gurobipy")
+        gp = pytest.importorskip("gurobipy")
         params = _params(solver="gurobi", min_norm_duals=True)
 
         class _Clock:
@@ -1325,10 +1337,10 @@ def test_repair_covers_all_feasible_flights(monkeypatch, min_norm):
         real_dual_lp = solver_module._real_dual_lp
 
         def failing_real_dual_lp(master, deadline):
-            def not_optimal():
-                raise RuntimeError("Gurobi LP failed with status 12")
+            def out_of_memory():
+                raise gp.GurobiError(10001, "Out of memory")
 
-            monkeypatch.setattr(master, "solve_lp", not_optimal)
+            monkeypatch.setattr(master, "solve_lp", out_of_memory)
             outcome = real_dual_lp(master, deadline)
             clock.offset = params.time_limit_s + 1.0
             return outcome
@@ -2408,7 +2420,10 @@ def test_backend_parity_when_final_integer_master_runs():
     # See note on the ladder below: this test must reach the final integer master.
     controls = {**controls, "seed_ladder_steps": 0}
     highs = ColGenSolver().solve(requests, cfg, (), _params(solver="highs", **controls))
-    gurobi = ColGenSolver().solve(requests, cfg, (), _params(solver="gurobi", **controls))
+    priced_rounds: list[dict] = []
+    gurobi = ColGenSolver().solve(
+        requests, cfg, (), _params(solver="gurobi", **controls), on_iteration=priced_rounds.append
+    )
 
     assert highs.stats["ip_skipped"] is False
     assert gurobi.stats["ip_skipped"] is False
@@ -2427,6 +2442,7 @@ def test_backend_parity_when_final_integer_master_runs():
             on_iteration=rounds.append,
         )
         first_round[rule, emptiest] = rounds[0]
+        priced_rounds += rounds
         assert {r["emptiest_airspace_rows"] > 0 for r in rounds} == {emptiest}
         stats = selected.stats
         assert (stats["dual_rule"], stats["emptiest_airspace_tiebreak"]) == (rule, emptiest)
@@ -2452,6 +2468,12 @@ def test_backend_parity_when_final_integer_master_runs():
     assert nudged["dual_objective"] - plain["dual_objective"] == pytest.approx(
         solver_module._EMPTIEST_AIRSPACE_DELTA * nudged_load, abs=1e-9
     )
+    # And the bound is built on that value: an exact, complete sweep's bound is the priced-on
+    # duals' ``b^T y`` plus every positive reduced cost (own duals, both rules, nudged or not).
+    exact = [r for r in priced_rounds if r["pricing_exact"] and r["pricing_search_complete"]]
+    assert {r["dual_selection"] for r in exact} == {"lp", "min_price", "min_norm"}
+    for r in exact:
+        assert r["raw_upper_bound"] == pytest.approx(r["dual_objective"] + r["rc_sum"], abs=1e-9)
     assert sorted(column.delay_s for column in highs.columns.values()) == pytest.approx(
         sorted(column.delay_s for column in gurobi.columns.values())
     )

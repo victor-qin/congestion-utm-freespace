@@ -301,8 +301,8 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   solves (homogeneous barrier failed on some rounds too) although the pin was feasible (exact
   optimum within 5e-7 of the master's barrier z*). Use dual simplex for any second-stage LP pinned
   to optimality. Separately, faster LP convergence did not mean a better answer: min-price duals
-  cut pricing 33% and lifted the lower bound every round, but the sparser pool's restricted IP was
-  ≥161,934 vs 156,616 (+4.0% final cost, final IP unproven at 600 s). Judge any dual-selection
+  cut pricing 33% and lifted the lower bound every round, but the sparser pool's final IP cost
+  162,924 vs 156,616 (+4.0%; unproven at 600 s, its bound ≥161,934 is already +3.4%). Judge any dual-selection
   change by the final IP cost, not rounds or bound. Runs 20261112T024339Z-mpd44-spx-on1-dd1941,
   20261112T024408Z-mpd44-off2-433fee. Files: `freespace_sim/planner/colgen/{master,solver}.py`.
 

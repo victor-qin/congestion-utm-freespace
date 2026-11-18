@@ -720,26 +720,29 @@ class GurobiBackend:
         Return
         --------
         - output (BackendDualSelection): the selected duals and their ``b^T y``, or only the
-          status when the solve was not optimal.
+          status when the solve was not optimal or Gurobi raised (``"GurobiError <errno>"``).
         """
         gp = self._gp
         model = self._model
-        model.update()
-        constraints = model.getConstrs()
-        # Rows and columns of `getA()` are constraint and variable `.index`, the same order
-        # `getConstrs()` / `getVars()` return.
-        matrix = model.getA()
-        rhs = np.asarray(model.getAttr("RHS", constraints), dtype=float)
-        objective = np.asarray(model.getAttr("Obj", model.getVars()), dtype=float)
-        flight_index = np.array([row.index for row in self._flight_rows.values()], dtype=np.int64)
-        capacity_index = np.array(
-            [row.index for row in self._capacity_rows.values()], dtype=np.int64
-        )
-        is_capacity = np.zeros(len(constraints), dtype=bool)
-        is_capacity[capacity_index] = True
-
-        dual = gp.Model(name)
+        dual = None
         try:
+            model.update()
+            constraints = model.getConstrs()
+            # Rows and columns of `getA()` are constraint and variable `.index`, the same order
+            # `getConstrs()` / `getVars()` return.
+            matrix = model.getA()
+            rhs = np.asarray(model.getAttr("RHS", constraints), dtype=float)
+            objective = np.asarray(model.getAttr("Obj", model.getVars()), dtype=float)
+            flight_index = np.array(
+                [row.index for row in self._flight_rows.values()], dtype=np.int64
+            )
+            capacity_index = np.array(
+                [row.index for row in self._capacity_rows.values()], dtype=np.int64
+            )
+            is_capacity = np.zeros(len(constraints), dtype=bool)
+            is_capacity[capacity_index] = True
+
+            dual = gp.Model(name)
             dual.Params.OutputFlag = 0
             dual.Params.Threads = gurobi_threads()
             dual.Params.Seed = self.seed
@@ -758,8 +761,12 @@ class GurobiBackend:
                 return BackendDualSelection(status)
             # Barrier without crossover can leave components a hair below their bound.
             values = np.maximum(np.asarray(y.X, dtype=float), 0.0)
+        except gp.GurobiError as exc:
+            # E.g. out of memory: like a non-optimal status, the caller keeps the LP's duals.
+            return BackendDualSelection(f"GurobiError {exc.errno}")
         finally:
-            dual.dispose()
+            if dual is not None:
+                dual.dispose()
         return BackendDualSelection(
             status,
             float(rhs @ values),

@@ -125,9 +125,9 @@ class ColGenResult:
 
     columns: dict[int, Column]
     stats: dict[str, Any]
-    # With a dual-selection rule on, the master LP over the final pool, solved right after the
-    # final IP and returned with its own, unselected duals (see `_real_dual_lp`). ``None``
-    # with the rule off or when no budget remained.
+    # With a dual-selection rule on, the master LP over the final pool, solved last (after the
+    # final IP and repair) and returned with its own, unselected duals (see `_real_dual_lp`).
+    # ``None`` with the rule off, when no budget remained, or when that LP failed.
     real_dual_lp: BackendLpResult | None = None
 
 
@@ -792,7 +792,7 @@ def _real_dual_lp(master: RestrictedMaster, deadline: float) -> tuple[BackendLpR
     --------
     - output (tuple[BackendLpResult | None, str]): the LP and ``"solved"``, or ``None`` and
       ``"time_limit"`` when the deadline passed first, or ``"failed"`` when the backend
-      returned a non-optimal status.
+      raised (a non-optimal status, or a Gurobi error such as out of memory).
     """
     while True:
         remaining_s = deadline - time.monotonic()
@@ -801,13 +801,15 @@ def _real_dual_lp(master: RestrictedMaster, deadline: float) -> tuple[BackendLpR
         master.backend.time_limit_s = max(1e-6, remaining_s)
         try:
             objective, row_duals, x = master.solve_lp()
+            clean = not master.add_violated_rows(x, _FEASIBILITY_TOL)
         except BackendTimeout:
             return None, "time_limit"
-        except RuntimeError as exc:
-            # A diagnostic: losing it must not lose the solve that already finished.
-            log.warning("final-pool LP for real duals failed: %s", exc)
+        except Exception:
+            # A diagnostic run after the answer is final: losing it must not lose the solve.
+            # `gurobipy.GurobiError` is not a RuntimeError, hence the broad catch.
+            log.warning("final-pool LP for real duals failed", exc_info=True)
             return None, "failed"
-        if not master.add_violated_rows(x, _FEASIBILITY_TOL):
+        if clean:
             return BackendLpResult(objective, master.flight_duals, row_duals, x), "solved"
 
 
@@ -2396,6 +2398,8 @@ class ColGenSolver:
         # older pool. Re-solve the final master's LP for its own. LAST, after the final IP and
         # repair, so a diagnostic can neither take their budget nor change the answer; the
         # eager rows the IP added are valid capacity rows, which leave the LP's optimum unchanged.
+        # Count the solve's rows first: rows this LP adds are not the solve's.
+        n_materialized_rows = len(getattr(master, "materialized_rows", ()))
         real_dual_lp: BackendLpResult | None = None
         real_dual_lp_status, real_dual_lp_s = "not_run", 0.0
         if dual_rule is not None and math.isfinite(last_lp_objective):
@@ -2411,7 +2415,6 @@ class ColGenSolver:
             for graph in graphs.values()
         )
 
-        materialized_rows = getattr(master, "materialized_rows", ())
         # A LOST WORKER OUTRANKS EVERY LATER REASON, and it has to be re-asserted here
         # because four phases downstream of the generation loop overwrite
         # `termination_reason` on their own terms -- skipping the final IP, failing to
@@ -2620,7 +2623,7 @@ class ColGenSolver:
             "seeded_columns": seeded_columns,
             "ladder_columns": ladder_columns,
             **_dual_regime_stats(_backend_name(master)),
-            "n_materialized_rows": len(materialized_rows),
+            "n_materialized_rows": n_materialized_rows,
             "lazy_rows_added": lazy_rows_added,
             "lazy_row_rounds": lazy_row_rounds,
             "dual_selection_fallbacks": dual_selection_fallbacks,

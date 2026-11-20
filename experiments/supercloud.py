@@ -81,10 +81,12 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # --env may override the job's thread-count and numba-cache defaults, but not the settings the
 # tool relies on for correctness (GRB_LICENSE_FILE comes only from --gurobi, PYTHONPATH points at
-# the snapshot) or what redirects which interpreter, packages or shared libraries load. Other
-# PYTHON* variables, e.g. PYTHONHASHSEED, stay allowed.
+# the snapshot) or what redirects which interpreter, packages, shared libraries or compiler
+# load: the Zeta native loop runs the compiler named by CC and links with LDSHARED/LDFLAGS.
+# Other PYTHON* variables, e.g. PYTHONHASHSEED, stay allowed.
 _RESERVED_ENV = {"PATH", "HOME", "PYTHONHOME", "PYTHONPATH", "PYTHONSAFEPATH", "PYTHONUSERBASE",
-                 "PYTHONNOUSERSITE", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONSTARTUP"}
+                 "PYTHONNOUSERSITE", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONSTARTUP",
+                 "CC", "CXX", "CPP", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "LDSHARED"}
 _RESERVED_ENV_PREFIXES = ("GRB_", "LD_", "DYLD_")
 # Slurm states in which a job still holds or waits for resources; sacct may briefly not know a
 # job it has just accepted, hence "" and UNKNOWN.
@@ -98,9 +100,11 @@ _MARK = "__SUPERCLOUD_OUTPUT__"
 # Module loads can leak these into the env's interpreter (see supercloud_array.sh); doctor
 # clears them exactly as the job script does, so it tests the environment jobs get.
 _CLEAN_PY = "unset PYTHONHOME PYTHONPATH; "
+_REMOTE_TIMEOUT_S = 600
 # Uploads create one file per shipped path; under runs/ the Lustre metadata server has taken
-# ~2 s per create (2026-11-19), so a full worktree needs far more than 600 s.
-_REMOTE_TIMEOUT_S = 3600
+# ~2 s per create (2026-11-19), so a full worktree needs far more than 600 s. Only rsync gets
+# this limit: ssh calls made while holding the submit lock keep the shorter one.
+_UPLOAD_TIMEOUT_S = 3600
 # sbatch answers in about a second; a short limit keeps the SIGTERM-held window short.
 _SBATCH_TIMEOUT_S = 60
 _LOCK_TIMEOUT_S = 300
@@ -516,9 +520,9 @@ def _rsync(src: str, dest: str) -> None:
     """Copy ``src`` to ``dest`` with rsync over ssh; raise with rsync's stderr on failure."""
     try:
         proc = subprocess.run(["rsync", "-a", "-e", "ssh -o BatchMode=yes", src, dest],
-                              capture_output=True, text=True, timeout=_REMOTE_TIMEOUT_S)
+                              capture_output=True, text=True, timeout=_UPLOAD_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
-        raise SuperCloudError(f"rsync {src} -> {dest} timed out after {_REMOTE_TIMEOUT_S}s") from exc
+        raise SuperCloudError(f"rsync {src} -> {dest} timed out after {_UPLOAD_TIMEOUT_S}s") from exc
     except OSError as exc:
         raise SuperCloudError(f"cannot run rsync: {exc}") from exc
     if proc.returncode != 0:

@@ -17,8 +17,17 @@ are timed around the solve call alone. Only the pricing differs: ``--pricing dp`
 ColGenParams and ZetaOptions field names of the checkout that runs (so a branch's own fields,
 such as ``price_snap``, pass through); lists become tuples for tuple fields. Precedence, low to
 high: captured params, ``--workers``/gurobi, the file, ``--param``; ``ZETA_DEFAULTS``, the
-file, ``--zeta-option``. Unknown names stop the run before any work. ``zeta_options`` apply to
-the Zeta arm only; ``turn_below_90`` is a ``params`` field that the Zeta options follow.
+file, ``--zeta-option``. Unknown names and values of the wrong type (checked against each
+field's annotation) stop the run before any work. ``zeta_options`` apply to the Zeta arm only;
+``turn_below_90`` is a ``params`` field that the Zeta options follow.
+
+The arms share one ColGenParams, but not every field binds both solvers: DP stops on
+``lp_gap`` and runs its per-round integer heuristic, while a Zeta solver without an LP-gap
+stop ends only on convergence, a pricing limit or the time limit. Each report says whether
+its solve applied ``lp_gap`` (``lp_gap_applied``); compare arms with that in mind.
+
+Input and options files are read once: a multi-arm run freezes copies next to its outputs and
+every arm solves exactly the bytes whose sha256 it reports.
 """
 from __future__ import annotations
 
@@ -72,13 +81,58 @@ def json_safe(value: Any) -> Any:
     return value
 
 
-def parse_overrides(pairs: list[str], target: type, label: str) -> dict[str, Any]:
-    """Parse repeated ``NAME=VALUE`` options into dataclass field overrides.
+def _field_types(target: type) -> dict[str, str]:
+    """Map each init field of a dataclass to its annotation text (``int | None``, ...)."""
+    return {field.name: (field.type if isinstance(field.type, str)
+                         else getattr(field.type, "__name__", str(field.type)))
+            for field in fields(target) if field.init}
+
+
+def typed_value(name: str, value: Any, annotation: str, label: str) -> Any:
+    """Check one override against its field annotation, converting only lossless cases.
 
     Parameters
     ------------
-    - pairs (list[str]): raw ``NAME=VALUE`` strings; values are Python literals, else strings
-      (or, for tuple fields, comma-separated strings).
+    - name (str): field name, for error messages.
+    - value (Any): parsed CLI literal or JSON value.
+    - annotation (str): the field's annotation text, e.g. ``bool``, ``int | None``.
+    - label (str): option name used in error messages.
+
+    Return
+    --------
+    - output (Any): the value, with ints widened for float fields and lists made tuples;
+      a mismatch (``forward_cruise="false"``, ``max_labels=True``) stops the run.
+    """
+    kinds = [part.strip() for part in annotation.replace("Optional[", "").rstrip("]").split("|")]
+    if value is None:
+        if "None" in kinds or annotation.startswith("Optional["):
+            return None
+        raise SystemExit(f"{label} {name}: None is not allowed for {annotation}")
+    kinds = [kind for kind in kinds if kind != "None"]
+    for kind in kinds:
+        base = kind.split("[", 1)[0]
+        if base == "bool" and isinstance(value, bool):
+            return value
+        if base == "int" and isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if base == "float" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if base == "str" and isinstance(value, str):
+            return value
+        if base == "tuple" and isinstance(value, (list, tuple)):
+            return tuple(value)
+    if any(kind.split("[", 1)[0] not in ("bool", "int", "float", "str", "tuple") for kind in kinds):
+        return value  # An annotation this check does not model; the dataclass validates it.
+    raise SystemExit(f"{label} {name}={value!r}: expected {annotation}")
+
+
+def parse_overrides(pairs: list[str], target: type, label: str) -> dict[str, Any]:
+    """Parse repeated ``NAME=VALUE`` options into type-checked dataclass field overrides.
+
+    Parameters
+    ------------
+    - pairs (list[str]): raw ``NAME=VALUE`` strings; values are Python literals, ``true``/
+      ``false``/``none``/``null`` in any case, bare strings, or (tuple fields) comma lists.
     - target (type): dataclass whose init fields the names must match.
     - label (str): option name used in error messages.
 
@@ -86,23 +140,28 @@ def parse_overrides(pairs: list[str], target: type, label: str) -> dict[str, Any
     --------
     - output (dict[str, Any]): field name to parsed value.
     """
-    defaults = {field.name: field.default for field in fields(target) if field.init}
+    types = _field_types(target)
+    words = {"true": True, "false": False, "none": None, "null": None}
     parsed: dict[str, Any] = {}
     for pair in pairs:
         name, sep, raw = pair.partition("=")
-        if not sep or name not in defaults:
+        if not sep or name not in types:
             raise SystemExit(f"{label} {pair!r}: expected NAME=VALUE with NAME a {target.__name__} field")
-        try:
-            parsed[name] = ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            # Tuple fields take bare comma lists (arrival,resource), which need no shell quoting.
-            parsed[name] = (tuple(part for part in raw.split(",") if part)
-                            if isinstance(defaults[name], tuple) else raw)
+        if raw.lower() in words:
+            value = words[raw.lower()]
+        else:
+            try:
+                value = ast.literal_eval(raw)
+            except (ValueError, SyntaxError):
+                # Tuple fields take bare comma lists (arrival,resource), which need no shell quoting.
+                value = (tuple(part for part in raw.split(",") if part)
+                         if "tuple" in types[name] else raw)
+        parsed[name] = typed_value(name, value, types[name], label)
     return parsed
 
 
 def file_overrides(raw: Any, target: type, label: str) -> dict[str, Any]:
-    """Validate one options-file section against a dataclass's init fields.
+    """Validate one options-file section against a dataclass's init fields and their types.
 
     Parameters
     ------------
@@ -112,18 +171,17 @@ def file_overrides(raw: Any, target: type, label: str) -> dict[str, Any]:
 
     Return
     --------
-    - output (dict[str, Any]): field name to value; JSON lists become tuples where the field's
-      default is a tuple. Values are validated later by the dataclass itself.
+    - output (dict[str, Any]): field name to type-checked value; JSON lists become tuples.
     """
     if not isinstance(raw, dict):
         raise SystemExit(f"--options-file {label!r} must be a JSON object of field names")
-    defaults = {field.name: field.default for field in fields(target) if field.init}
-    unknown = sorted(set(raw) - set(defaults))
+    types = _field_types(target)
+    unknown = sorted(set(raw) - set(types))
     if unknown:
         raise SystemExit(f"--options-file {label!r}: {unknown} are not {target.__name__} fields "
                          "in this checkout")
-    return {name: (tuple(value) if isinstance(value, list) and isinstance(defaults[name], tuple)
-                   else value) for name, value in raw.items()}
+    return {name: typed_value(name, value, types[name], f"--options-file {label}")
+            for name, value in raw.items()}
 
 
 def resolve_overrides(args: argparse.Namespace) -> tuple[dict, dict, dict | None]:
@@ -163,12 +221,13 @@ def resolve_overrides(args: argparse.Namespace) -> tuple[dict, dict, dict | None
     return params, zeta, record
 
 
-def load_input(path: Path, count: int | None) -> tuple[Any, list[Any], tuple[Any, ...], dict[str, Any]]:
+def load_input(raw_bytes: bytes, count: int | None) -> tuple[Any, list[Any], tuple[Any, ...], dict[str, Any]]:
     """Rebuild the captured config, FCFS-ordered requests and terminals by field name.
 
     Parameters
     ------------
-    - path (Path): JSON capture with ``config``, ``requests``, ``static_terminals``, ``params``.
+    - raw_bytes (bytes): JSON capture with ``config``, ``requests``, ``static_terminals`` and
+      ``params``, read once so the reported sha256 covers exactly what is solved.
     - count (int | None): keep the first ``count`` requests in FCFS order; None keeps all.
 
     Return
@@ -179,7 +238,7 @@ def load_input(path: Path, count: int | None) -> tuple[Any, list[Any], tuple[Any
     from freespace_sim.config import SimConfig
     from freespace_sim.types import FlightRequest, Terminal, vec
 
-    data = json.loads(path.read_text())
+    data = json.loads(raw_bytes)
     config = dict(data["config"])
     for name in ("flight_levels_m", "region_center_latlon", "region_size_m"):
         config[name] = tuple(config[name])
@@ -230,6 +289,23 @@ def peak_rss_bytes() -> dict[str, int]:
             "largest_child": resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * scale}
 
 
+def write_new(path: Path, data: bytes) -> None:
+    """Write ``path`` atomically and only if it does not exist yet.
+
+    The bytes go to a private temporary file that is then hard-linked into place, so a
+    concurrent writer or an interruption can never leave a partial or overwritten file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(data)
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        raise SystemExit(f"{path} exists; measurements never overwrite a report") from None
+    finally:
+        temporary.unlink()
+
+
 def run_sequence(args: argparse.Namespace, arms: list[str]) -> None:
     """Run each arm in its own interpreter so no cache or allocator state carries over.
 
@@ -241,15 +317,22 @@ def run_sequence(args: argparse.Namespace, arms: list[str]) -> None:
     Return
     --------
     - output (None): each arm writes ``<out stem>-<arm>.json``; a failed arm stops the rest.
+      The input and options files are frozen once beside the outputs, so every arm solves
+      the same bytes even if the originals change mid-run.
     """
     outputs = [args.out.with_name(f"{args.out.stem}-{arm}.json") for arm in arms]
     existing = [str(path) for path in outputs if path.exists()]
     if existing:
         raise SystemExit(f"refusing to overwrite {existing}")
-    shared = ["--input", str(args.input), "--workers", str(args.workers),
-              "--gurobi-threads", str(args.gurobi_threads)]
+    frozen_input = args.out.with_name(f"{args.out.stem}-input.json")
+    write_new(frozen_input, args.input.read_bytes())
+    shared = ["--input", str(frozen_input), "--workers", str(args.workers)]
+    if args.gurobi_threads is not None:
+        shared += ["--gurobi-threads", str(args.gurobi_threads)]
     if args.options_file is not None:
-        shared += ["--options-file", str(args.options_file)]
+        frozen_options = args.out.with_name(f"{args.out.stem}-options.json")
+        write_new(frozen_options, args.options_file.read_bytes())
+        shared += ["--options-file", str(frozen_options)]
     if args.count:
         shared += ["--count", str(args.count)]
     for pair in args.param:
@@ -274,7 +357,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pricing", required=True,
                         help="dp, zeta, or a comma-separated sequence such as dp,zeta")
     parser.add_argument("--workers", type=int, default=12)
-    parser.add_argument("--gurobi-threads", type=int, default=4)
+    parser.add_argument("--gurobi-threads", type=int, default=None,
+                        help="master LP/IP threads; default keeps COLGEN_GUROBI_THREADS or the solver default")
     parser.add_argument("--count", type=int, default=None,
                         help="solve only the first N requests in FCFS order")
     parser.add_argument("--param", action="append", default=[],
@@ -297,7 +381,9 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"{args.out} exists; measurements never overwrite a report")
     if args.zeta_option and args.pricing != "zeta":
         raise SystemExit("--zeta-option applies only to --pricing zeta")
-    os.environ["COLGEN_GUROBI_THREADS"] = str(args.gurobi_threads)
+    if args.gurobi_threads is not None:
+        os.environ["COLGEN_GUROBI_THREADS"] = str(args.gurobi_threads)
+    input_bytes = args.input.read_bytes()
 
     from freespace_sim.planner.colgen.objective import cost_model
     from freespace_sim.planner.colgen.params import ColGenParams
@@ -306,7 +392,7 @@ def main(argv: list[str] | None = None) -> None:
     from freespace_sim.verify import find_interflight_conflict
 
     started = time.monotonic()
-    cfg, requests, terms, captured = load_input(args.input, args.count)
+    cfg, requests, terms, captured = load_input(input_bytes, args.count)
     names = {field.name for field in fields(ColGenParams) if field.init}
     unknown = sorted(set(captured) - names)
     if unknown:
@@ -323,7 +409,9 @@ def main(argv: list[str] | None = None) -> None:
         from freespace_sim.planner.colgen.zeta_solver import solve_zeta
         from freespace_sim.planner.zeta.native import prepare_compiled_loop
 
-        prepare_compiled_loop()
+        # Only the compiled loop needs the native build (and a C compiler).
+        if options.compiled_loop:
+            prepare_compiled_loop()
 
         def solve(reqs: Any, config: Any, statics: Any, solve_params: Any) -> Any:
             """Run the Zeta pricing solve."""
@@ -331,9 +419,20 @@ def main(argv: list[str] | None = None) -> None:
     else:
         from freespace_sim.planner.colgen.solver import ColGenSolver
 
+        dp_rounds: list[dict[str, Any]] = []
+        # Model objects and per-column arrays stay out of the report; per-flight lists only
+        # with --flight-records, matching the Zeta history.
+        skipped = {"master", "lp_x", "lp_columns", "capacity_duals"}
+
+        def record_round(state: dict[str, Any]) -> None:
+            """Keep DP's per-round evidence, which it exposes only through this callback."""
+            dp_rounds.append({key: value for key, value in state.items() if key not in skipped
+                              and (args.flight_records or not isinstance(value, (list, tuple, dict)))})
+
         def solve(reqs: Any, config: Any, statics: Any, solve_params: Any) -> Any:
-            """Run the production DP pricing solve."""
-            return ColGenSolver().solve(reqs, config, statics, solve_params)
+            """Run the production DP pricing solve, recording each round."""
+            dp_rounds.clear()
+            return ColGenSolver().solve(reqs, config, statics, solve_params, on_iteration=record_round)
 
     warm_cfg, warm_requests, warm_params = warm_case(cfg, params)
     warm_started = time.monotonic()
@@ -360,11 +459,14 @@ def main(argv: list[str] | None = None) -> None:
              "all_intents_accepted": all(intent.accepted for intent in intents.values()),
              "audit_s": time.monotonic() - audit_started}
     stats = dict(result.stats)
-    history = stats.pop("history", [])
+    history = stats.pop("history", []) if args.pricing == "zeta" else list(dp_rounds)
+    # DP rounds always carry their LP gap; a Zeta solver applies lp_gap only if its rounds do.
+    lp_gap_applied = any(isinstance(row, dict) and "lp_gap" in row for row in history)
     report = {
         "pricing": args.pricing, "flights": len(requests),
-        "input_sha256": hashlib.sha256(args.input.read_bytes()).hexdigest(),
-        "workers": args.workers, "gurobi_threads": args.gurobi_threads,
+        "input": str(args.input), "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
+        "workers": args.workers, "gurobi_threads": os.environ.get("COLGEN_GUROBI_THREADS"),
+        "lp_gap_applied": lp_gap_applied,
         "params": asdict(params), "param_overrides": overrides,
         "zeta_options": None if options is None else asdict(options),
         "zeta_option_overrides": zeta_overrides if options is not None else None,
@@ -379,8 +481,7 @@ def main(argv: list[str] | None = None) -> None:
                   if not key.endswith("_flight_records")},
         "hostname": socket.gethostname(), "python": sys.version, "platform": platform.platform(),
     }
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(json_safe(report), indent=2) + "\n")
+    write_new(args.out, (json.dumps(json_safe(report), indent=2) + "\n").encode())
     print(json.dumps({"event": "done", "solve_s": solve_s, "served": audit["served"],
                       "termination": report["termination_reason"],
                       "collision": conflict is not None}), flush=True)

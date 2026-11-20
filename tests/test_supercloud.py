@@ -63,6 +63,7 @@ def _req(**changes) -> sc.JobRequest:
     (_req(env=(("lower", "1"),)), CFG, "UPPER_SNAKE_CASE"),
     (_req(env=(("GRB_LICENSE_FILE", LICENCE),)), CFG, "reserved"),
     (_req(env=(("PYTHONHOME", "/x"),)), CFG, "reserved"),
+    (_req(env=(("CC", "/shared/cc-wrapper"),)), CFG, "reserved"),
     (_req(module="experiments.colgen_four_round", args=("--capture", "c.pkl")), CFG, None),
     (_req(module="experiments.colgen_four_round", args=("--source", "/x")), CFG, "--source"),
     (_req(module="experiments.colgen_four_round", args=("--sour=/x",)), CFG, "--source"),

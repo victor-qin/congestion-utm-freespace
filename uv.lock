@@ -249,6 +249,9 @@ gurobi = [
 metal = [
     { name = "pyobjc-framework-metal", marker = "sys_platform == 'darwin'" },
 ]
+zeta-native = [
+    { name = "cython" },
+]
 
 [package.dev-dependencies]
 compiled = [
@@ -257,6 +260,7 @@ compiled = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cython", marker = "extra == 'zeta-native'", specifier = ">=3.2,<4" },
     { name = "gurobipy", marker = "extra == 'gurobi'", specifier = ">=11.0" },
     { name = "huggingface-hub", marker = "extra == 'cloud'", specifier = ">=0.20" },
     { name = "matplotlib", specifier = ">=3.8" },
@@ -272,7 +276,7 @@ requires-dist = [
     { name = "shapely", specifier = ">=2.0" },
     { name = "trimesh", specifier = ">=4.0" },
 ]
-provides-extras = ["dev", "cloud", "compiled", "metal", "gurobi"]
+provides-extras = ["dev", "cloud", "compiled", "zeta-native", "metal", "gurobi"]
 
 [package.metadata.requires-dev]
 compiled = [{ name = "numba", specifier = ">=0.59" }]

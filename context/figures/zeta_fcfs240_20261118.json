@@ -1,0 +1,708 @@
+{
+  "requests": 100,
+  "served": 98,
+  "denied": 2,
+  "progress": [
+    {
+      "flight_id": 1482,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.067933250014903
+    },
+    {
+      "flight_id": 2290,
+      "accepted": true,
+      "complete": true,
+      "reason": "optimal",
+      "plan_wall_s": 0.15993287501623854
+    },
+    {
+      "flight_id": 364,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.8786767499987036
+    },
+    {
+      "flight_id": 3098,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.432787833007751
+    },
+    {
+      "flight_id": 226,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.098961749987211
+    },
+    {
+      "flight_id": 1656,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.8545667919970583
+    },
+    {
+      "flight_id": 872,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.4569228749896865
+    },
+    {
+      "flight_id": 894,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.107771208015038
+    },
+    {
+      "flight_id": 2204,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.453686207998544
+    },
+    {
+      "flight_id": 1886,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.9458796660182998
+    },
+    {
+      "flight_id": 2598,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.102139541995712
+    },
+    {
+      "flight_id": 1350,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.42747958400286734
+    },
+    {
+      "flight_id": 2904,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.103706583002349
+    },
+    {
+      "flight_id": 1008,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.06906337500549853
+    },
+    {
+      "flight_id": 1744,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 4.153120292001404
+    },
+    {
+      "flight_id": 2394,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.102198709006188
+    },
+    {
+      "flight_id": 490,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.4307826670119539
+    },
+    {
+      "flight_id": 1240,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.5564080000040121
+    },
+    {
+      "flight_id": 2870,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.7580120000056922
+    },
+    {
+      "flight_id": 2278,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.084459250007058
+    },
+    {
+      "flight_id": 224,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.08809016700252
+    },
+    {
+      "flight_id": 758,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.35952866601292044
+    },
+    {
+      "flight_id": 1346,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.0210842909873463
+    },
+    {
+      "flight_id": 342,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.2404961670108605
+    },
+    {
+      "flight_id": 608,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.17838345799827948
+    },
+    {
+      "flight_id": 1806,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.09712595900055
+    },
+    {
+      "flight_id": 1992,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.4461292499909177
+    },
+    {
+      "flight_id": 48,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.094386917015072
+    },
+    {
+      "flight_id": 136,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.8317386659909971
+    },
+    {
+      "flight_id": 2866,
+      "accepted": true,
+      "complete": true,
+      "reason": "optimal",
+      "plan_wall_s": 0.3923423329833895
+    },
+    {
+      "flight_id": 1276,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 4.716374582989374
+    },
+    {
+      "flight_id": 232,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.6095943750115111
+    },
+    {
+      "flight_id": 88,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.107252750021871
+    },
+    {
+      "flight_id": 132,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.8441763750161044
+    },
+    {
+      "flight_id": 882,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.107494333002251
+    },
+    {
+      "flight_id": 1758,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.7049077920091804
+    },
+    {
+      "flight_id": 78,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 4.112705415987875
+    },
+    {
+      "flight_id": 2592,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.3364982500206679
+    },
+    {
+      "flight_id": 8,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 4.2748544169880915
+    },
+    {
+      "flight_id": 1648,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.6164172499848064
+    },
+    {
+      "flight_id": 2082,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.108447374979733
+    },
+    {
+      "flight_id": 2382,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.2447768329875544
+    },
+    {
+      "flight_id": 1772,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.118172042013612
+    },
+    {
+      "flight_id": 2634,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.24491645797388628
+    },
+    {
+      "flight_id": 1618,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.139182292012265
+    },
+    {
+      "flight_id": 254,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.2230995419959072
+    },
+    {
+      "flight_id": 2386,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.27475425001466647
+    },
+    {
+      "flight_id": 1392,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.114863791997777
+    },
+    {
+      "flight_id": 2990,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.097962959000142
+    },
+    {
+      "flight_id": 180,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.7923725419968832
+    },
+    {
+      "flight_id": 1852,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 3.2907312500174157
+    },
+    {
+      "flight_id": 512,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.2239517499983776
+    },
+    {
+      "flight_id": 866,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.0966223329887725
+    },
+    {
+      "flight_id": 330,
+      "accepted": false,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.118512542016106
+    },
+    {
+      "flight_id": 2702,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.1355637079977896
+    },
+    {
+      "flight_id": 1014,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.12288974999683
+    },
+    {
+      "flight_id": 2672,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.101947749993997
+    },
+    {
+      "flight_id": 2600,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.127616749989102
+    },
+    {
+      "flight_id": 2050,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.065229250001721
+    },
+    {
+      "flight_id": 1876,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.925595249980688
+    },
+    {
+      "flight_id": 1402,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.109734708996257
+    },
+    {
+      "flight_id": 468,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.11221791699063
+    },
+    {
+      "flight_id": 1408,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.6167065000045113
+    },
+    {
+      "flight_id": 2882,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.512250125000719
+    },
+    {
+      "flight_id": 892,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.026306041982025
+    },
+    {
+      "flight_id": 668,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.100306916021509
+    },
+    {
+      "flight_id": 296,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.24609466700349003
+    },
+    {
+      "flight_id": 2510,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.10124041698873
+    },
+    {
+      "flight_id": 2316,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.2146877080085687
+    },
+    {
+      "flight_id": 1624,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 2.07988387500518
+    },
+    {
+      "flight_id": 234,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.541588167019654
+    },
+    {
+      "flight_id": 1986,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.1309353339893278
+    },
+    {
+      "flight_id": 2856,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.4831167919910513
+    },
+    {
+      "flight_id": 1338,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.109829708992038
+    },
+    {
+      "flight_id": 318,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.6008654169854708
+    },
+    {
+      "flight_id": 2568,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.106898957979865
+    },
+    {
+      "flight_id": 560,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.4843548340140842
+    },
+    {
+      "flight_id": 1978,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 4.229513708007289
+    },
+    {
+      "flight_id": 486,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.6190608339966275
+    },
+    {
+      "flight_id": 470,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.147763874992961
+    },
+    {
+      "flight_id": 2430,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.116669750015717
+    },
+    {
+      "flight_id": 820,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.20332645901362412
+    },
+    {
+      "flight_id": 1836,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.1965964580012951
+    },
+    {
+      "flight_id": 1454,
+      "accepted": false,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.111290375003591
+    },
+    {
+      "flight_id": 2716,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.102584417007165
+    },
+    {
+      "flight_id": 2464,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 1.629553875012789
+    },
+    {
+      "flight_id": 2442,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.108796792017529
+    },
+    {
+      "flight_id": 1970,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.9046677080041263
+    },
+    {
+      "flight_id": 1698,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.102221875014948
+    },
+    {
+      "flight_id": 1558,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 3.9061478750081733
+    },
+    {
+      "flight_id": 1544,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.5200807919900399
+    },
+    {
+      "flight_id": 334,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.123810332996072
+    },
+    {
+      "flight_id": 1336,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.102230624994263
+    },
+    {
+      "flight_id": 1044,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 0.31529650001903065
+    },
+    {
+      "flight_id": 2276,
+      "accepted": true,
+      "complete": false,
+      "reason": "merge_uncertainty",
+      "plan_wall_s": 3.142375916999299
+    },
+    {
+      "flight_id": 2032,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.110532999999123
+    },
+    {
+      "flight_id": 556,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.104438250011299
+    },
+    {
+      "flight_id": 688,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.108976000017719
+    },
+    {
+      "flight_id": 1832,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.105701833002968
+    },
+    {
+      "flight_id": 266,
+      "accepted": true,
+      "complete": false,
+      "reason": "deadline",
+      "plan_wall_s": 5.117627708008513
+    }
+  ],
+  "source_head": "179e8846 + documented CG import migration; frozen source manifest in .agent/zeta-fcfs240-20261118"
+}

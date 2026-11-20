@@ -693,7 +693,8 @@ def test_graph_build_keeps_corridor_and_static_arcs_lazy(monkeypatch):
     # `_static_hop_allowed_roles`, NOT the `_static_hop_forbidden` wrapper: the lazy oracle
     # calls the former directly, so a sentinel on the wrapper can never fire and the guard
     # would pass no matter how eager construction became.
-    monkeypatch.setattr(network_module, "_static_hop_allowed_roles", fail_if_checked)
+    from freespace_sim.planner import route_domain
+    monkeypatch.setattr(route_domain, "_static_hop_allowed_roles", fail_if_checked)
     graph = build_flight_graph(
         req,
         cfg,
@@ -744,7 +745,11 @@ def test_static_catalog_is_shared_without_rebuilding_terminal_cells(monkeypatch)
     assert all(not graph.corridor_cells.is_materialized for graph in graphs)
 
 
-def test_many_far_walls_never_reach_narrow_phase(monkeypatch):
+@pytest.mark.parametrize("planner", ["dp", "zeta"])
+def test_many_far_walls_never_reach_narrow_phase(monkeypatch, planner):
+    """Initial routes must avoid scanning physical conflicts against irrelevant walls."""
+    from freespace_sim.planner.colgen import zeta
+
     cfg = _cfg()
     terminals = tuple(
         (
@@ -767,18 +772,25 @@ def test_many_far_walls_never_reach_narrow_phase(monkeypatch):
         ColGenParams(max_air_overrun_hops=2),
     )
     calls = 0
-    original_conflict = network_module.volumes_conflict
+    import importlib
+    module = importlib.import_module(
+        "freespace_sim.planner.route_domain" if planner == "dp"
+        else "freespace_sim.planner.zeta.search")
+    original_conflict = module.volumes_conflict
 
     def count_conflicts(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original_conflict(*args, **kwargs)
 
-    monkeypatch.setattr(network_module, "volumes_conflict", count_conflicts)
+    monkeypatch.setattr(module, "volumes_conflict", count_conflicts)
 
-    seed = seed_column(graph, cfg)
+    if planner == "dp":
+        seeds = (seed_column(graph, cfg),)
+    else:
+        seeds = zeta.ZetaGraph(graph, cfg, RowIndex()).seed_columns(ColGenParams())
 
-    assert seed.claims
+    assert seeds and all(seed.claims for seed in seeds)
     assert calls == 0
     assert catalog.wall_index.stats["queries"] > 0
     assert catalog.wall_index.stats["candidates"] == 0

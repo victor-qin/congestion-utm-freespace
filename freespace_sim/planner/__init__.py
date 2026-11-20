@@ -75,15 +75,14 @@ def uses_hex_lattice(name: str) -> bool:
     each grow their own incomplete string check when a lattice-planner family is registered.
     """
     return any(name == family or name.startswith(f"{family}_")
-               for family in ("astar", "sipp", "colgen"))
+               for family in ("astar", "sipp", "zeta", "colgen"))
 
 
 def get_planner(name: str, params=None) -> Planner:
     """Resolve a planner registry name to a fresh planner instance, wrapped for round trips.
 
-    Only ``colgen`` accepts a ``params`` object today, so passing one for any other name raises
-    rather than being silently dropped — a dropped solver budget looks like a converged run, not an
-    error.
+    The ``colgen`` and ``zeta`` planners accept their own ``params`` objects. Other
+    registry entries raise when given a params object.
 
     Every per-flight planner is wrapped in :class:`~.itinerary.ItineraryPlanner`, which composes a
     ``return_to_origin`` request into one intent covering both legs and the pad between them. The
@@ -94,12 +93,12 @@ def get_planner(name: str, params=None) -> Planner:
     Parameters
     ------------
     - name (str): registry name (e.g. ``"astar"``, ``"astar_shortcut"``, ``"colgen"``).
-    - params: planner config (a :class:`~.colgen.ColGenParams` for ``colgen``), else ``None``.
+    - params: planner config for ``colgen`` or ``zeta``, else ``None``.
 
     Return
     --------
     - output (Planner): the resolved planner; raises ``ValueError`` on an unknown name or on a
-      ``params`` object passed for a non-``colgen`` planner.
+      ``params`` object passed for a planner that does not accept it.
     """
     inner = _get_planner(name, params)
     if name in WHOLE_SCHEDULE_PLANNERS:
@@ -110,7 +109,7 @@ def get_planner(name: str, params=None) -> Planner:
 
 
 def _get_planner(name: str, params=None) -> Planner:
-    if params is not None and name != "colgen":
+    if params is not None and name not in {"colgen", "zeta"}:
         raise ValueError(f"planner {name!r} takes no params object (got {type(params).__name__})")
     if name == "straight":
         from .straight import StraightLineTimeShift
@@ -173,4 +172,8 @@ def _get_planner(name: str, params=None) -> Planner:
         # Whole-schedule, not per-flight: `plan` refuses the FCFS protocol and `sim.run`
         # routes this planner to `colgen.run_batch` instead. See `plans_whole_schedule`.
         return ColumnGenerationPlanner(params)
+    if name == "zeta":
+        from .zeta.planner import ZetaPlanner
+
+        return ZetaPlanner(params)
     raise ValueError(f"unknown planner: {name!r}")

@@ -13,6 +13,8 @@ intents are obstacles the newcomer must avoid; the ledger never mutates them.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import numpy as np
 
 from .config import SimConfig
@@ -465,6 +467,40 @@ class ReservationLedger:
         """The set of committed flight_ids that block ``volumes`` (for reroute targeting). Excludes the
         static-wall sentinel (a permanent terminal wall owns no flight and cannot be a reroute target)."""
         return {fid for fid, _ in self.conflicts(volumes) if fid != self.STATIC_WALL_FID}
+
+    def committed_near(
+        self, xy_boxes: Iterable[tuple[float, float, float, float]], t_start: float, t_end: float,
+    ) -> list[tuple[int, Volume4D]]:
+        """Live committed volumes that may touch any xy box during ``[t_start, t_end]``.
+
+        Reads the (step, xy-cell) buckets instead of every committed volume, so the cost follows
+        local traffic rather than ledger size. The result is a SUPERSET: every live volume whose
+        xy-AABB meets a box and whose time window meets the interval is returned (a volume is
+        bucketed in every step and cell its AABB spans), plus others sharing a coarse bucket.
+
+        Parameters
+        ------------
+        - xy_boxes (Iterable[tuple[float, float, float, float]]): ``(xmin, ymin, xmax, ymax)``.
+        - t_start (float): earliest instant of interest (s).
+        - t_end (float): latest instant of interest (s).
+
+        Return
+        --------
+        - output (list[tuple[int, Volume4D]]): ``(flight_id, volume)`` pairs in commit order;
+          tombstoned volumes are skipped.
+        """
+        cells = set()
+        for xmin, ymin, xmax, ymax in xy_boxes:
+            cells.update(_xy_cell_span((xmin, ymin, 0.0, xmax, ymax, 0.0), _DYNAMIC_GRID_CELL_M))
+        first = int(np.floor(t_start / self.cfg.dt_s))
+        last = int(np.floor(t_end / self.cfg.dt_s))
+        seen: set[int] = set()
+        buckets = self._buckets
+        for step in range(first, last + 1):
+            for cx, cy in cells:
+                seen.update(buckets.get((step, cx, cy), ()))
+        tomb = self.TOMBSTONE_FID
+        return [(self._fids[i], self._vols[i]) for i in sorted(seen) if self._fids[i] != tomb]
 
     def iter_committed(self):
         """Yield every committed (flight_id, Volume4D) — used by verify and viz. Tombstoned entries

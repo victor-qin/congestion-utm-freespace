@@ -2,6 +2,25 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-19T14:30Z [CODE/TOOL] A one-time build must not run inside a per-leg deadline. With the
+  native Zeta loop as the default, a cold Cython build (~8 s) under a shorter `time_limit_s` was
+  killed on every leg and cached nothing, so EVERY leg was denied as `deadline` (reproduced: 4/4
+  denied at 2 s with an empty `ZETA_LOOP_CACHE_DIR`). `ZetaPlanner.plan` now prepares the loop
+  before starting the leg clock. The converse also bit: `ColGenSolver.solve` ran its entry
+  `gc.collect()` before starting its clock, so the time limit excluded it and the round-IP deadline
+  test failed in the full suite on a busy machine; the clock now starts first. Files:
+  `freespace_sim/planner/zeta/{planner,native}.py`, `freespace_sim/planner/colgen/solver.py`,
+  `tests/test_zeta_planner.py`, `tests/test_colgen_iteration_ip.py`.
+
+- 2026-11-18T02:10Z [CODE/TOOL] Zeta's variable-duration links cannot reuse production DP's
+  hop-derived clock/length or fixed recent-hop history. Preserve exact arrival times, both length
+  accumulations, endpoint/context roles and the union of buffered reservation rows. Native group
+  IDs do not permit collapsing different paid histories; signed paid-set partitions are local
+  to one frozen dual vector. A spatial forward sweep interrupted inside an expansion must retain
+  the active parent's lower floor as well as every pending waypoint, or it can falsely certify
+  omitted successors. Files: `freespace_sim/planner/zeta/{compact,forward,history,state_index}.py`,
+  `tests/test_zeta_search.py`.
+
 - 2026-11-12T02:10Z [TOOL] `terminal_airspace_always_active` is not only a wall switch: hub placement
   reject-samples on the wall extent and the demand drops customers inside foreign walls, both keyed on
   the flag. Flipping it on density_faa moved 119/182 hubs and left 0 of 2,318 requests in common, so an

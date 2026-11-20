@@ -351,6 +351,10 @@ def _check_anyangle_completion_bounds(
                if graph.options.lattice_distance_bound else None)
     bounds = CompletionBounds.build(graph, prices, model)
     assert set(bounds.names) == set(graph.options.completion_bounds)
+    # The compiled id path must reproduce every interpreted floor bit for bit.
+    table_rows = tuple(sorted(prices, key=repr))
+    table_ids = {row: index for index, row in enumerate(table_rows)}
+    bounds.bind(table_rows)
     relaxed_cells, outgoing = geometry(graph, prices)
     relaxed_ids = {cell: index for index, cell in enumerate(relaxed_cells)}
     relaxed_edges = {(source, edge.target): edge for source, group in enumerate(outgoing)
@@ -405,12 +409,30 @@ def _check_anyangle_completion_bounds(
                 assert physical <= column.delay_s + 1e-9
                 assert physical + positive + negative <= actual + 1e-9
             for retained in (paid, live):
+                ids = np.asarray(sorted(table_ids[row] for row in retained), dtype=np.int64)
+                terminal = index == len(column.cell_path) - 1
                 for name, bound in zip(bounds.names, bounds.components, strict=True):
                     value = bound.floor(cell, goal, stamp, length, positive, ground,
-                                        negative, fold, retained,
-                                        terminal=index == len(column.cell_path) - 1)
+                                        negative, fold, retained, terminal=terminal)
                     assert value <= actual + 1e-9, (name, column, index, value, actual)
                     strongest[name] = max(strongest[name], value - ground - positive - negative)
+                    if hasattr(bound, "floor_ids"):
+                        compiled = bound.floor_ids(cell, goal, stamp, length, positive, ground,
+                                                   negative, fold, ids, terminal)
+                        assert compiled == value, (name, compiled, value)
+                assert bounds.floor_ids(cell, goal, stamp, length, positive, ground, negative,
+                                        fold, ids, terminal) == bounds.floor(
+                    cell, goal, stamp, length, positive, ground, negative, fold, retained,
+                    terminal)
+            # Paid destination rows exercise the compiled discount (a prefix rarely holds one).
+            for bound in bounds.components:
+                destination = getattr(bound, "_slices", {})
+                if destination and index + 1 < len(column.cell_path):
+                    extra = set(paid) | set(destination)
+                    extra_ids = np.asarray(sorted(table_ids[row] for row in extra), dtype=np.int64)
+                    assert bound.floor_ids(cell, goal, stamp, length, positive, ground, negative,
+                                           fold, extra_ids) == bound.floor(
+                        cell, goal, stamp, length, positive, ground, negative, fold, extra)
     expired = CompletionBounds.build(graph, prices, model, deadline=time.perf_counter() - 1.0)
     assert not expired.components
     return strongest
@@ -577,6 +599,8 @@ def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
     ("compiled-radius240-lattice-turn", True, True, False, ()),
     ("compiled-strong-native-history-hex12-forward-lattice-turn", True, True, True, ()),
     ("compiled-turn", True, True, False, ("arrival", "resource", "selected", "crossing")),
+    ("reference-turn", True, True, False, ("arrival",)),
+    ("compiled-turn", True, True, True, ("arrival",)),
 ], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy",
         "reference-pruned-snapped", "compiled-pruned-snapped",
         "compiled-loop-eager", "compiled-loop-pruned-snapped", "arrival-bound",
@@ -589,7 +613,7 @@ def test_anyangle_cancelling_prices_preserve_improvements_and_certificates(
         "lattice-radius240-compact", "lattice-forward-hex12-native", "turn-reference-eager",
         "turn-compact-lazy", "turn-native-strong-history", "turn-hex12-reference",
         "turn-lattice-radius240-compact", "turn-lattice-forward-hex12-native",
-        "turn-all-bounds-compact"])
+        "turn-all-bounds-compact", "turn-arrival-reference", "turn-arrival-native"])
 def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
     objective, forbid, merge, terminal, backend, lazy, prune_snap, compiled_loop, completion_bounds,
 ):

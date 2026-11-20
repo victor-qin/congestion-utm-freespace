@@ -196,6 +196,39 @@ expansions; the forward sweep ran 17 rounds instead of 5, because Zeta stops
 only when a sweep finds nothing, and the cut halved its expansions. Production
 DP does not use price rounding (`context/HISTORY.md`).
 
+## Optional completion bounds
+
+`ZetaOptions.completion_bounds` adds certified lower bounds on the cost a label
+still has to pay; all are off by default. Of the four, `"arrival"` is the one
+that has earned its cost: `"resource"`, `"selected"` and `"crossing"` rebuild
+price tables every LP round and changed no search outcome on the saved calls.
+
+Every completion reserves its destination endpoint at some landing time. From a
+label's clock, its remaining distance and its remaining length budget, the
+arrival bound derives the possible landing window. For each landing-time slice
+it takes the destination prices that landing must pay, minus rows the label has
+already paid, and adds the least air cost of landing that late: a cruising
+aircraft cannot hover, so a later landing needs a longer flight. The cheapest
+slice is added to the label's sunk cost (`context/figures/zeta_arrival_bound.png`).
+The price-independent window geometry is cached on the graph; a new price
+vector only re-sums the destination rows.
+
+The compact and native loops evaluate non-terminal labels with a numba kernel
+over table-row ids (`ArrivalBound.floor_ids`, after `CompletionBounds.bind`
+packs each row's slice once per search). It rounds every operation exactly as
+`ArrivalBound.floor` does, so both return bit-identical values; the tests
+compare them at every prefix of every enumerated route. Terminal labels and the
+reference search use `floor`.
+
+Measured 2026-11-20 on 10 saved hard calls (turn rule on, no price rounding,
+50k-expansion cap): the compiled floor took the arrival arm from 36.2 to 24.4 s
+(forward12) and from 41.2 to 28.2 s (radius240) with identical search outcomes
+(1.35M floor calls compared bit for bit). The bound itself still costs 29-32 %
+more wall than no bound on these mostly capped calls, and turns one capped call
+per mode into a proof. In full column generation on 100 actual flights (turn
+limit and price rounding on, 700k-label cap) the bound halved pricing work:
+813 s instead of 1724 s, with the same LP trajectory, final cost and bound.
+
 ## Comparing fleet policies
 
 ```sh

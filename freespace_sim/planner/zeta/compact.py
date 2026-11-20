@@ -28,9 +28,7 @@ from .search import Cell, ZetaGraph, SearchResult
 from .geometry import volume_spatial_cells
 from .history import PriceHistory as PythonPriceHistory
 from .history_guard import HistoryGuard
-from .price_floor import (
-    prepare_price_floor, price_floor, snap_certificate, snap_prices, snapped_lower_bound,
-)
+from .price_floor import prepare_price_floor, price_floor
 from .kernel import (
     apply_timed_edge, build_successor_scan, evaluate_edge, partition_expired,
     prepare_timed_edge, prepare_windowed_edge, write_label,
@@ -193,27 +191,13 @@ def search_compact(
     if any(not math.isfinite(value) for value in prices.values()):
         raise ValueError("row prices must be finite")
     forbidden_rows = frozenset(RowKey(row) for row in forbidden_rows)
-    # Labels, floors and histories see only the search vector; incumbents use both.
-    exact_prices, snap = prices, None
-    if graph.options.price_snap:
-        prices, snap = snap_prices(exact_prices, settings.epsilon)
-        if not snap.rows:
-            prices, snap = exact_prices, None
     negative, price_error = prepare_price_floor(prices.values())
     cfg, fg = graph.cfg, graph.fg
     model = settings.model
     best: float = math.inf
-    reported, reported_cost, reported_improves = None, math.inf, False
-    exact_claim_prices: dict[frozenset[RowKey], float] = {}
     pricing_margin: float = (settings.target_cost or 0.0)
     improvement_tolerance: float = settings.epsilon
     early_return: bool = graph.options.early_return and settings.target_cost is not None
-    # Prefixes at or above ``limit`` are discarded: the incumbent, or also the pricing target
-    # under target_cutoff. Withheld negative prices can lower a route by at most their total,
-    # so the snapped-space target is raised by it; finish() re-derives the full-price bound.
-    cut: float = (pricing_margin - (0.0 if snap is None else snap.negative_mass)
-                  if early_return and graph.options.target_cutoff else math.inf)
-    limit: float = cut
     incumbent = None
     known_canonical: set[Route] = set()
     claim_prices: dict[frozenset[RowKey], float] = {}
@@ -272,12 +256,6 @@ def search_compact(
         if graph.options.expire_history or graph.options.history_dominance else None
     )
     history_guard = HistoryGuard(graph, model, prices) if graph.options.strong_history_dominance else None
-    # A guarded merge leaves at most its endpoint margin unproven. Keeping that band above
-    # the cut lets exhausting below it certify whenever the uncut search would.
-    if math.isfinite(cut) and history_guard is not None and graph.options.history_dominance:
-        cut += max((m for oi, *_ in graph.origins for di, _ in graph.destinations
-                    if (m := history_guard.margin(oi, di)) is not None), default=0.0)
-        limit = cut
     merge_shorter = (graph.options.merge_shorter_histories
                      and math.isfinite(model.air_weight) and model.air_weight >= 0.0)
     row_ends = np.asarray([(row.step + 1) * cfg.dt_s for row in table.rows])
@@ -310,24 +288,17 @@ def search_compact(
 
     def finish(complete: bool, reason: str, floor: float) -> SearchResult:
         """Keep every unexplored scan represented in a minimization frontier bound."""
-        route, cost = (incumbent, best) if snap is None else (reported, reported_cost)
-        raw = snapped_lower_bound(min(best, floor), snap)
-        rc = pricing_margin - cost
-        upper = pricing_margin - raw
+        rc = pricing_margin - best
+        upper = pricing_margin - min(best, floor)
         uncertainty = 0.0 if history is None else history.merge_error_bound
         if uncertainty > 0.0:
             upper = math.nextafter(max(rc, upper) + uncertainty, math.inf)
-            # A bound, not an incumbent: target_cutoff can finish with no route found.
-            if complete and math.isfinite(raw):
+            if complete and math.isfinite(rc):
                 complete = early_return and upper <= improvement_tolerance
                 reason = "no_improvement" if complete else "merge_uncertainty"
-        if snap is not None:
-            complete, reason = snap_certificate(
-                complete, reason, raw, cost, upper, settings.target_cost,
-                improvement_tolerance, tol, reported_improves)
-        return SearchResult(route, cost,
-                                 (math.nextafter(raw - uncertainty, -math.inf)
-                                  if uncertainty > 0 else raw), complete, reason,
+        return SearchResult(incumbent, best,
+                                 (math.nextafter(min(best, floor) - uncertainty, -math.inf)
+                                  if uncertainty > 0 else min(best, floor)), complete, reason,
                                  expanded, generated, time.perf_counter() - started,
                                  edge_evaluations, successor_pops,
                                  0 if history is None else history.pruned, expired_rows,
@@ -348,17 +319,13 @@ def search_compact(
                                  topology_setup_s=topology_setup_s,
                                  incumbent_setup_s=incumbent_setup_s,
                                  dp_waypoints=0 if frontier is None else frontier.visited,
-                                 dp_peak_pending=0 if frontier is None else frontier.peak_pending, raw_lower_bound=raw,
+                                 dp_peak_pending=0 if frontier is None else frontier.peak_pending, raw_lower_bound=min(best, floor),
                                  turn_rejected=turn_rejected, waypoint_states=node_marks.count(1),
-                                 heading_states=state_marks.count(1),
-                                 snapped_rows=0 if snap is None else snap.rows,
-                                 snapped_positive_mass=0.0 if snap is None else snap.positive_mass,
-                                 snapped_negative_mass=0.0 if snap is None else snap.negative_mass)
+                                 heading_states=state_marks.count(1))
 
     def accept(column: Route, *, known: bool = False) -> None:
         """Use only canonical full-volume coefficients to update the feasible cutoff."""
-        nonlocal best, incumbent, early_candidate_ready, limit
-        nonlocal reported, reported_cost, reported_improves
+        nonlocal best, incumbent, early_candidate_ready
         canonical = graph.canonical_route(column, model)
         if canonical is None or not canonical.claims.isdisjoint(forbidden_rows):
             return
@@ -371,26 +338,8 @@ def search_compact(
                          else math.fsum(prices.get(row, 0.0) for row in canonical.claims))
             claim_prices[canonical.claims] = dual_cost
         value = canonical.physical_cost + dual_cost
-        if snap is not None:
-            # The search cutoff stays snapped; reporting and early exits use full prices.
-            exact_cost = exact_claim_prices.get(canonical.claims)
-            if exact_cost is None:
-                exact_cost = math.fsum(exact_prices.get(row, 0.0) for row in canonical.claims)
-                exact_claim_prices[canonical.claims] = exact_cost
-            exact_value = canonical.physical_cost + exact_cost
-            if exact_value < reported_cost:
-                reported, reported_cost = canonical, exact_value
-                reported_improves = (pricing_margin - exact_value > settings.epsilon
-                                     and settings.accepts(canonical.physical_cost, exact_cost))
-                early_candidate_ready = (early_return and reported_improves
-                                         and canonical not in known_canonical)
-            if value < best:
-                best, incumbent = value, canonical
-                limit = min(best, cut)
-            return
         if value < best:
             best, incumbent = value, canonical
-            limit = min(best, cut)
             # Both associations must pass epsilon, or the driver could reject an early exit.
             early_candidate_ready = (early_return
                                      and canonical not in known_canonical
@@ -441,7 +390,7 @@ def search_compact(
                 contexts[context][4], negative, contexts[context][5],
                 (table.rows[int(row)] for row in paid), terminal,
             ))
-            if floor >= limit:
+            if floor >= best:
                 bound_pruned += 1
                 return
         key = None
@@ -558,11 +507,11 @@ def search_compact(
                 indices, floors = build_successor_scan(
                     *target_arrays[key], length, positive, labels.floors[label], ground,
                     math.nan if fold is None else fold, graph.reference, model.air_weight,
-                    cfg.nominal_speed_mps, negative, tol, graph.max_length, limit, price_error,
+                    cfg.nominal_speed_mps, negative, tol, graph.max_length, best, price_error,
                 )
                 scans[label] = entries, indices, floors
             _entries, _indices, floors = scans[label]
-            if start < len(floors) and floors[start] < limit:
+            if start < len(floors) and floors[start] < best:
                 heapq.heappush(heap, (float(floors[start]), next(serial), 1, label, start))
             else:
                 del scans[label]
@@ -574,14 +523,14 @@ def search_compact(
                 lower = length + distance
                 if lower + remaining <= graph.max_length + 1e-7:
                     floor = max(labels.floors[label], bound(context, lower, remaining, positive))
-                    if floor < limit:
+                    if floor < best:
                         candidates.append((floor, entry))
             # Sort actual floating bounds rather than algebraically equivalent geometric sums.
             scans[label] = tuple(sorted(candidates, key=lambda candidate: candidate[0]))
         entries = scans[label]
         for index in range(start, len(entries)):
             floor, _entry = entries[index]
-            if floor < limit:
+            if floor < best:
                 heapq.heappush(heap, (floor, next(serial), 1, label, index))
                 return
         del scans[label]
@@ -638,7 +587,7 @@ def search_compact(
         lower = length + distance
         if lower + remaining > graph.max_length + 1e-7:
             return
-        if max(labels.floors[label], bound(context, lower, remaining, positive)) >= limit:
+        if max(labels.floors[label], bound(context, lower, remaining, positive)) >= best:
             return
         goal = contexts[context][3]
         roles = (False,)
@@ -708,7 +657,7 @@ def search_compact(
                 continue
             child_positive = positive + added
             floor = max(labels.floors[label], bound(context, child_length, remaining, child_positive))
-            if floor >= limit:
+            if floor >= best:
                 continue
             sequence_key = sequence, node, target, first, terminal
             child_sequence = sequence_cache.get(sequence_key)
@@ -771,7 +720,7 @@ def search_compact(
                 return finish(False, "deadline", global_floor)
             ground = model.ground_weight * ((dep - fg.base_step) * cfg.dt_s)
             # Even granting every negative row price cannot rescue this or a later departure.
-            if price_floor(ground, 0.0, negative, price_error, tol) >= limit:
+            if price_floor(ground, 0.0, negative, price_error, tol) >= best:
                 break
             origin_rows = graph.rows(graph.endpoint(True, dep * cfg.dt_s))
             if not origin_rows.isdisjoint(forbidden_rows):
@@ -788,7 +737,7 @@ def search_compact(
                     remaining = (math.dist(graph.point(start), graph.point(goal))
                                  if lattice_bound is None else lattice_bound.remaining(start, goal))
                     floor = bound(context, 0.0, remaining, positive)
-                    if floor < limit:
+                    if floor < best:
                         enqueue(cell_ids[start], -1, context, paid, 0, False, True,
                                 stamp, 0.0, positive, floor)
                         if graph.options.max_labels is not None and generated >= graph.options.max_labels:
@@ -803,12 +752,9 @@ def search_compact(
             floor = frontier.floor if forward_dp else heap[0][0]
             if floor >= best - tol:
                 return finish(True, "optimal", min(best, floor))
-            if floor >= limit:
-                # Every remaining prefix reaches the pricing target (target_cutoff).
-                break
             # All departure roots and deferred continuations are represented in this bound.
             uncertainty = 0.0 if history is None else history.merge_error_bound
-            certified_upper = pricing_margin - snapped_lower_bound(min(best, floor), snap)
+            certified_upper = pricing_margin - min(best, floor)
             if uncertainty > 0.0:
                 certified_upper = math.nextafter(certified_upper + uncertainty, math.inf)
             if early_return and certified_upper <= improvement_tolerance:
@@ -825,7 +771,7 @@ def search_compact(
             if forward_dp:
                 label_floor, label = frontier.pop()
                 active_floor = label_floor
-                if ((history is not None and label in history.dead) or label_floor >= limit):
+                if ((history is not None and label in history.dead) or label_floor >= best):
                     continue
                 kind = index = 0
             else:
@@ -868,9 +814,6 @@ def search_compact(
             else:
                 for entry in targets(label):
                     expand(label, entry)
-        if best > limit:
-            # Exhausted below the target: nothing improves, but the incumbent is not proven optimal.
-            return finish(True, "no_improvement", limit)
         return finish(True, "optimal" if incumbent else "infeasible", best)
     except ForwardLimit as stopped:
         # The active parent covers every child omitted by an interrupted successor batch.

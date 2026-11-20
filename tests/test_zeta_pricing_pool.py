@@ -186,10 +186,7 @@ def _zeta_pool_case(
     (False, False, True, True, "lattice-indexed", True, True, True, True),
     (False, False, True, True, "forward_dp-indexed", True, True, True, True),
     (True, True, True, True, "forward_dp-indexed", True, True, True, True),
-    (False, False, True, True, "merge-snap", True, True, True, True),
-    (False, True, False, True, "merge-snap", False, True, True, False),
-    (True, True, True, True, "forward_dp-snap", True, True, True, True),
-], ids=['exact-best-column', 'work-cap-best-column', 'exact-early-column', 'work-cap-early-column', 'compiled-loop-early-column', 'compiled-loop-work-cap', 'shared-native-exact', 'shared-compact-early', 'shared-native-cap', 'strong-native-exact', 'strong-compact-early', 'strong-native-cap', 'compiled-history-exact', 'compiled-history-early', 'compiled-history-cap', 'skip-groups-native-exact', 'skip-groups-compact-early', 'skip-groups-native-cap', 'route-coverage-native-exact', 'route-coverage-compact-early', 'route-coverage-native-cap', 'compiled-coverage-exact', 'compiled-coverage-early', 'compiled-coverage-cap', 'all-native-early', 'all-native-cap', 'merged-native-exact', 'merged-native-cap', 'merged-compact-early', 'lattice-native-exact', 'lattice-native-cap', 'shorter-native-exact', 'forward-dp-exact', 'forward-dp-cap', 'shorter-compact-cap', 'indexed-full-exact', 'indexed-radius-exact', 'indexed-forward-dp-exact', 'indexed-forward-dp-cap', 'snap-merged-native-exact', 'snap-merged-compact-early', 'snap-forward-dp-cap'])
+], ids=['exact-best-column', 'work-cap-best-column', 'exact-early-column', 'work-cap-early-column', 'compiled-loop-early-column', 'compiled-loop-work-cap', 'shared-native-exact', 'shared-compact-early', 'shared-native-cap', 'strong-native-exact', 'strong-compact-early', 'strong-native-cap', 'compiled-history-exact', 'compiled-history-early', 'compiled-history-cap', 'skip-groups-native-exact', 'skip-groups-compact-early', 'skip-groups-native-cap', 'route-coverage-native-exact', 'route-coverage-compact-early', 'route-coverage-native-cap', 'compiled-coverage-exact', 'compiled-coverage-early', 'compiled-coverage-cap', 'all-native-early', 'all-native-cap', 'merged-native-exact', 'merged-native-cap', 'merged-compact-early', 'lattice-native-exact', 'lattice-native-cap', 'shorter-native-exact', 'forward-dp-exact', 'forward-dp-cap', 'shorter-compact-cap', 'indexed-full-exact', 'indexed-radius-exact', 'indexed-forward-dp-exact', 'indexed-forward-dp-cap'])
 @pytest.mark.parametrize("completion_bounds", [(), ("arrival", "resource", "selected", "crossing")])
 def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
     capped, early_return, compiled_loop, shared_cache, strong_history, compiled_history,
@@ -201,9 +198,6 @@ def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
         pytest.importorskip("Cython")
     from freespace_sim.planner.colgen.zeta_pool import ZetaPricingPool, build_seed_columns
 
-    price_snap = isinstance(strong_history, str) and strong_history.endswith("-snap")
-    if price_snap:
-        strong_history = strong_history.removesuffix("-snap")
     native_state_index = isinstance(strong_history, str) and strong_history.endswith("-indexed")
     if native_state_index:
         strong_history = strong_history.removesuffix("-indexed")
@@ -237,9 +231,6 @@ def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
     if native_state_index:
         for graph in graphs.values():
             graph.options = replace(graph.options, native_state_index=True)
-    if price_snap:
-        for graph in graphs.values():
-            graph.options = replace(graph.options, price_snap=True)
     serial_graphs = {
         fid: type(graph)(graph.fg, graph.cfg, graph.row_index,
                          replace(graph.options, native_state_index=False))
@@ -256,10 +247,6 @@ def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
     known = {fid: result.columns for fid, result in expected_seeds}
     rows = sorted({row for columns in known.values() for column in columns for row in column.claims})
     prices = {row: (-0.25, 0.5, 3.0)[index % 3] for index, row in enumerate(rows)}
-    if price_snap:
-        # LP-like noise on every fourth row; workers must withhold exactly what serial does.
-        prices = {row: (2e-9 if index % 4 == 0 else value)
-                  for index, (row, value) in enumerate(prices.items())}
     block = max(known[3][0].claims)
     flights = {3: 7.25, 9: 19.5}
     if early_return:
@@ -314,8 +301,6 @@ def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
                            or ((merge_equivalent or merge_shorter) and result.reason == "merge_uncertainty"
                                and result.merge_error_bound > 0.0 and not result.complete)
                            for _fid, result in sweep.results)
-            if price_snap and duals is not shorter_prices:
-                assert all(result.snapped_rows > 0 for _fid, result in sweep.results)
             if duals is shorter_prices and not completion_bounds:
                 assert any(result.shorter_histories_merged > 0 for _fid, result in sweep.results)
             for fid, result in sweep.results:

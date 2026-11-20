@@ -42,6 +42,26 @@ cdef extern from *:
     unsigned long long _zeta_state_mix(unsigned long long first, unsigned long long second) noexcept
 
 
+# C twin of price_floor.price_floor, bound to that name only inside the compiled module
+# (native.py). It must stay operation-for-operation identical: callers rely on bit parity.
+cdef extern from *:
+    """
+    #include <math.h>
+    static double _zeta_price_floor(double cost, double positive, double negative,
+                                    double error, double tolerance) {
+        if (!isfinite(cost) || !isfinite(positive) || !isfinite(negative) || !isfinite(error))
+            return -INFINITY;
+        double credit = nextafter(positive + negative, -INFINITY);
+        credit = nextafter(credit - error, -INFINITY);
+        double value = nextafter(cost + credit, -INFINITY);
+        return nextafter(value - tolerance, -INFINITY);
+    }
+    """
+    double _zeta_price_floor(
+        double cost, double positive, double negative, double error, double tolerance,
+    ) noexcept
+
+
 cdef class _StateIndex:
     cdef public Py_ssize_t size
     cdef long long[::1] slots

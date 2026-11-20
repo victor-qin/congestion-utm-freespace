@@ -252,8 +252,24 @@ def _anyangle_history_type(compiled_history: bool) -> type:
     [1e308, 1e308, -1e308, -1e308, 10.0], [],
 ])
 def test_anyangle_price_floor_covers_partial_signed_unions(values: list[float]) -> None:
-    """Prefix bounds cover complete unions across cancellation, subnormals and overflow."""
+    """Prefix bounds cover complete unions across cancellation, subnormals and overflow.
+
+    The compiled search loop's C twin of the floor must return bit-identical values.
+    """
     from freespace_sim.planner.zeta.price_floor import prepare_price_floor, price_floor
+
+    compiled_floor = None
+    try:
+        import Cython  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        import sys
+
+        from freespace_sim.planner.zeta.native import prepare_compiled_loop
+
+        compiled_floor = sys.modules[prepare_compiled_loop()[0]].price_floor
+        assert compiled_floor is not price_floor
 
     negative, error = prepare_price_floor(values)
     for ordered in (values, list(reversed(values)), sorted(values, key=abs)):
@@ -275,8 +291,14 @@ def test_anyangle_price_floor_covers_partial_signed_unions(values: list[float]) 
                     except OverflowError:
                         continue
                     for physical in (0.0, 0.25, 1e17):
-                        assert price_floor(physical, positive, negative, error, 0.0) <= (
-                            physical + canonical_price)
+                        floor = price_floor(physical, positive, negative, error, 0.0)
+                        assert floor <= physical + canonical_price
+                        for tolerance in (0.0, 1e-7):
+                            if compiled_floor is not None:
+                                assert compiled_floor(
+                                    physical, positive, negative, error, tolerance,
+                                ).hex() == price_floor(
+                                    physical, positive, negative, error, tolerance).hex()
 
 
 @pytest.mark.parametrize("backend,traversal,lazy,native,forward,mode", [

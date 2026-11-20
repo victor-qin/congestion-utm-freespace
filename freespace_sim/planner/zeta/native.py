@@ -68,6 +68,18 @@ def _run(command: list[str], deadline: float | None) -> str:
     return stdout
 
 
+# Compiled module only: rebinds the loop's price floor (imported from price_floor.py) to the
+# libm twin declared in compact.pxd, so each call avoids four interpreted math.nextafter calls.
+_COMPILED_PRICE_FLOOR = b"""
+
+
+def price_floor(cost: float, positive: float, negative: float, error: float,
+                tolerance: float) -> float:
+    '''Return the C floor with the reference operation order and rounding.'''
+    return _zeta_price_floor(cost, positive, negative, error, tolerance)
+"""
+
+
 def _load(deadline: float | None) -> tuple[Callable, tuple[str, str]]:
     """Build or load this source's extension without changing the interpreted control.
 
@@ -96,7 +108,7 @@ def _load(deadline: float | None) -> tuple[Callable, tuple[str, str]]:
     combined_source = source + b"\n" + b"\n".join(
         helper.replace(b"from __future__ import annotations\n", b"", 1)
         for helper in (history_source, coverage_source, state_source)
-    )
+    ) + _COMPILED_PRICE_FLOOR
     compiler = shlex.split(os.environ.get("CC", sysconfig.get_config_var("CC") or "cc"))
     flags = ["-O3", "-fno-fast-math", "-ffp-contract=off", "-fno-strict-aliasing"]
     directives = "annotation_typing=True,infer_types=False"
@@ -106,11 +118,12 @@ def _load(deadline: float | None) -> tuple[Callable, tuple[str, str]]:
         "history_source_sha256": hashlib.sha256(history_source).hexdigest(),
         "coverage_source_sha256": hashlib.sha256(coverage_source).hexdigest(),
         "state_source_sha256": hashlib.sha256(state_source).hexdigest(),
+        "floor_source_sha256": hashlib.sha256(_COMPILED_PRICE_FLOOR).hexdigest(),
         "python": sys.version, "abi": sysconfig.get_config_var("SOABI"),
         "platform": sys.platform, "machine": platform.machine(),
         "compiler": compiler, "compiler_version": _run(compiler + ["--version"], deadline),
         "flags": flags, "directives": directives,
-        "package_layout": 5,
+        "package_layout": 6,
     }
     fingerprint = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()[:24]
     short_name = "_zeta_loop_" + fingerprint

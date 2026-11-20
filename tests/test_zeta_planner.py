@@ -1,10 +1,9 @@
 """Standalone Zeta files flights in order and reads the current reservation ledger."""
 
 from dataclasses import replace
-import io
-import pickle
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -14,6 +13,7 @@ from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
 from freespace_sim.planner.route_domain import RowIndex
 from freespace_sim.planner.zeta.geometry import reservation_claims
+from freespace_sim.planner.zeta import planner as zeta_planner
 from freespace_sim.planner.zeta.planner import ZetaPlannerParams
 from freespace_sim.planner.zeta.search import ZetaOptions
 from freespace_sim.sim import run
@@ -37,13 +37,20 @@ def _params() -> ZetaPlannerParams:
     )
 
 
-@pytest.mark.parametrize("domain", ["full480", "radius240", "radius240-native", "hex12", "forward12-native"])
+@pytest.mark.parametrize(
+    "domain", ["full480", "radius240", "radius240-native", "hex12", "forward12-native", "default"],
+)
 def test_zeta_fcfs_files_buffered_routes_in_request_order(domain: str) -> None:
     first = FlightRequest(1, vec(0, 0, 0), vec(480, 0, 0), 0.0)
     second = replace(first, flight_id=2)
     cfg = _config()
     params = _params()
-    if domain != "full480":
+    if domain == "default":
+        # The shipped defaults (tuned pruning on the native loop) must plan the same flights.
+        pytest.importorskip("numba")
+        pytest.importorskip("Cython")
+        params = ZetaPlannerParams(max_air_overrun_hops=0)
+    elif domain != "full480":
         native = domain.endswith("-native")
         radius240 = domain.startswith("radius240")
         if native:
@@ -174,50 +181,23 @@ sys.meta_path.insert(0, NoColgen())
 from freespace_sim.config import SimConfig
 from freespace_sim.ledger import ReservationLedger
 from freespace_sim.planner import get_planner
-from freespace_sim.planner.zeta import ZetaPlannerParams
+from freespace_sim.planner.zeta import ZetaPlannerParams, tuned_options
 from freespace_sim.types import FlightRequest, vec
-from experiments.zeta_prototype import _run_fcfs
+from freespace_sim.planner.zeta.fcfs import run_fcfs
 cfg = SimConfig(flight_levels_m=(100.0,), airspace_ceiling_m=125.0, max_ground_delay_s=0.0)
-planner = get_planner('zeta', ZetaPlannerParams(max_air_overrun_hops=0))
+planner = get_planner('zeta', ZetaPlannerParams(max_air_overrun_hops=0, options=tuned_options(native=False)))
 intent = planner.plan(FlightRequest(1, vec(0,0,0), vec(480,0,0), 0.0), ReservationLedger(cfg), cfg)
 assert intent.accepted
 assert planner.inner.last_result.complete
-routes, intents, stats = _run_fcfs(cfg, [intent.request], (), planner.inner.params)
+routes, intents, stats = run_fcfs(cfg, [intent.request], (), planner.inner.params)
 assert len(routes) == len(intents) == 1 and stats['violated_rows'] == 0
+record, = stats['search_records']
+searched = planner.inner.last_result
+assert record['route_cost_lower_bound'] == searched.lower_bound
+assert record['merge_error_bound'] == searched.merge_error_bound
 assert not any(name.startswith('freespace_sim.planner.colgen') for name in sys.modules)
 """
     subprocess.run([sys.executable, "-c", code], check=True, timeout=30)
-
-
-def test_zeta_archive_migration_preserves_graph_routes_and_claims() -> None:
-    """Old saved graphs require explicit migration and retain their canonical route model."""
-    from experiments.zeta_migrate import load_archive
-    from freespace_sim.planner.colgen.params import ColGenParams
-    from freespace_sim.planner.colgen.zeta import ZetaGraph, price_zeta
-    from freespace_sim.planner.route_domain import build_flight_graph
-
-    cfg = _config(max_ground_delay_s=0.0)
-    params = ColGenParams(max_air_overrun_hops=0)
-    req = FlightRequest(1, vec(0, 0, 0), vec(480, 0, 0), 0.0)
-    graph = ZetaGraph(build_flight_graph(req, cfg, (), params), cfg, RowIndex())
-    seeds = graph.seed_columns(params)
-    original = price_zeta(graph, {}, 0.0, params, known_columns=seeds)
-    current = pickle.dumps((graph, params, seeds), protocol=2)
-    modern = b"freespace_sim.planner.zeta.route_cache\n"
-    legacy = b"freespace_sim.planner.colgen.zeta_route_cache\n"
-    assert modern in current
-    archived = current.replace(modern, legacy)
-    with pytest.raises(ModuleNotFoundError, match="zeta_route_cache"):
-        pickle.loads(archived)
-    restored, restored_params, restored_seeds = load_archive(io.BytesIO(archived))
-    assert restored.seed_columns(restored_params) == seeds == restored_seeds
-    migrated = pickle.dumps((restored, restored_params, restored_seeds), protocol=2)
-    assert legacy not in migrated
-    restored, restored_params, restored_seeds = pickle.loads(migrated)
-    result = price_zeta(restored, {}, 0.0, restored_params, known_columns=restored_seeds)
-    assert result.complete and result.column == original.column
-    assert result.column.claims == original.column.claims
-    assert result.reduced_cost == original.reduced_cost
 
 
 def test_zeta_rejects_unwrapped_itinerary_and_reports_preparation_deadline() -> None:
@@ -247,3 +227,129 @@ def test_shared_zeta_rejects_weights_that_invalidate_distance_bounds(weight: flo
     for model in (CostModel(weight, 1.0), CostModel(1.0, weight)):
         with pytest.raises(ValueError, match="finite and positive"):
             SearchSettings(model=model)
+
+
+def test_zeta_reads_only_reservations_its_routes_could_touch(monkeypatch) -> None:
+    """Far-away and long-finished filings change no claimable row, plan or preparation work."""
+    from freespace_sim.planner.route_cost import cost_model
+    from freespace_sim.planner.route_domain import StaticTerminalCatalog, build_flight_graph
+    from freespace_sim.planner.zeta import SearchSettings, ZetaGraph, search
+    from freespace_sim.planner.zeta import planner as zeta_planner
+
+    cfg = _config()
+    params = _params()
+    planner = get_planner("zeta", params)
+    request = FlightRequest(9, vec(0, 0, 0), vec(480, 0, 0), 4000.0)
+
+    def file(ledger: ReservationLedger, flight_id: int, dx: float, t_departure: float) -> None:
+        """Plan and commit one leg parallel to ``request``, shifted by ``dx`` metres."""
+        leg = FlightRequest(flight_id, vec(dx, 0, 0), vec(dx + 480, 0, 0), t_departure)
+        intent = planner.plan(leg, ledger, cfg)
+        assert intent.accepted
+        ledger.commit(flight_id, intent.volumes)
+
+    clean, noisy = ReservationLedger(cfg), ReservationLedger(cfg)
+    for ledger in (clean, noisy):
+        file(ledger, 1, 0.0, request.t_departure)   # occupies the leg's own corridor
+    for k in range(12):
+        file(noisy, 100 + k, 20_000.0 + 960.0 * k, request.t_departure)   # far away
+        file(noisy, 200 + k, 0.0, 200.0 * k)                              # long finished
+
+    catalog = StaticTerminalCatalog(noisy.static_terminals(), cfg)
+    row_index = RowIndex()
+    graph = ZetaGraph(build_flight_graph(request, cfg, catalog, params), cfg, row_index,
+                      options=params.options)
+    full = zeta_planner._saturated_rows(noisy, cfg, catalog, row_index)
+    scoped = zeta_planner._saturated_rows(noisy, cfg, catalog, row_index,
+                                          scope=zeta_planner._claim_scope(graph))
+    assert scoped <= full
+
+    # Record every row the search tests against the forbidden set.
+    checked: set = set()
+    rows = graph.rows
+    graph.rows = lambda volume: checked.update(found := rows(volume)) or found
+    settings = SearchSettings(model=cost_model(cfg, params))
+    by_full = search(graph, {}, settings, forbidden_rows=full)
+    by_scope = search(graph, {}, settings, forbidden_rows=scoped)
+    checked |= by_full.route.claims
+    assert {row for row in checked if row in full} == {row for row in checked if row in scoped}
+    assert any(row in full for row in checked)
+    assert (by_scope.route, by_scope.priced_cost, by_scope.expanded, by_scope.generated) == (
+        by_full.route, by_full.priced_cost, by_full.expanded, by_full.generated)
+
+    conversions = []
+    convert = zeta_planner.volume_claims
+    monkeypatch.setattr(zeta_planner, "volume_claims",
+                        lambda volume, *args, **kwargs: conversions.append(volume)
+                        or convert(volume, *args, **kwargs))
+    plans = []
+    for ledger in (clean, noisy):
+        conversions.clear()
+        intent = planner.plan(request, ledger, cfg)
+        plans.append((len(conversions), planner.inner.last_result.route, intent.cost,
+                      [(point.tolist(), stamp) for point, stamp in intent.centerline]))
+    assert plans[0] == plans[1]
+    assert plans[1][1].departure_step > graph.fg.base_step
+    assert noisy.n_volumes > 4 * plans[1][0]
+
+
+@pytest.mark.parametrize("setting", [
+    "flight_levels_m", "terminal_airspace_always_active", "fixed_exit_lanes",
+])
+def test_zeta_refuses_unsupported_setups_before_any_work(setting: str, monkeypatch) -> None:
+    """Multi-level worlds, and hub legs without permanent walls or fixed lanes, fail fast."""
+    from experiments.run import _execute, parse_args
+    from freespace_sim.planner.zeta import planner as zeta_planner
+
+    overrides = {"terminal_airspace_always_active": True, "fixed_exit_lanes": True}
+    overrides.update({"flight_levels_m": (85.0, 100.0)} if setting == "flight_levels_m"
+                     else {setting: False})
+    cfg = _config(**overrides)
+    hub = Terminal("hub", capacity=2, radius=180.0)
+    request = FlightRequest(1, vec(0, 0, 0), vec(720, 0, 0), 0.0, origin_terminal=hub)
+
+    def no_work(*args, **kwargs):
+        raise AssertionError("validation must precede graph construction")
+
+    monkeypatch.setattr(zeta_planner, "build_flight_graph", no_work)
+    with pytest.raises(NotImplementedError, match=f"zeta planner.*{setting}"):
+        get_planner("zeta", _params()).plan(request, ReservationLedger(cfg), cfg)
+    if setting == "flight_levels_m":
+        with pytest.raises(NotImplementedError, match="zeta planner.*flight_levels_m"):
+            _execute(parse_args(["--scenario", "metro_uniform", "--planner", "zeta"]))
+
+
+def test_zeta_first_native_build_does_not_spend_a_short_leg_budget(monkeypatch) -> None:
+    """A first native build that outlasts the leg budget must not deny the leg."""
+    pytest.importorskip("numba")
+    pytest.importorskip("Cython")
+    from freespace_sim.planner.zeta import native
+
+    cfg = _config()
+    request = FlightRequest(1, vec(0, 0, 0), vec(480, 0, 0), 0.0)
+    params = ZetaPlannerParams(max_air_overrun_hops=0)
+    # Warm everything else first, so only the native build stands between the leg and its budget.
+    assert get_planner("zeta", params).plan(request, ReservationLedger(cfg), cfg).accepted
+    built = native._LOADED
+
+    def slow_build(deadline):
+        """Stand in for a cold compile: slower than the budget, with the real deadline check."""
+        time.sleep(0.6)
+        native._remaining(deadline)
+        return built
+
+    monkeypatch.setattr(native, "_LOADED", None)
+    monkeypatch.setattr(native, "_load", slow_build)
+    planner = get_planner("zeta", replace(params, time_limit_s=0.5))
+    assert planner.plan(request, ReservationLedger(cfg), cfg).accepted
+
+
+def test_zeta_default_names_the_native_extra_when_cython_is_missing(monkeypatch) -> None:
+    """The native default fails at construction with an install hint; the opt-out still works."""
+    real_find_spec = zeta_planner.importlib.util.find_spec
+    monkeypatch.setattr(zeta_planner.importlib.util, "find_spec",
+                        lambda name, *a: None if name == "Cython" else real_find_spec(name, *a))
+    with pytest.raises(RuntimeError, match="zeta-native"):
+        get_planner("zeta", ZetaPlannerParams())
+    # Opting out keeps the same pruning without the native build.
+    get_planner("zeta", ZetaPlannerParams(options=zeta_planner.tuned_options(native=False)))

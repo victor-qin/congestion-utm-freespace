@@ -75,7 +75,6 @@ class ZetaOptions:
     history_dominance: bool = False
     arrival_snap_s: float = 0.0
     speed_fraction: float = 0.05
-    future_price_bound: bool = False
     compiled_search: bool = True
     timed_cache_bytes: int = 16 * 1024 * 1024
     early_return: bool = False
@@ -89,9 +88,6 @@ class ZetaOptions:
     route_coverage_cache: bool = False
     compiled_route_coverage: bool = False
     connection_mode: str = "full"
-    cheap_connection_mode: str | None = None
-    cheap_max_expansions: int = 5_000
-    cheap_max_labels: int = 25_000
     seed_validation_radius_m: float | None = None
     merge_equivalent_histories: bool = False
     forward_cruise: bool = False
@@ -111,13 +107,6 @@ class ZetaOptions:
             raise ValueError("seed_validation_radius_m must be finite and at least connection_radius_m")
         if self.connection_mode not in ("full", "hex12", "hex12_long"):
             raise ValueError("connection_mode must be 'full', 'hex12' or 'hex12_long'")
-        if self.cheap_connection_mode not in (None, "hex12", "hex12_long"):
-            raise ValueError("cheap_connection_mode must be None, 'hex12' or 'hex12_long'")
-        if self.cheap_connection_mode is not None and self.connection_mode != "full":
-            raise ValueError("cheap_connection_mode requires connection_mode='full'")
-        for name in ("cheap_max_expansions", "cheap_max_labels"):
-            if operator.index(getattr(self, name)) <= 0:
-                raise ValueError(f"{name} must be a positive integer")
         for name in ("max_expansions", "max_labels"):
             value = getattr(self, name)
             if value is not None and operator.index(value) <= 0:
@@ -132,7 +121,7 @@ class ZetaOptions:
             raise ValueError("traversal must be 'best_first' or 'forward_dp'")
         if self.traversal == "forward_dp" and (
             self.backend != "compiled" or not self.forward_cruise
-            or self.connection_mode != "hex12" or self.cheap_connection_mode is not None
+            or self.connection_mode != "hex12"
         ):
             raise ValueError("forward_dp requires compiled backend, forward_cruise and hex12")
         if self.compiled_loop and self.backend != "compiled":
@@ -209,12 +198,6 @@ class SearchResult:
     history_group_replace_skips: int = 0
     route_coverage_hits: int = 0
     route_coverage_misses: int = 0
-    cheap_expanded: int = 0
-    cheap_generated: int = 0
-    cheap_wall_s: float = 0.0
-    full_wall_s: float = 0.0
-    full_calls: int = 0
-    cheap_columns_returned: int = 0
     equivalent_histories_merged: int = 0
     merge_error_bound: float = 0.0
     lattice_bound_calls: int = 0
@@ -619,10 +602,6 @@ def search(
       A threshold discovery can return incomplete. ``no_improvement`` certifies the
       supplied target only; setting target_cost=None seeks the best route.
     """
-    if graph.options.cheap_connection_mode is not None:
-        from .hybrid import price_hybrid
-        return price_hybrid(graph, prices, settings, known_routes=known_routes,
-                            forbidden_rows=forbidden_rows, deadline=deadline)
     if not graph.options.leg_cache and not graph.options.persistent_timing_cache:
         return _search(graph, prices, settings, known_routes=known_routes,
                            forbidden_rows=forbidden_rows, deadline=deadline)
@@ -715,7 +694,6 @@ def _search(
     merge_shorter = (graph.options.merge_shorter_histories
                      and math.isfinite(model.air_weight) and model.air_weight >= 0.0)
     expired_rows = 0
-    future_bound = None
     completion_bounds = None
     lattice_bound = None
     bound_build_s = 0.0
@@ -741,8 +719,7 @@ def _search(
                                  0 if history is None else history.pruned, expired_rows,
                                  0 if history is None else history.comparisons,
                                  bound_build_s,
-                                 (0 if future_bound is None else future_bound.table_states)
-                                 + (0 if completion_bounds is None else completion_bounds.table_states),
+                                 0 if completion_bounds is None else completion_bounds.table_states,
                                  bound_lookups, bound_pruned,
                                  strong_history_pruned=0 if history is None else history.strong_pruned,
                                  history_group_reject_skips=0 if history is None else history.group_reject_skips,
@@ -799,19 +776,6 @@ def _search(
             expired_rows += len(expired)
             label = replace(label, paid=label.paid - expired,
                             retired_charge=label.retired_charge + history.charge(expired))
-        if future_bound is not None:
-            bound_lookups += 1
-            paid_units = sum(future_bound.row_units.get(row, 0) for row in label.paid
-                             if future_bound.row_samples.get(row, -math.inf) > label.stamp)
-            floor = max(floor, future_bound.floor(
-                label.path[-1], label.stamp, label.length, paid_units,
-                label.positive_paid, label.ground_cost, negative,
-            ))
-            if floor >= best:
-                bound_pruned += 1
-                return
-            # A child's completions are a subset of its parent's, including deferred scans.
-            label = replace(label, priced_floor=floor)
         if completion_bounds is not None:
             bound_lookups += 1
             floor = max(floor, completion_bounds.floor(
@@ -822,6 +786,7 @@ def _search(
             if floor >= best:
                 bound_pruned += 1
                 return
+            # A child's completions are a subset of its parent's, including deferred scans.
             label = replace(label, priced_floor=floor)
         if label.fold_m is not None or graph.reference <= 1e-9:
             # Both reduction orders must match the canonical cost and length-budget checks.
@@ -907,11 +872,6 @@ def _search(
         bound_started = time.perf_counter()
         lattice_bound = LatticeDistanceBound.build(graph, model, prices, history_guard,
                                                    deadline=deadline)
-        bound_build_s += time.perf_counter() - bound_started
-    if graph.options.future_price_bound:
-        from .bound import FuturePriceBound
-        bound_started = time.perf_counter()
-        future_bound = FuturePriceBound.build(graph, prices, deadline, air_weight=model.air_weight)
         bound_build_s += time.perf_counter() - bound_started
     if graph.options.completion_bounds:
         from .completion import CompletionBounds

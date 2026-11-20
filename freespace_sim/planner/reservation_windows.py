@@ -334,10 +334,13 @@ def validate_edge_locality(cfg: SimConfig) -> None:
                     continue
                 if volumes_conflict(first, second):
                     raise NotImplementedError(
-                        "colgen visit rows require nonincident lattice edges to be conflict-free; "
-                        f"corridor_width_m={cfg.corridor_width_m:g} and pitch={pitch:g} violate "
-                        f"that invariant on {tuple(first_endpoints)} vs {tuple(endpoints)}. "
-                        "Hex sizing from corridor geometry is tracked in GitHub issue #72."
+                        f"corridor_width_m={cfg.corridor_width_m:g} is too wide for the hex "
+                        f"spacing pitch={pitch:g} m (nominal_speed_mps * dt_s): hops "
+                        f"{tuple(first_endpoints)} and {tuple(endpoints)} share no hex but "
+                        "overlap, so capacity rows on visited hexes would miss the conflict. "
+                        "Use a narrower corridor or a longer dt_s; nonincident lattice edges "
+                        "must stay conflict-free until hex sizing follows corridor geometry "
+                        "(GitHub issue #72)."
                     )
 
 

@@ -254,11 +254,8 @@ def search_compact(
                      and math.isfinite(model.air_weight) and model.air_weight >= 0.0)
     row_ends = np.asarray([(row.step + 1) * cfg.dt_s for row in table.rows])
     expired_rows = 0
-    future_bound = None
     completion_bounds = None
     lattice_bound = None
-    bound_row_units = None
-    bound_row_samples = None
     bound_build_s = 0.0
     bound_lookups = bound_pruned = 0
     contexts: list[tuple[int, int | None, int | None, Cell, float, float | None]] = []
@@ -300,8 +297,7 @@ def search_compact(
                                  0 if history is None else history.pruned, expired_rows,
                                  0 if history is None else history.comparisons,
                                  bound_build_s,
-                                 (0 if future_bound is None else future_bound.table_states)
-                                 + (0 if completion_bounds is None else completion_bounds.table_states),
+                                 0 if completion_bounds is None else completion_bounds.table_states,
                                  bound_lookups, bound_pruned,
                                  cache_hits, cache_misses, cache_peak,
                                  strong_history_pruned=0 if history is None else history.strong_pruned,
@@ -378,15 +374,6 @@ def search_compact(
                 expired_rows += int(np.count_nonzero(expired))
                 retired += history.charge(paid[expired].tolist())
                 paid = paid[~expired]
-        if future_bound is not None:
-            bound_lookups += 1
-            paid_units = future_paid_units(paid, bound_row_units, bound_row_samples, stamp)
-            floor = max(floor, future_bound.floor(
-                cells[node], stamp, length, paid_units, positive, contexts[context][4], negative,
-            ))
-            if floor >= best:
-                bound_pruned += 1
-                return
         if completion_bounds is not None:
             bound_lookups += 1
             floor = max(floor, completion_bounds.floor(
@@ -435,7 +422,7 @@ def search_compact(
             seen.add(exact)
         label = labels.add(node, parent, context, paid_id, sequence, terminal, first,
                            stamp, length, positive, canonical_length, retired,
-                           floor if future_bound is not None or completion_bounds is not None else -math.inf)
+                           floor if completion_bounds is not None else -math.inf)
         if forward_dp:
             frontier.add(node, label, floor)
         else:
@@ -685,16 +672,6 @@ def search_compact(
             lattice_bound = LatticeDistanceBound.build(graph, model, prices, history_guard,
                                                        deadline=deadline)
             bound_build_s += time.perf_counter() - bound_started
-        if graph.options.future_price_bound:
-            from .bound import FuturePriceBound, future_paid_units
-            bound_started = time.perf_counter()
-            future_bound = FuturePriceBound.build(graph, prices, deadline, air_weight=model.air_weight)
-            bound_build_s += time.perf_counter() - bound_started
-            if future_bound is not None:
-                bound_row_units = np.asarray([future_bound.row_units.get(row, 0) for row in table.rows],
-                                             dtype=np.int64)
-                bound_row_samples = np.asarray([future_bound.row_samples.get(row, -math.inf)
-                                                for row in table.rows])
         if graph.options.completion_bounds:
             from .completion import CompletionBounds
             completion_bounds = CompletionBounds.build(graph, prices, model, deadline)

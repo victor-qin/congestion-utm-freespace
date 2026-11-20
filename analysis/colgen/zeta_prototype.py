@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -26,18 +25,12 @@ os.environ.setdefault("COLGEN_GUROBI_THREADS", "1")
 import numpy as np  # noqa: E402
 
 from freespace_sim.config import SimConfig  # noqa: E402
-from freespace_sim.dss import DSS  # noqa: E402
-from freespace_sim.ledger import ReservationLedger  # noqa: E402
-from freespace_sim.mechanism import FCFSMechanism  # noqa: E402
-from freespace_sim.planner import get_planner  # noqa: E402
 from freespace_sim.planner import hexgrid as hg  # noqa: E402
 from freespace_sim.planner.route_cost import cost_model  # noqa: E402
-from freespace_sim.planner.route_domain import RowIndex  # noqa: E402
 from freespace_sim.planner.zeta import Route, ZetaOptions  # noqa: E402
-from freespace_sim.planner.zeta.geometry import reservation_claims  # noqa: E402
+from freespace_sim.planner.zeta.fcfs import run_fcfs  # noqa: E402
 from freespace_sim.planner.zeta.planner import ZetaPlannerParams  # noqa: E402
-from freespace_sim.types import DenialReason, FlightRequest, OperationalIntent, Terminal, vec  # noqa: E402
-from freespace_sim.uss import USS  # noqa: E402
+from freespace_sim.types import FlightRequest, Terminal, vec  # noqa: E402
 from freespace_sim.verify import find_interflight_conflict  # noqa: E402
 
 
@@ -94,92 +87,6 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
-
-
-def _run_fcfs(
-    cfg: SimConfig,
-    requests: list[FlightRequest],
-    terms: tuple,
-    params: ZetaPlannerParams,
-) -> tuple[dict[int, Route], dict[int, OperationalIntent], dict[str, Any]]:
-    """File each request in simulator order and audit the resulting buffered row loads.
-
-    Parameters
-    ------------
-    - cfg (SimConfig): shared physical and timing rules.
-    - requests (list[FlightRequest]): one-way comparison requests.
-    - terms (tuple): permanent terminal catalogue shared across arms.
-    - params (ZetaPlannerParams): route domain, objective and budget for each leg.
-
-    Return
-    --------
-    - output (tuple): accepted routes, filed intents, and per-leg search and row audit evidence.
-    """
-    started = time.monotonic()
-    if len({request.flight_id for request in requests}) != len(requests):
-        raise ValueError("flight ids must be unique")
-    if any(request.return_to_origin for request in requests):
-        raise ValueError("the Zeta comparison expects one-way requests")
-    cfg = replace(cfg, planner="zeta")
-    ledger = ReservationLedger(cfg)
-    row_index = RowIndex()
-    for center, terminal in terms:
-        ledger.register_static_terminal(center, terminal)
-        row_index.register_terminal(terminal)
-    protected = frozenset(terminal.id for _, terminal in terms)
-    dss = DSS(ledger=ledger, mechanism=FCFSMechanism())
-    usses = {
-        uid: USS(uid, dss, cfg, get_planner("zeta", params))
-        for uid in {request.uss_id for request in requests}
-    }
-    routes: dict[int, Route] = {}
-    intents: dict[int, OperationalIntent] = {}
-    records = []
-    for req in sorted(requests, key=FlightRequest.sort_key):
-        uss = usses[req.uss_id]
-        intent = uss.handle_request(req)
-        result = uss.planner.last_result
-        if intent.denial_reason is DenialReason.CONFLICT_AT_COMMIT:
-            raise RuntimeError(f"Zeta checked flight {req.flight_id} but FCFS could not file it")
-        if intent.accepted:
-            assert result is not None and result.route is not None
-            intents[req.flight_id] = intent
-            routes[req.flight_id] = result.route
-        records.append({
-            "flight_id": req.flight_id,
-            "accepted": intent.accepted,
-            "denial_reason": intent.denial_reason.value,
-            "reason": "graph_infeasible" if result is None else result.reason,
-            "complete": result is None or result.complete,
-            "route_cost_lower_bound": None if result is None else result.lower_bound,
-            "expanded": 0 if result is None else result.expanded,
-            "generated": 0 if result is None else result.generated,
-            "search_wall_s": 0.0 if result is None else result.wall_s,
-            "plan_wall_s": intent.solve_time_s,
-        })
-    elapsed = time.monotonic() - started
-    loads: Counter = Counter()
-    for flight_id, intent in intents.items():
-        claims = reservation_claims(
-            intent.volumes, cfg, row_index=row_index, protected_terminal_ids=protected,
-        )
-        if claims != routes[flight_id].claims:
-            raise RuntimeError(f"Zeta search and filing claims disagree for flight {flight_id}")
-        loads.update(claims)
-    stats = {
-        "policy": "FCFS",
-        "certificate_scope": "per leg with earlier filings fixed",
-        "wall_budget_s_per_leg": params.time_limit_s,
-        "row_rule": "complete simulator box/cylinder coverage and terminal pad rows",
-        "elapsed_s": elapsed,
-        "pricing_wall_s": math.fsum(record["search_wall_s"] for record in records),
-        "violated_rows": sum(load > row_index.cap(row) for row, load in loads.items()),
-        "unique_rows": len(loads),
-        "nonzeros": sum(loads.values()),
-        "searches_complete": sum(record["complete"] for record in records),
-        "search_records": records,
-    }
-    return routes, intents, stats
 
 
 def run_arm(
@@ -239,7 +146,7 @@ def run_arm(
             max_air_overrun_hops=params.max_air_overrun_hops,
             time_limit_s=params.time_limit_s if fcfs_leg_seconds is None else fcfs_leg_seconds,
         )
-        columns, intents, stats = _run_fcfs(cfg, requests, terms, standalone_params)
+        columns, intents, stats = run_fcfs(cfg, requests, terms, standalone_params)
         master = None
     else:
         from freespace_sim.planner.colgen.zeta_solver import solve_zeta
@@ -391,8 +298,6 @@ def main() -> None:
                         help="reuse complete route coverage projected onto currently priced rows")
     parser.add_argument("--compiled-route-coverage", action="store_true",
                         help="compile coverage repricing; requires --compiled-loop and --route-coverage-cache")
-    parser.add_argument("--future-price-bound", action="store_true",
-                        help="use a conservative backward travel-and-price bound")
     parser.add_argument("--completion-bounds", nargs="*", default=[],
                         choices=("arrival", "resource", "selected", "crossing"),
                         help="optional certified completion relaxations, combined by maximum")
@@ -424,11 +329,15 @@ def main() -> None:
         max_iterations=args.iterations, n_pricing_workers=args.workers,
         iteration_ip_time_limit_s=0.0, lp_gap=0.0, ip_gap=0.0,
     )
-    options = ZetaOptions(args.radius, None if args.no_search_caps else args.max_expansions,
-                          None if args.no_search_caps else args.max_labels, not args.no_merge,
-                          args.backend, args.lazy_successors, args.expire_history,
-                          args.history_dominance, args.arrival_snap, args.speed_fraction,
-                          args.future_price_bound, compiled_search=not args.no_compiled_search,
+    options = ZetaOptions(connection_radius_m=args.radius,
+                          max_expansions=None if args.no_search_caps else args.max_expansions,
+                          max_labels=None if args.no_search_caps else args.max_labels,
+                          merge_identical_states=not args.no_merge,
+                          backend=args.backend, lazy_successors=args.lazy_successors,
+                          expire_history=args.expire_history,
+                          history_dominance=args.history_dominance,
+                          arrival_snap_s=args.arrival_snap, speed_fraction=args.speed_fraction,
+                          compiled_search=not args.no_compiled_search,
                           timed_cache_bytes=args.timed_cache_bytes, early_return=args.early_return,
                           compiled_loop=args.compiled_loop,
                           completion_bounds=tuple(args.completion_bounds),
@@ -447,7 +356,7 @@ def main() -> None:
                           route_coverage_cache=args.route_coverage_cache,
                           compiled_route_coverage=args.compiled_route_coverage)
     arms = ("dp", "adjacent", "zeta") if args.arm == "all" else (args.arm,)
-    source_root = Path(__file__).resolve().parents[1]
+    source_root = Path(__file__).resolve().parents[2]
     planner_root = source_root / "freespace_sim" / "planner"
     source_files = sorted([
         Path(__file__).resolve(), *planner_root.glob("*.py"),

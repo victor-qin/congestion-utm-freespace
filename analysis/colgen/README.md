@@ -375,3 +375,16 @@ implemented reachability bound, the proposed cheaper endpoint accounting,
 merge boundaries, and the separate CPU preparation work.
 The [CPU–GPU handoff walkthrough](GPU_HANDOFF.md) shows the current per-flight
 dispatch loop and the proposed reductions in copying and synchronization.
+
+## Zeta comparison harness
+
+`zeta_prototype` compares production DP pricing, Zeta column generation and standalone
+Zeta FCFS on small crossing or shared-hub workloads, and audits every filed schedule:
+
+```sh
+uv run python -m analysis.colgen.zeta_prototype --arm zeta_fcfs \
+  --case crossing --flights 2 --distance-cells 2 --workers 0 \
+  --radius 480 --fcfs-leg-seconds 10 --out results/zeta-fcfs.json
+```
+
+See [the Zeta guide](../../context/zeta.md) for the search options and certificate scope.

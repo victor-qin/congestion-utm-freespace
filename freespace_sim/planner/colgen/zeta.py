@@ -7,10 +7,7 @@ import math
 import time
 from ...types import OperationalIntent
 from ..zeta.model import Route, SearchSettings
-from ..zeta.search import (
-    ZetaGraph as RouteGraph, ZetaOptions as ZetaOptions, search,
-    _Part as _Part, _Label as _Label, _Scan as _Scan,
-)
+from ..zeta.search import ZetaGraph as RouteGraph, ZetaOptions as ZetaOptions, search
 from .network import RowKey
 from .objective import CostModel, cost_model
 from .params import ColGenParams
@@ -64,12 +61,6 @@ class ZetaPricingResult:
     history_group_replace_skips: int = 0
     route_coverage_hits: int = 0
     route_coverage_misses: int = 0
-    cheap_expanded: int = 0
-    cheap_generated: int = 0
-    cheap_wall_s: float = 0.0
-    full_wall_s: float = 0.0
-    full_calls: int = 0
-    cheap_columns_returned: int = 0
     equivalent_histories_merged: int = 0
     merge_error_bound: float = 0.0
     lattice_bound_calls: int = 0
@@ -99,12 +90,6 @@ class ZetaGraph(RouteGraph):
     ------------
     - options (ZetaOptions): unchanged search domain and optimization switches.
     """
-
-    def __setstate__(self, state: dict[str, object]) -> None:
-        """Load archived graph geometry while rebuilding old column-valued route caches."""
-        self.__dict__.update(state)
-        self.__dict__.setdefault("endpoint_validator", None)
-        self._canonical = {}
 
     def intent(self, column: Column | Route) -> OperationalIntent:
         """Keep CG reporting labels while using the shared reservation builder."""

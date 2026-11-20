@@ -164,7 +164,6 @@ def test_colgen_terminal_rows_enforce_pad_capacity():
     ("compiled", True, 2, True, True, ()),
     ("compiled", True, 2, True, True, ("arrival", "resource", "selected", "crossing")),
     ("reference", True, 0, True, True, ("arrival", "resource", "selected", "crossing")),
-    ("compiled-hybrid", True, 2, True, True, ()),
     ("compiled-long24", True, 2, True, True, ()),
     ("compiled-merge12", True, 2, True, True, ()),
     ("compiled-merge240", True, 2, True, True, ()),
@@ -179,7 +178,7 @@ def test_colgen_terminal_rows_enforce_pad_capacity():
     ("compiled-merge12-forward-dp-indexed", True, 2, True, True, ()),
 ], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy", "parallel",
         "parallel-pruned-snapped", "early-reference", "early-compiled", "early-parallel", "all-bounds-parallel", "all-bounds-reference",
-        "hybrid-parallel", "long24-parallel", "merged-12-parallel", "merged-240-parallel",
+        "long24-parallel", "merged-12-parallel", "merged-240-parallel",
         "forward-12-parallel", "forward-dp-parallel", "forward-240-parallel", "forward-full-parallel",
         "lattice-12-parallel", "lattice-240-parallel", "indexed-full-parallel",
         "indexed-radius-parallel", "indexed-forward-dp-parallel"])
@@ -200,14 +199,13 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
     backend = backend.removesuffix("-lattice")
     forward = backend.endswith("-forward")
     backend = backend.removesuffix("-forward")
-    hybrid = backend.endswith("-hybrid")
     restricted = backend.endswith("-long24")
     merge_equivalent = backend in {"compiled-merge12", "compiled-merge240"}
     merged12 = backend.endswith("-merge12")
     radius = 240.0 if backend.endswith("-merge240") else 480.0
     if merge_equivalent:
         backend = "compiled"
-    backend = backend.removesuffix("-hybrid").removesuffix("-long24")
+    backend = backend.removesuffix("-long24")
     if backend == "compiled":
         pytest.importorskip("numba")
     if native_state_index:
@@ -244,7 +242,6 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
                           history_dominance=prune_snap, arrival_snap_s=float(prune_snap),
                           early_return=early_return, completion_bounds=completion_bounds,
                           connection_mode="hex12" if merged12 else "hex12_long" if restricted else "full",
-                          cheap_connection_mode="hex12_long" if hybrid else None,
                           strong_history_dominance=merge_equivalent,
                           merge_equivalent_histories=merge_equivalent,
                           forward_cruise=forward,

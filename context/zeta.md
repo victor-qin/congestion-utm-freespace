@@ -15,6 +15,7 @@ The production planner selection remains unchanged.
 | `planner/colgen/zeta.py` | Converts master columns to routes and route cost bounds to reduced-cost bounds, retaining the master's numerical improvement guard. |
 | `planner/colgen/zeta_pool.py`, `zeta_solver.py` | Persistent pricing ownership, seed scheduling, LP/IP master and column-generation iterations. |
 | `planner/zeta/planner.py` | One flight against the current ledger; normal simulator FCFS filing commits the result. |
+| `planner/zeta/fcfs.py` | `run_fcfs` files one-way requests in FCFS order and audits row loads and claims. |
 
 The core does not import `colgen`, construct `ColGenParams`, or start an LP solver.
 `Route` carries waypoint/endpoint/departure choices, physical cost and immutable
@@ -42,24 +43,13 @@ caps and deadlines then remain incomplete with a conservative certificate.
 scheduling). Search, geometry, bounds, caches and native compilation live in
 `planner.zeta`; current callers import those modules directly.
 
-The twenty old helper modules, including the compact/hybrid CG entry points,
-have been removed. For example, replace `colgen.zeta_geometry` with `zeta.geometry`.
 CG callers use `colgen.zeta.price_zeta`; direct search callers use `zeta.search`
 with `SearchSettings`, `Route` and `SearchResult`. The public CG adapter retains
-its CG arguments and result type. Independent workspace/price-preparation
-experiments need the same import migration before integration.
+its CG arguments and result type.
 
-Archived scripts that select frozen source keep running against that source.
-For trusted graph pickles reused against current code, explicitly load through
-`experiments.zeta_migrate.load_archive`, or write a new migrated copy:
-
-```sh
-python -m experiments.zeta_migrate archived-graph.pkl migrated-graph.pkl
-```
-
-The command refuses to overwrite an existing destination and leaves the archive
-unchanged. Old column-valued graph caches are rebuilt on loading; the new copy
-uses shared helper class paths and can subsequently use ordinary `pickle.load`.
+Current code reads only captures made with current code. Graph pickles from the
+prototype branch are not migrated; scripts that select frozen source keep running
+against that source, and anything reused against current code is recaptured.
 
 ## Standalone FCFS
 
@@ -80,19 +70,28 @@ planner = get_planner("zeta", ZetaPlannerParams(
         compiled_history=True, arrival_snap_s=1.0, speed_fraction=0.05,
     ),
     max_air_overrun_hops=6,
-    time_limit_s=10.0,  # per leg, including preparation
+    time_limit_s=10.0,  # per leg, including graph preparation; not the one-time native build
 ))
 intent = planner.plan(request, ledger, cfg)
 # The simulator/USS owns validation and commit; plan itself never mutates the ledger.
 ```
 
-The default standalone options use the reference backend, so Cython is optional.
+The default standalone options are `tuned_options()`: full pruning on the Cython native
+loop, which needs the `zeta-native` extra (`uv sync --extra zeta-native`) and a C compiler.
+`tuned_options(native=False)` keeps the same pruning on the pure-Python reference backend.
 Native options are identical to those used by CG and require the compiled and
 `zeta-native` extras plus a C compiler. Current domain support remains one cruise
-level and fixed terminal exit lanes with registered permanent terminal walls.
+level and, for hub endpoints, fixed terminal exit lanes with registered permanent
+terminal walls. `ZetaPlanner.plan` refuses anything else before any work, naming the
+zeta planner and the setting (`flight_levels_m`, `terminal_airspace_always_active`,
+`fixed_exit_lanes`); `experiments.run` applies the same check once per run.
 
 Before each search, the planner unions the live volumes **per flight ID**, then
-counts how many flights use each row. Cell capacity remains one; pad capacity
+counts how many flights use each row. It reads only volumes that can share a row
+with the leg: the ledger's time/space buckets around the corridor waypoints and
+endpoint footprints, over the departure-to-latest-landing window. On every row the
+leg can claim, the result equals a whole-ledger count, so preparation follows local
+traffic rather than ledger size. Cell capacity remains one; pad capacity
 comes from the terminal registry. Only saturated rows are forbidden. Permanent
 walls are geometry constraints, not dynamic occupants. Zero prices never stand
 in for these occupancy constraints. Exact endpoint and ground-hold checks cover
@@ -107,13 +106,14 @@ individual geometry operations are cooperative rather than preemptible.
 ## Comparing fleet policies
 
 ```sh
-uv run python -m experiments.zeta_prototype --arm zeta_fcfs \
+uv run python -m analysis.colgen.zeta_prototype --arm zeta_fcfs \
   --case crossing --flights 2 --distance-cells 2 --workers 0 \
   --radius 480 --fcfs-leg-seconds 10 --out results/zeta-fcfs.json
 ```
 
 Use the existing `--arm zeta` for column generation. Every connection, history,
-cache and native option also applies to `zeta_fcfs`. FCFS processes requests in
+cache and native option also applies to `zeta_fcfs`, which calls
+`freespace_sim.planner.zeta.fcfs.run_fcfs`. FCFS processes requests in
 `FlightRequest.sort_key()` order. Requests cannot be priced in parallel against
 stale copies of the ledger; the CG arm retains its persistent pricing pool.
 
@@ -149,7 +149,7 @@ The earlier full480 trial also accepted 98, at cost 1002.364407. It is a histori
 reference from before the signed-price fix, not a fresh matched timing control.
 This radius240 trial does not establish a runtime or cost benefit.
 
-Frozen source, input checks, progress and audits are in canonical
-`.agent/zeta-fcfs240-20261118/`. The figure can be regenerated with
+Frozen source, input checks, progress and audits are in the local, untracked
+`.agent/zeta-fcfs240-20261118/` folder. The figure can be regenerated with
 `fig_zeta_fcfs240("context/figures/zeta_fcfs240_20261118.json")` from
 `context/figures/make_figures.py`.

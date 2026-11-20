@@ -614,6 +614,11 @@ def _execute(args, saved: list[Path] | None = None) -> Path:
     scenario_payload = spec.to_json_dict()
     cfg = spec.config()
     demand = spec.demand_model()
+    if cfg.planner == "zeta":
+        # Refuse whole-run settings before the first leg; each leg re-checks its own endpoints.
+        from freespace_sim.planner.zeta.planner import validate_zeta_setup
+
+        validate_zeta_setup(cfg, terminal_endpoints=hasattr(demand, "terminals"))
     tag = args.tag or spec.name
     log.info("invocation: python -m experiments.run %s", " ".join(sys.argv[1:]) or "(no arguments)")
     log.info("scenario=%s tag=%s planner=%s demand=%s region=%s λ=%s/h planner-envelope=%ss seed=%s",

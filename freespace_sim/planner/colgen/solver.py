@@ -1114,10 +1114,13 @@ class ColGenSolver:
         added after that LP have zero values, with ``lp_column_count`` identifying the
         original LP prefix. ``master`` remains live and may grow after the callback.
         """
+        # The clock starts before the entry collection so the time limit covers it too.
+        started = time.monotonic()
         with _ParentHeap() as heap, ExitStack() as resources:
             return self._solve(
                 requests, cfg, static_terms, params, fixed_claims=fixed_claims,
                 on_iteration=on_iteration, seed_columns=seed_columns, heap=heap, resources=resources,
+                started=started,
             )
 
     def _solve(
@@ -1132,6 +1135,7 @@ class ColGenSolver:
         seed_columns: Mapping[int, Sequence[Column]] | None,
         heap: _ParentHeap,
         resources: ExitStack,
+        started: float,
     ) -> ColGenResult:
         """Body of :meth:`solve`, which documents every other parameter.
 
@@ -1139,12 +1143,13 @@ class ColGenSolver:
         ------------
         - heap (_ParentHeap): the entered GC policy; frozen at the start of every iteration.
         - resources (ExitStack): closes an early-started pool on every return or exception.
+        - started (float): ``time.monotonic()`` at entry to :meth:`solve`; every budget counts
+          from here.
 
         Return
         --------
         - output (ColGenResult): as :meth:`solve`.
         """
-        started = time.monotonic()
         pricing_wall_s = 0.0
         pricing_task_total_s = 0.0
         pricing_pool_setup_s = 0.0

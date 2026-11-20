@@ -518,12 +518,10 @@ def solve_zeta(
         "pricing_traversal": options.traversal,
         "native_state_index": options.native_state_index,
         "lattice_distance_bound": options.lattice_distance_bound,
-        "future_price_bound": options.future_price_bound,
         "early_return": options.early_return,
         "row_rule": "complete simulator box/cylinder coverage and terminal pad rows",
         "connection_radius_m": options.connection_radius_m,
         "connection_mode": options.connection_mode,
-        "cheap_connection_mode": options.cheap_connection_mode,
         "certificate_scope": (
             ("forward-only cruise; " if options.forward_cruise else "") +
             ("configured connection graph union fixed supplied seed pool"

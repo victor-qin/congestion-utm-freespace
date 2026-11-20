@@ -87,8 +87,7 @@ def build_seed_columns(
                  or graph.options.seed_validation_radius_m != graph.options.connection_radius_m)):
         supplied_graph = ZetaGraph(
             graph.fg, graph.cfg, graph.row_index,
-            replace(graph.options, connection_mode="full", cheap_connection_mode=None,
-                    traversal="best_first",
+            replace(graph.options, connection_mode="full", traversal="best_first",
                     connection_radius_m=graph.options.seed_validation_radius_m,
                     seed_validation_radius_m=None),
         )

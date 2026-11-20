@@ -31,6 +31,8 @@ class ZetaPricingResult:
     - turn_rejected (int): declared successors skipped by the opt-in turn rule.
     - waypoint_states, heading_states (int): distinct waypoints and waypoint/heading pairs
       among enqueued labels.
+    - snapped_rows, snapped_positive_mass, snapped_negative_mass: rows withheld by the
+      opt-in price_snap and their totals; reduced costs and bounds use the full prices.
     """
 
     column: Column | None
@@ -75,6 +77,9 @@ class ZetaPricingResult:
     turn_rejected: int = 0
     waypoint_states: int = 0
     heading_states: int = 0
+    snapped_rows: int = 0
+    snapped_positive_mass: float = 0.0
+    snapped_negative_mass: float = 0.0
 
 
 

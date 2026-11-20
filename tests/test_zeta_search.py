@@ -130,6 +130,199 @@ def _exhaustive_anyangle_columns(
     return columns
 
 
+def _check_price_snap(
+    fg: network_mod.FlightGraph,
+    cfg: SimConfig,
+    row_index: network_mod.RowIndex,
+    params: ColGenParams,
+    options: ZetaOptions,
+    columns: list[Column],
+    prices: dict[RowKey, float],
+    forbidden: frozenset[RowKey] = frozenset(),
+    pi_f: float = 0.0,
+) -> None:
+    """Withheld noise and negative prices keep full-price costs exact and certificates sound.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): declared flight domain.
+    - cfg (SimConfig): simulator rules.
+    - row_index (RowIndex): terminal capacity authority.
+    - params (ColGenParams): objective and improvement epsilon.
+    - options (ZetaOptions): search configuration; price_snap is switched on here.
+    - columns (list[Column]): exhaustive canonical routes of the domain.
+    - prices (dict[RowKey, float]): real signed prices; zero rows receive LP-like noise.
+    - forbidden (frozenset[RowKey]): saturated rows.
+    - pi_f (float): flight dual.
+
+    Return
+    --------
+    - output (None): asserts exact reporting, sound and decided certificates.
+    """
+    model = cost_model(cfg, params)
+    eps = params.epsilon
+    legal = [c for c in columns if c.claims.isdisjoint(forbidden)]
+    assert legal
+    universe = sorted({row for column in columns for row in column.claims})
+
+    def exact_rc(column: Column, current: dict[RowKey, float], dual: float) -> float:
+        """Reprice one route exactly as the column-generation driver does."""
+        return model.reduced_cost(benefit=params.M, cost=column.delay_s, pi_f=dual,
+                                  dual_cost=math.fsum(current.get(r, 0.0) for r in column.claims))
+
+    def run(current: dict[RowKey, float], dual: float, **change) -> ZetaPricingResult:
+        """Price with the snapped search, any option change and the frozen inputs."""
+        graph = ZetaGraph(fg, cfg, row_index, replace(options, price_snap=True, **change))
+        return price_zeta(graph, current, dual, params, forbidden_rows=forbidden)
+
+    # Barrier-like noise (1e-10..3e-9) on every unpriced row and one tiny negative credit.
+    noisy = {row: prices.get(row) or (index % 7 + 1) * 4e-10 for index, row in enumerate(universe)}
+    noisy[universe[len(universe) // 2]] = -3e-10
+    withheld = [value for value in noisy.values() if value < eps]
+    expected = max(exact_rc(c, noisy, pi_f) for c in legal)
+    for early in (False, True):
+        result = run(noisy, pi_f, early_return=early)
+        assert result.snapped_rows == len(withheld)
+        assert result.snapped_negative_mass == math.fsum(v for v in withheld if v < 0.0)
+        assert result.column is None or result.column in legal
+        if result.column is not None:
+            assert result.reduced_cost == pytest.approx(exact_rc(result.column, noisy, pi_f), abs=1e-9)
+        assert result.upper_bound >= expected - 1e-9
+        if result.complete and not early:
+            # A finished search is loose by at most the withheld price mass.
+            assert result.upper_bound <= expected + math.fsum(abs(v) for v in withheld) + 1e-6
+        if result.reason == "improving_column":
+            assert result.reduced_cost > eps
+        if result.complete:
+            assert (result.upper_bound <= eps or result.reduced_cost > eps
+                    or result.upper_bound - result.reduced_cost <= 1e-7)
+        for cap in (1, 3):
+            limited = run(noisy, pi_f, early_return=early, max_expansions=cap)
+            assert limited.upper_bound >= expected - 1e-9
+            assert limited.expanded <= cap
+    graph = ZetaGraph(fg, cfg, row_index, replace(options, price_snap=True))
+    expired = price_zeta(graph, noisy, pi_f, params, forbidden_rows=forbidden,
+                         deadline=time.perf_counter() - 1.0)
+    assert not expired.complete and expired.reason == "deadline"
+    assert expired.upper_bound >= expected - 1e-9
+    # Without withheld rows the opt-in changes nothing.
+    exact_only = {row: value for row, value in prices.items() if value >= eps}
+    control = price_zeta(ZetaGraph(fg, cfg, row_index, options), exact_only, pi_f, params,
+                         forbidden_rows=forbidden)
+    same = run(exact_only, pi_f)
+    assert same.snapped_rows == 0
+    assert ((same.column, same.reduced_cost, same.upper_bound, same.reason, same.expanded)
+            == (control.column, control.reduced_cost, control.upper_bound, control.reason,
+                control.expanded))
+    # Band case: every route's full reduced cost is at most epsilon, but withholding the
+    # sub-epsilon prices lifts the best one above it; the search cannot decide either way.
+    noise = 0.5 * eps
+    band_prices = {row: noise for row in universe}
+    lowest = min(c.delay_s + math.fsum(band_prices.get(r, 0.0) for r in c.claims) for c in legal)
+    for margin, improving in ((-noise / 4, False), (noise / 4, True)):
+        dual = params.M - lowest - (eps + margin)
+        best = max(exact_rc(c, band_prices, dual) for c in legal)
+        assert (best > eps) == improving
+        for early in (False, True):
+            band = run(band_prices, dual, early_return=early)
+            assert band.upper_bound >= best - 1e-9
+            if band.column is not None:
+                assert band.reduced_cost == pytest.approx(exact_rc(band.column, band_prices, dual),
+                                                          abs=1e-9)
+            if band.reason == "improving_column" or (band.complete and band.upper_bound > eps):
+                assert band.reduced_cost > eps
+            if not improving:
+                assert band.reduced_cost <= eps
+                # Without the adapter's exact guard, the shared search alone must still
+                # judge an early exit under the full prices.
+                from freespace_sim.planner.zeta import SearchSettings, search
+
+                direct = search(ZetaGraph(fg, cfg, row_index, replace(
+                    options, price_snap=True, early_return=early)), band_prices,
+                    SearchSettings(model=model, epsilon=eps, target_cost=params.M - dual),
+                    forbidden_rows=forbidden)
+                assert direct.reason != "improving_column" and not direct.complete
+                assert params.M - dual - direct.priced_cost <= eps
+                # A guarded history merge may already have declined the certificate.
+                assert not band.complete
+                assert band.reason in ("snap_uncertainty", "merge_uncertainty")
+
+
+def _check_target_cutoff(
+    fg: network_mod.FlightGraph,
+    cfg: SimConfig,
+    row_index: network_mod.RowIndex,
+    params: ColGenParams,
+    options: ZetaOptions,
+    columns: list[Column],
+    prices: dict[RowKey, float],
+    forbidden: frozenset[RowKey] = frozenset(),
+    pi_f: float = 0.0,
+) -> None:
+    """Pruning at the pricing target keeps the improvement verdict and never adds work.
+
+    The flight dual is moved so the exhaustive optimum is clearly improving, inside the
+    epsilon band, or clearly not improving. The price_snap arm uses LP-like noise and small
+    negative prices (withheld, above epsilon in total): its snapped-space target must allow
+    for that credit, or exhausting below it cannot certify ``no_improvement``.
+
+    Parameters
+    ------------
+    - fg (FlightGraph): declared flight domain.
+    - cfg (SimConfig): simulator rules.
+    - row_index (RowIndex): terminal capacity authority.
+    - params (ColGenParams): objective and improvement epsilon.
+    - options (ZetaOptions): search configuration; early return and the cut are set here.
+    - columns (list[Column]): exhaustive canonical routes of the domain.
+    - prices (dict[RowKey, float]): signed reservation prices.
+    - forbidden (frozenset[RowKey]): saturated rows.
+    - pi_f (float): reference flight dual.
+
+    Return
+    --------
+    - output (None): asserts decided verdicts, sound bounds and no extra expansions.
+    """
+    model = cost_model(cfg, params)
+    eps = params.epsilon
+    legal = [c for c in columns if c.claims.isdisjoint(forbidden)]
+    assert legal
+    universe = sorted({row for column in columns for row in column.claims})
+    noisy = {row: (-2e-6 if prices.get(row, 0.0) < 0.0 else prices.get(row) or (i % 7 + 1) * 4e-10)
+             for i, row in enumerate(universe)}
+
+    for snap, current in ((False, prices), (True, noisy)):
+        def exact_rc(column: Column, dual: float) -> float:
+            """Reprice one route exactly as the column-generation driver does."""
+            return model.reduced_cost(
+                benefit=params.M, cost=column.delay_s, pi_f=dual,
+                dual_cost=math.fsum(current.get(r, 0.0) for r in column.claims))
+
+        optimum = max(exact_rc(c, pi_f) for c in legal)
+        for shift in (-1.0, -0.5 * eps, 1e-3):
+            # The optimum's reduced cost becomes -shift.
+            dual = pi_f + optimum + shift
+            best = max(exact_rc(c, dual) for c in legal)
+            plain, cut = (
+                price_zeta(ZetaGraph(fg, cfg, row_index, replace(
+                    options, early_return=True, price_snap=snap, target_cutoff=flag)),
+                    current, dual, params, forbidden_rows=forbidden)
+                for flag in (False, True)
+            )
+            assert cut.expanded <= plain.expanded
+            assert cut.upper_bound >= best - 1e-9
+            if cut.column is not None:
+                assert cut.column in legal
+                assert cut.reduced_cost == pytest.approx(exact_rc(cut.column, dual), abs=1e-9)
+            if best > eps:
+                # An improving incumbent may already be proven optimal when it is found.
+                assert cut.reason in ("improving_column", "optimal") and cut.reduced_cost > eps
+                continue
+            assert cut.reason != "improving_column"
+            assert not cut.complete or cut.upper_bound <= eps
+            if shift > 0:
+                assert cut.complete and cut.reason == "no_improvement"
+
+
 def _check_anyangle_completion_bounds(
     graph: ZetaGraph, columns: list[Column], prices: dict[RowKey, float], params: ColGenParams,
 ) -> dict[str, float]:
@@ -515,6 +708,9 @@ def test_anyangle_exact_pricing_matches_exhaustive_physical_walks(
     assert result.upper_bound >= expected - 1e-6
     assert result.upper_bound <= expected + 1e-6
     assert result.column is not None and result.column in legal
+    if merge and objective == "total_cost":
+        _check_price_snap(fg, cfg, row_index, params, options, columns, prices, forbidden, pi_f)
+        _check_target_cutoff(fg, cfg, row_index, params, options, columns, prices, forbidden, pi_f)
     if terminal == "customer" and merge and not forbid and not lazy and not prune_snap:
         from freespace_sim.planner.zeta import SearchSettings, ZetaGraph as SharedGraph, search
 
@@ -1958,6 +2154,8 @@ def test_forward_dp_matches_exhaustive_union_prices_and_interrupted_bounds(
             limited = price_zeta(capped, current, 0.0, params, forbidden_rows=forbidden)
             assert limited.upper_bound >= optimum - 1e-6
             assert limited.generated <= cap
+        _check_price_snap(fg, cfg, rows, params, options, columns, current, forbidden)
+        _check_target_cutoff(fg, cfg, rows, params, options, columns, current, forbidden)
     early = ZetaGraph(fg, cfg, rows, replace(options, early_return=True))
     found = price_zeta(early, {}, 0.0, params)
     assert found.column is not None and found.reduced_cost > params.epsilon

@@ -66,6 +66,7 @@ def _req(**changes) -> sc.JobRequest:
     (_req(module="experiments.colgen_four_round", args=("--capture", "c.pkl")), CFG, None),
     (_req(module="experiments.colgen_four_round", args=("--source", "/x")), CFG, "--source"),
     (_req(module="experiments.colgen_four_round", args=("--sour=/x",)), CFG, "--source"),
+    (_req(module="experiments.colgen_full_cohort", args=("--pricing", "zeta")), CFG, None),
     (_req(cores=25), CFG, "total cores"),
     (_req(gpus=2), CFG, "total GPUs"),
     (_req(), replace(CFG, caps=replace(CAPS, max_jobs=2)), "agent jobs already queued"),

@@ -63,9 +63,10 @@ CONFIG_PATH = Path("~/.config/congestion-utm/supercloud.toml").expanduser()
 # Beside the config rather than in a repo, so agents in different clones also serialize.
 LOCK_PATH = CONFIG_PATH.with_name("supercloud.lock")
 JOB_PREFIX = "agent-"
-# experiments.colgen_four_round replays a fixed captured cohort for
-# per-round colgen timing.
-ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round")
+# experiments.colgen_four_round replays a fixed captured cohort for per-round colgen timing;
+# experiments.colgen_full_cohort solves a fixed cohort to the end with DP or Zeta pricing.
+ALLOWED_MODULES = ("experiments.run", "pytest", "experiments.colgen_four_round",
+                   "experiments.colgen_full_cohort")
 # Options that would make an allowed module load code other than the shipped snapshot, after
 # the job's import check has already passed.
 FORBIDDEN_OPTIONS = {"experiments.colgen_four_round": ("--source",)}
@@ -97,7 +98,9 @@ _MARK = "__SUPERCLOUD_OUTPUT__"
 # Module loads can leak these into the env's interpreter (see supercloud_array.sh); doctor
 # clears them exactly as the job script does, so it tests the environment jobs get.
 _CLEAN_PY = "unset PYTHONHOME PYTHONPATH; "
-_REMOTE_TIMEOUT_S = 600
+# Uploads create one file per shipped path; under runs/ the Lustre metadata server has taken
+# ~2 s per create (2026-11-19), so a full worktree needs far more than 600 s.
+_REMOTE_TIMEOUT_S = 3600
 # sbatch answers in about a second; a short limit keeps the SIGTERM-held window short.
 _SBATCH_TIMEOUT_S = 60
 _LOCK_TIMEOUT_S = 300
@@ -515,7 +518,7 @@ def _rsync(src: str, dest: str) -> None:
         proc = subprocess.run(["rsync", "-a", "-e", "ssh -o BatchMode=yes", src, dest],
                               capture_output=True, text=True, timeout=_REMOTE_TIMEOUT_S)
     except subprocess.TimeoutExpired as exc:
-        raise SuperCloudError(f"rsync {src} -> {dest} timed out") from exc
+        raise SuperCloudError(f"rsync {src} -> {dest} timed out after {_REMOTE_TIMEOUT_S}s") from exc
     except OSError as exc:
         raise SuperCloudError(f"cannot run rsync: {exc}") from exc
     if proc.returncode != 0:

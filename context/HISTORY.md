@@ -2,16 +2,6 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
-- 2026-11-20T23:00Z [TOOL] Rounding production-DP pricing prices is a net loss at scale. The CPU
-  default emptiest-airspace tie-break prices ~52k rows below epsilon; rounding the LP duals alone
-  changes nothing, and rounding the pricing vector strips the tie-break. That cut DP labels 75–90%
-  per round and won at 100 flights (pricing 13.2 → 7.9 s), but at 1,537 flights (SuperCloud,
-  turn limit on) it took 11 rounds instead of 5, solved 2.9× slower, hit the final IP time limit
-  and cost 1.9% more. Measure pricing-price changes at full scale with the nudged duals; raising
-  the tie-break above epsilon only restores the default. Zeta rounding (`ZetaOptions.price_snap`)
-  is unaffected: Zeta has no tie-break. Files: `freespace_sim/planner/colgen/solver.py`
-  (`_emptiest_airspace_duals`), `freespace_sim/planner/zeta/price_floor.py`.
-
 - 2026-11-19T14:30Z [CODE/TOOL] A one-time build must not run inside a per-leg deadline. With the
   native Zeta loop as the default, a cold Cython build (~8 s) under a shorter `time_limit_s` was
   killed on every leg and cached nothing, so EVERY leg was denied as `deadline` (reproduced: 4/4

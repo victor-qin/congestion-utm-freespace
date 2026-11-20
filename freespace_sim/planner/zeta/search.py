@@ -33,9 +33,7 @@ from .model import Route
 from .geometry import anyangle_to_intent, reservation_claims, volume_claims
 from .history import PriceHistory
 from .history_guard import HistoryGuard
-from .price_floor import (
-    prepare_price_floor, price_floor, snap_certificate, snap_prices, snapped_lower_bound,
-)
+from .price_floor import prepare_price_floor, price_floor
 from .timing import edge_end_times
 from ..turn_rule import path_turns_valid
 from .turns import TurnClasses
@@ -71,13 +69,6 @@ class ZetaOptions:
     - turn_below_90 (bool): require every interior cruise waypoint to deflect strictly less
       than 90 degrees (exact positive axial dot product). The first cruise link, climb,
       descent and endpoint lanes are unconstrained; labels carry an incoming heading class.
-    - price_snap (bool): search with positive prices below the improvement epsilon and all
-      negative prices withheld; reported routes, reduced costs and certificates use the full
-      prices, and a completed search the full prices cannot decide reports ``snap_uncertainty``.
-    - target_cutoff (bool): in early-return pricing, also discard prefixes whose floor
-      reaches the pricing target, not only the incumbent. Such prefixes cannot yield an
-      improving column; exhausting the rest certifies ``no_improvement`` at the target
-      rather than proving the incumbent optimal.
     """
 
     connection_radius_m: float = 480.0
@@ -111,8 +102,6 @@ class ZetaOptions:
     traversal: str = "best_first"
     native_state_index: bool = False
     turn_below_90: bool = False
-    price_snap: bool = False
-    target_cutoff: bool = False
 
     def __post_init__(self) -> None:
         """Reject nonfinite geometry and invalid enabled compute limits."""
@@ -186,9 +175,6 @@ class SearchResult:
     - turn_rejected (int): declared successors skipped by the turn rule before any geometry.
     - waypoint_states, heading_states (int): distinct waypoints and waypoint/heading pairs
       among enqueued labels; equal without the turn rule.
-    - snapped_rows (int): rows withheld by price_snap; zero leaves the search unchanged.
-    - snapped_positive_mass, snapped_negative_mass (float): withheld positive and negative
-      price totals; the negative total is already subtracted from the lower bounds.
     """
 
     route: Route | None
@@ -234,9 +220,6 @@ class SearchResult:
     turn_rejected: int = 0
     waypoint_states: int = 0
     heading_states: int = 0
-    snapped_rows: int = 0
-    snapped_positive_mass: float = 0.0
-    snapped_negative_mass: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -752,27 +735,13 @@ def _search(
     prices = {RowKey(r): float(p) for r, p in duals.items() if p != 0.0}
     if any(not math.isfinite(p) for p in prices.values()):
         raise ValueError("row prices must be finite")
-    # Labels, floors and histories see only the search vector; incumbents use both.
-    exact_prices, snap = prices, None
-    if graph.options.price_snap:
-        prices, snap = snap_prices(exact_prices, settings.epsilon)
-        if not snap.rows:
-            prices, snap = exact_prices, None
     negative, price_error = prepare_price_floor(prices.values())
     cfg, fg = graph.cfg, graph.fg
     model = settings.model
     best, incumbent = math.inf, None
-    reported, reported_cost, reported_improves = None, math.inf, False
-    exact_claim_prices: dict[frozenset[RowKey], float] = {}
     pricing_margin = (settings.target_cost or 0.0)
     improvement_tolerance = settings.epsilon
     early_return = graph.options.early_return and settings.target_cost is not None
-    # Prefixes at or above ``limit`` are discarded: the incumbent, or also the pricing target
-    # under target_cutoff. Withheld negative prices can lower a route by at most their total,
-    # so the snapped-space target is raised by it; finish() re-derives the full-price bound.
-    cut = (pricing_margin - (0.0 if snap is None else snap.negative_mass)
-           if early_return and graph.options.target_cutoff else math.inf)
-    limit = cut
     known_canonical: set[Route] = set()
     claim_prices: dict[frozenset[RowKey], float] = {}
     route_prices = graph.route_coverage.bind(prices) if graph.options.route_coverage_cache else None
@@ -790,12 +759,6 @@ def _search(
                             merge_shorter=graph.options.merge_shorter_histories)
                if graph.options.expire_history or graph.options.history_dominance else None)
     history_guard = HistoryGuard(graph, model, prices) if graph.options.strong_history_dominance else None
-    # A guarded merge leaves at most its endpoint margin unproven. Keeping that band above
-    # the cut lets exhausting below it certify whenever the uncut search would.
-    if math.isfinite(cut) and history_guard is not None and graph.options.history_dominance:
-        cut += max((m for oi, *_ in graph.origins for di, _ in graph.destinations
-                    if (m := history_guard.margin(oi, di)) is not None), default=0.0)
-        limit = cut
     merge_shorter = (graph.options.merge_shorter_histories
                      and math.isfinite(model.air_weight) and model.air_weight >= 0.0)
     expired_rows = 0
@@ -808,24 +771,17 @@ def _search(
 
     def finish(complete: bool, reason: str, floor: float) -> SearchResult:
         """Report all pending costs, including the numerical history-merge allowance."""
-        route, cost = (incumbent, best) if snap is None else (reported, reported_cost)
-        raw = snapped_lower_bound(min(best, floor), snap)
-        rc = pricing_margin - cost
-        upper = pricing_margin - raw
+        rc = pricing_margin - best
+        upper = pricing_margin - min(best, floor)
         uncertainty = 0.0 if history is None else history.merge_error_bound
         if uncertainty > 0.0:
             upper = math.nextafter(max(rc, upper) + uncertainty, math.inf)
-            # A bound, not an incumbent: target_cutoff can finish with no route found.
-            if complete and math.isfinite(raw):
+            if complete and math.isfinite(rc):
                 complete = early_return and upper <= improvement_tolerance
                 reason = "no_improvement" if complete else "merge_uncertainty"
-        if snap is not None:
-            complete, reason = snap_certificate(
-                complete, reason, raw, cost, upper, settings.target_cost,
-                improvement_tolerance, tol, reported_improves)
-        return SearchResult(route, cost,
-                                 (math.nextafter(raw - uncertainty, -math.inf)
-                                  if uncertainty > 0 else raw), complete, reason,
+        return SearchResult(incumbent, best,
+                                 (math.nextafter(min(best, floor) - uncertainty, -math.inf)
+                                  if uncertainty > 0 else min(best, floor)), complete, reason,
                                  expanded, generated, time.perf_counter() - started,
                                  edge_evaluations, successor_pops,
                                  0 if history is None else history.pruned, expired_rows,
@@ -841,17 +797,13 @@ def _search(
                                  equivalent_histories_merged=0 if history is None else history.merged,
                                  merge_error_bound=uncertainty,
                                  lattice_bound_calls=int(lattice_bound is not None),
-                                 shorter_histories_merged=0 if history is None else history.shorter_merged, raw_lower_bound=raw,
+                                 shorter_histories_merged=0 if history is None else history.shorter_merged, raw_lower_bound=min(best, floor),
                                  turn_rejected=turn_rejected, waypoint_states=len(waypoint_states),
-                                 heading_states=len(heading_states),
-                                 snapped_rows=0 if snap is None else snap.rows,
-                                 snapped_positive_mass=0.0 if snap is None else snap.positive_mass,
-                                 snapped_negative_mass=0.0 if snap is None else snap.negative_mass)
+                                 heading_states=len(heading_states))
 
     def accept(column: Route, *, known: bool = False) -> None:
         """Validate supplied or discovered incumbents before using their cutoff."""
-        nonlocal best, incumbent, early_candidate_ready, limit
-        nonlocal reported, reported_cost, reported_improves
+        nonlocal best, incumbent, early_candidate_ready
         canonical = graph.canonical_route(column, model)
         if canonical is None or not canonical.claims.isdisjoint(forbidden_rows):
             return
@@ -864,26 +816,8 @@ def _search(
                          else math.fsum(prices.get(row, 0.0) for row in canonical.claims))
             claim_prices[canonical.claims] = dual_cost
         value = canonical.physical_cost + dual_cost
-        if snap is not None:
-            # The search cutoff stays snapped; reporting and early exits use full prices.
-            exact_cost = exact_claim_prices.get(canonical.claims)
-            if exact_cost is None:
-                exact_cost = math.fsum(exact_prices.get(row, 0.0) for row in canonical.claims)
-                exact_claim_prices[canonical.claims] = exact_cost
-            exact_value = canonical.physical_cost + exact_cost
-            if exact_value < reported_cost:
-                reported, reported_cost = canonical, exact_value
-                reported_improves = (pricing_margin - exact_value > settings.epsilon
-                                     and settings.accepts(canonical.physical_cost, exact_cost))
-                early_candidate_ready = (early_return and reported_improves
-                                         and canonical not in known_canonical)
-            if value < best:
-                best, incumbent = value, canonical
-                limit = min(best, cut)
-            return
         if value < best:
             best, incumbent = value, canonical
-            limit = min(best, cut)
             # Both associations must pass epsilon, or the driver could reject an early exit.
             early_candidate_ready = (early_return
                                      and canonical not in known_canonical
@@ -919,7 +853,7 @@ def _search(
                 label.positive_paid, label.ground_cost, negative, label.fold_m,
                 label.paid, label.terminal,
             ))
-            if floor >= limit:
+            if floor >= best:
                 bound_pruned += 1
                 return
             # A child's completions are a subset of its parent's, including deferred scans.
@@ -967,7 +901,7 @@ def _search(
         if lower_length + remaining > graph.max_length + 1e-7:
             return
         trial = replace(label, path=label.path + (target,), length=lower_length)
-        if bound(trial) >= limit:
+        if bound(trial) >= best:
             return
         for terminal in ((True, False) if target == label.goal else (False,)):
             edge_evaluations += 1
@@ -994,7 +928,7 @@ def _search(
                             segment_lengths=label.segment_lengths + tuple(p.length for p in parts),
                             canonical_length=label.canonical_length + sum(p.length for p in parts))
             floor = bound(child)
-            if floor < limit:
+            if floor < best:
                 enqueue(child, floor)
 
     for column in known_routes:
@@ -1028,7 +962,7 @@ def _search(
             return finish(False, "deadline", global_floor)
         ground = model.ground_weight * ((dep - fg.base_step) * cfg.dt_s)
         # Even granting every negative row price cannot rescue this or a later departure.
-        if price_floor(ground, 0.0, negative, price_error, tol) >= limit:
+        if price_floor(ground, 0.0, negative, price_error, tol) >= best:
             break
         endpoint = graph.endpoint(True, dep * cfg.dt_s)
         origin_rows = graph.rows(endpoint)
@@ -1044,7 +978,7 @@ def _search(
                                ground,
                                graph.fold_length(oi, di))
                 floor = bound(label)
-                if floor < limit:
+                if floor < best:
                     enqueue(label, floor)
                     if graph.options.max_labels is not None and generated >= graph.options.max_labels:
                         return finish(False, "search_cap", global_floor)
@@ -1061,12 +995,9 @@ def _search(
         floor = heap[0][0]
         if floor >= best - tol:
             return finish(True, "optimal", min(best, floor))
-        if floor >= limit:
-            # Every remaining prefix reaches the pricing target (target_cutoff).
-            break
         # All departure roots and deferred continuations are represented in this bound.
         uncertainty = 0.0 if history is None else history.merge_error_bound
-        certified_upper = pricing_margin - snapped_lower_bound(min(best, floor), snap)
+        certified_upper = pricing_margin - min(best, floor)
         if uncertainty > 0.0:
             certified_upper = math.nextafter(certified_upper + uncertainty, math.inf)
         if early_return and certified_upper <= improvement_tolerance:
@@ -1087,7 +1018,7 @@ def _search(
             next_index = entry.index + 1
             if next_index < len(entry.targets):
                 next_floor = entry.targets[next_index][0]
-                if next_floor < limit:
+                if next_floor < best:
                     heapq.heappush(heap, (next_floor, next(serial), replace(entry, index=next_index)))
             extend(entry.label, entry.targets[entry.index][1])
             continue
@@ -1127,7 +1058,7 @@ def _search(
                 if length + remaining > graph.max_length + 1e-7:
                     continue
                 child_floor = bound(label, target, length)
-                if child_floor < limit:
+                if child_floor < best:
                     targets.append((child_floor, target))
             if targets:
                 targets.sort(key=lambda candidate: candidate[0])
@@ -1136,7 +1067,4 @@ def _search(
         # Complete each expansion before honoring a cap: every remaining child stays in the heap.
         for target in legal:
             extend(label, target)
-    if best > limit:
-        # Exhausted below the target: nothing improves, but the incumbent is not proven optimal.
-        return finish(True, "no_improvement", limit)
     return finish(True, "optimal" if incumbent else "infeasible", best)

@@ -103,6 +103,27 @@ returned. A preparation timeout does not search against a partial reservation
 map. Preparation checks the deadline between stages and volume conversions;
 individual geometry operations are cooperative rather than preemptible.
 
+## Optional cruise turn limit
+
+`ZetaOptions(turn_below_90=True)` and production DP
+`ColGenParams(turn_below_90=True)` (CLI `--colgen-turn-below-90`) restrict the
+route domain. At every interior cruise waypoint, the incoming and outgoing
+waypoint links must have a strictly positive dot product. The test uses exact
+integer axial arithmetic (`planner/turn_rule.py`), so exactly 90 degrees and
+reversals are rejected and straight continuations are kept. The first cruise
+link, climb/descent and terminal lanes or customer stubs are not checked.
+Forward-only cruise remains a separate option. Inside one `solve_zeta`, both
+flags must agree.
+
+Zeta labels carry an exact heading class. Classes group incoming links with
+identical legal next links, and every history and dominance key includes the
+class. Successor caches are keyed by heading, while geometry caches stay
+shared. Supplied, imported and seeded routes are validated against the same
+domain. A free shortest seed that already obeys the rule is reused before the
+heading-aware seed search. Production DP needs no new state because its
+dominance key already contains the predecessor cell. Certificates cover only
+the restricted domain. GPU pricing refuses the option.
+
 ## Comparing fleet policies
 
 ```sh

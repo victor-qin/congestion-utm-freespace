@@ -12,7 +12,7 @@ import operator
 import threading
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Set as AbstractSet
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from types import MappingProxyType
 from typing import Any, Protocol
 
@@ -977,12 +977,31 @@ class FlightGraph:
     static_walls: tuple[Volume4D, ...] = field(repr=False, compare=False)
     _wall_index: _WallSpatialIndex = field(repr=False, compare=False)
     forbidden_hops: frozenset[tuple[Cell, Cell]] | _LazyForbiddenHops
+    # Opt-in route-domain restriction: interior cruise turns strictly below 90 degrees.
+    # It is part of graph identity so seed and certificate caches never mix domains.
+    turn_below_90: bool = False
     _search_cache: _FlightSearchCache = field(
         default_factory=_FlightSearchCache,
         init=False,
         repr=False,
         compare=False,
     )
+
+    def __setstate__(self, state: list[Any]) -> None:
+        """Restore positional slot state, reading pre-turn-rule pickles as unrestricted.
+
+        Slotted dataclasses pickle field values by position. A graph pickled before
+        ``turn_below_90`` existed has one fewer value; insert the default so later
+        values are not shifted into the wrong fields.
+        """
+        names = [item.name for item in fields(self)]
+        if len(state) == len(names) - 1:
+            index = names.index("turn_below_90")
+            state = [*state[:index], False, *state[index:]]
+        if len(state) != len(names):
+            raise ValueError("FlightGraph pickle state does not match its fields")
+        for name, value in zip(names, state):
+            object.__setattr__(self, name, value)
 
     def outgoing_neighbors(self, source: Cell) -> tuple[Cell, ...]:
         """Generate/cache all admissible directed arcs leaving ``source``.
@@ -1953,6 +1972,7 @@ def build_flight_graph(
         static_walls=frozen_static_walls,
         _wall_index=wall_index,
         forbidden_hops=forbidden_hops,
+        turn_below_90=bool(getattr(params, "turn_below_90", False)),
     )
     graph._search_cache.pricing_context = (cfg, params, catalog.entries)
     return graph

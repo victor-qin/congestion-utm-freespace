@@ -22,6 +22,7 @@ from .dp_kernel import (
     _role_allows,
     _sink_may_improve,
     _state_hash,
+    _turn_ok,
     _visit_cost,
     _visit_hits_forbidden,
 )
@@ -62,11 +63,12 @@ def _advance(frontier, states, control, labels, topology, duals, paid_rows,
     - (status, label): Pause reason and candidate label, or -1 without a candidate.
     """
     cells, parent, hops_array, paid_array, first_array, links = labels
-    arc_start, arc_target, roles, remaining, destinations = topology
+    arc_start, arc_target, roles, remaining, destinations, cell_q, cell_r = topology
     cell_series, series_first, series_start, series_prefix = duals
     paid_start, paid_cell, paid_step, paid_value = paid_rows
     bits, row_steps, row_step0 = forbidden
-    start, max_step, max_hops, revisit_depth, history_depth, track_first, budget, lo, hi = limits
+    (start, max_step, max_hops, revisit_depth, history_depth, track_first, budget, lo, hi,
+     turn_rule) = limits
     pops = 0
     while len(frontier) and control[0] < budget:
         if pops >= 256:
@@ -105,6 +107,11 @@ def _advance(frontier, states, control, labels, topology, duals, paid_rows,
                     break
                 previous = parent[previous]
             if revisited:
+                continue
+            # The recent-cell state below already contains this predecessor.
+            if turn_rule and hops > 0 and not _turn_ok(
+                cell_q, cell_r, cells[parent[label]], cell, neighbor
+            ):
                 continue
             distance = remaining[neighbor]
             next_step = step + 1
@@ -298,13 +305,13 @@ def goal_directed_bootstrap(
         )
         limits = (start, fg.max_step, fg.max_air_hops, offsets[1] - offsets[0], recent_depth,
                   int(bool(fg.static_walls and fg.origin_terminal is not None)),
-                  int(max_labels), offsets[0], offsets[1])
+                  int(max_labels), offsets[0], offsets[1], int(bool(topology.turn_below_90)))
         while True:
             pricing._check_deadline(deadline)
             status, label = _advance(
                 frontier, states, control, labels,
                 (topology.arc_start, topology.arc_target, topology.arc_roles,
-                 topology.hex_remaining, topology.dest_mask),
+                 topology.hex_remaining, topology.dest_mask, topology.cell_q, topology.cell_r),
                 (packed.cell_series, packed.series_first, packed.series_start, packed.series_prefix),
                 paid_arrays, (forbidden.bits, rows.n_steps, rows.step0), limits,
                 delay, destination, screen, partials, recent, other,
@@ -360,13 +367,14 @@ def warm_kernel() -> bool:
         frontier, states, control, labels,
         (readonly(np.zeros(2, np.int32)), readonly(np.zeros(0, np.int32)),
          readonly(np.zeros(0, np.uint8)), readonly(np.ones(1, np.int32)),
-         readonly(np.zeros(1, np.uint8))),
+         readonly(np.zeros(1, np.uint8)), readonly(np.zeros(1, np.int32)),
+         readonly(np.zeros(1, np.int32))),
         (readonly(np.full(1, -1, np.int32)), readonly(np.zeros(0, np.int32)),
          readonly(np.zeros(1, np.int64)), readonly(np.zeros(0, np.float64))),
         (np.zeros(2, np.int32), np.zeros(0, np.int32), np.zeros(0, np.int32),
          np.zeros(0, np.float64)),
         (readonly(np.zeros(1, np.uint64)), 1, 0),
-        (0, 2, 2, 0, 2, 0, 1, 0, 0),
+        (0, 2, 2, 0, 2, 0, 1, 0, 0, 0),
         np.zeros(3, np.float64), np.zeros(3, np.float64),
         (np.zeros(1, np.int32), np.array([3], np.int32), np.zeros(1, np.float64),
          np.zeros(1, np.int32), np.zeros(3, np.float64)),

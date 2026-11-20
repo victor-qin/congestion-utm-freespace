@@ -136,6 +136,8 @@ class PreparedTopology:
     # identical pair of constants in ``pricing._best_column``.
     state_history_depth: int = 0
     track_first_hop: bool = False
+    # Opt-in turn rule copied from the graph: interior cruise turns strictly below 90 degrees.
+    turn_below_90: bool = False
 
     unsupported_reason: str | None = None
 
@@ -407,6 +409,7 @@ def prepare_topology(fg: FlightGraph, cfg: SimConfig) -> PreparedTopology:
         revisit_depth=revisit_depth,
         state_history_depth=max(2, revisit_depth),
         track_first_hop=bool(fg.static_walls and fg.origin_terminal is not None),
+        turn_below_90=bool(getattr(fg, "turn_below_90", False)),
     )
     # Read-only after construction: these are shared across threads without a lock, and
     # the guarantee that nobody mutates them is the entire basis for doing so.

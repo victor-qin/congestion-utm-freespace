@@ -14,6 +14,7 @@ from ...types import IntentStatus
 from ...conflict import volumes_conflict
 from ...volumes import column_dwell_s
 from .. import hexgrid as hg
+from ..turn_rule import path_turns_valid
 from ..route_domain import (
     RouteBudget as RouteBudget,
     Cell as Cell,
@@ -293,6 +294,10 @@ def column_claims(
             raise ValueError(f"column contains a non-neighbour lateral hop {a} -> {b}")
         if (a, b) in fg.forbidden_hops:
             raise ValueError(f"column hop {a} -> {b} overlaps permanent static terminal airspace")
+    # Certificates are per graph, and the rule is part of graph identity, so a cached
+    # path already passed this check on first certification.
+    if certificate is None and fg.turn_below_90 and not path_turns_valid(path):
+        raise ValueError("column turns by 90 degrees or more at an interior cruise cell")
 
     origin_lane_steps = 0
     if fg.origin_terminal is not None:

@@ -233,6 +233,12 @@ def search_compact(
     cells = tuple(sorted(graph.cells | {cell for _index, cell, _steps in graph.origins}
                          | {cell for _index, cell in graph.destinations}))
     cell_ids = {cell: index for index, cell in enumerate(cells)}
+    turns = graph.turns
+    # Heading classes widen the state key as node * count + class; one class leaves it unchanged.
+    heading_count: cython.Py_ssize_t = 1 if turns is None else turns.count
+    turn_rejected = 0
+    node_marks = bytearray(len(cells))
+    state_marks = bytearray(len(cells) * heading_count)
     table: _RowTable = _RowTable(prices, forbidden_rows)
     history_type = PythonPriceHistory
     if graph.options.compiled_history:
@@ -263,8 +269,9 @@ def search_compact(
     paid_ids: dict[bytes, int] = {}
     sequence_ids: dict[tuple[int, float], int] = {}
     seen: set[tuple[object, ...]] = set()
-    target_cache: dict[tuple[int, int], tuple[tuple[float, int, float, float], ...]] = {}
-    target_arrays: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    target_cache: dict[tuple[int, int, int], tuple[tuple[float, int, float, float], ...]] = {}
+    target_rejections: dict[tuple[int, int, int], int] = {}
+    target_arrays: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray]] = {}
     scans: dict[int, tuple] = {}
     edge_cache: dict[tuple[int, int, bool, bool], tuple | None] = {}
     timed_cache: OrderedDict[tuple[int, int, bool, bool, float], tuple] = OrderedDict()
@@ -312,7 +319,9 @@ def search_compact(
                                  topology_setup_s=topology_setup_s,
                                  incumbent_setup_s=incumbent_setup_s,
                                  dp_waypoints=0 if frontier is None else frontier.visited,
-                                 dp_peak_pending=0 if frontier is None else frontier.peak_pending, raw_lower_bound=min(best, floor))
+                                 dp_peak_pending=0 if frontier is None else frontier.peak_pending, raw_lower_bound=min(best, floor),
+                                 turn_rejected=turn_rejected, waypoint_states=node_marks.count(1),
+                                 heading_states=state_marks.count(1))
 
     def accept(column: Route, *, known: bool = False) -> None:
         """Use only canonical full-volume coefficients to update the feasible cutoff."""
@@ -359,7 +368,7 @@ def search_compact(
     def enqueue(
         node: int, parent: int, context: int, paid: np.ndarray, sequence: int,
         terminal: bool, first: bool, stamp: float, length: float, positive: float, floor: float,
-        canonical_length: float = 0.0, retired: int = 0,
+        canonical_length: float = 0.0, retired: int = 0, heading: int = 0,
     ) -> None:
         """Expire paid rows and apply the reference's exact future-state comparisons."""
         nonlocal generated, expired_rows, bound_lookups, bound_pruned
@@ -386,17 +395,18 @@ def search_compact(
                 return
         key = None
         paid_id = intern_paid(paid) if state_index is not None else None
+        state_node = node * heading_count + heading
         if contexts[context][5] is not None or graph.reference <= 1e-9:
             margin = None if history_guard is None else history_guard.margin(
                 contexts[context][1], contexts[context][2],
             )
             if state_index is not None:
                 key, broad_key, length_key = state_index.keys(
-                    node, context, stamp, length, canonical_length, terminal, first,
+                    state_node, context, stamp, length, canonical_length, terminal, first,
                     sequence, margin is not None, merge_shorter,
                 )
             else:
-                key = node, context, stamp, length, canonical_length, terminal, first, sequence
+                key = state_node, context, stamp, length, canonical_length, terminal, first, sequence
                 broad_key = key[:-1] if margin is not None else None
                 length_key = key[:3] + key[5:7] if merge_shorter else None
             if graph.options.history_dominance:
@@ -428,29 +438,54 @@ def search_compact(
         else:
             heapq.heappush(heap, (floor, next(serial), 0, label, 0))
         generated += 1
+        node_marks[node] = 1
+        state_marks[state_node] = 1
         if forward_dp and graph.options.max_labels is not None and generated >= graph.options.max_labels:
             raise ForwardLimit("search_cap")
 
+    def heading_of(label: int) -> int:
+        """Recover a stored prefix's incoming heading class from its parent waypoint."""
+        if turns is None:
+            return 0
+        integer_view: cython.longlong[:, ::1] = labels.int_view
+        index: cython.Py_ssize_t = label
+        parent: cython.Py_ssize_t = integer_view[1, index]
+        if parent < 0:
+            return 0
+        return turns.heading(cells[integer_view[0, parent]], cells[integer_view[0, index]])
+
     def targets(label: int) -> tuple[tuple[float, int, float, float], ...]:
-        """Cache geometry-only successor ordering for each node and destination."""
+        """Cache geometry-only successor ordering per node, destination and heading class."""
+        nonlocal turn_rejected
         integer_view: cython.longlong[:, ::1] = labels.int_view
         index: cython.Py_ssize_t = label
         node, context = integer_view[0, index], integer_view[2, index]
         goal = contexts[context][3]
-        key = node, cell_ids[goal]
+        heading = heading_of(label)
+        key = node, cell_ids[goal], heading
         if key not in target_cache:
             entries = []
             reachable = None if topology is None else topology.reaches(cell_ids[goal])
-            neighbors = (graph.neighbors(cells[node]) if topology is None else
-                         (cells[int(i)] for i in topology.targets[
-                             topology.offsets[node]:topology.offsets[node + 1]]
-                          if reachable[i]))
+            neighbors = tuple(graph.neighbors(cells[node]) if topology is None else
+                              (cells[int(i)] for i in topology.targets[
+                                  topology.offsets[node]:topology.offsets[node + 1]]
+                               if reachable[i]))
+            if heading:
+                # Legality depends on the incoming link; geometry below stays heading-free.
+                allowed = turns.allowed[heading]
+                origin = cells[node]
+                legal = tuple(target for target in neighbors
+                              if (target[0] - origin[0], target[1] - origin[1]) in allowed)
+                target_rejections[key] = len(neighbors) - len(legal)
+                neighbors = legal
             for target in neighbors:
                 distance = math.dist(graph.point(cells[node]), graph.point(target))
                 remaining = (math.dist(graph.point(target), graph.point(goal))
                              if lattice_bound is None else lattice_bound.remaining(target, goal))
                 entries.append((distance + remaining, cell_ids[target], distance, remaining))
             target_cache[key] = tuple(entries)
+        if heading:
+            turn_rejected += target_rejections[key]
         return target_cache[key]
 
     def schedule(label: int, start: int) -> None:
@@ -464,7 +499,7 @@ def search_compact(
         if compiled_search:
             if start == 0:
                 entries = targets(label)
-                key = integer_view[0, index], cell_ids[contexts[context][3]]
+                key = integer_view[0, index], cell_ids[contexts[context][3]], heading_of(label)
                 if key not in target_arrays:
                     target_arrays[key] = (np.array([entry[2] for entry in entries]),
                                           np.array([entry[3] for entry in entries]))
@@ -641,7 +676,9 @@ def search_compact(
             enqueue(target, label, context, paid, child_sequence, terminal, False,
                     child_stamp, child_length, child_positive, floor,
                     canonical_length + canonical_increment,
-                    labels.retired[label])
+                    labels.retired[label],
+                    # A sink has no continuation, so every heading is future-equivalent.
+                    0 if turns is None or terminal else turns.heading(cells[node], cells[target]))
 
     try:
         setup_started = time.perf_counter()
@@ -784,4 +821,4 @@ def search_compact(
     finally:
         # Cython closure environments retain helpers that point back to the whole search.
         # Break those references on every exit so arenas are released without waiting for GC.
-        bound = enqueue = intern_paid = prepared_edge = targets = None
+        bound = enqueue = intern_paid = prepared_edge = targets = heading_of = None

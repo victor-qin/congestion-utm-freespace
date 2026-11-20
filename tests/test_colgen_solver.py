@@ -59,6 +59,7 @@ from freespace_sim.planner.colgen.windows import (
     endpoint_claim_cells,
     visit_rows,
 )
+from freespace_sim.planner.turn_rule import path_turns_valid
 from freespace_sim.types import FlightRequest, IntentStatus, Terminal, vec
 from tests._colgen_support import with_air_hops
 
@@ -496,6 +497,43 @@ def test_pricing_allows_wide_loops_but_no_tight_revisits():
         if cell in positions:
             assert index - positions[cell] >= min_repeat
         positions[cell] = index
+
+
+def test_turn_rule_replaces_the_sharp_loop_and_rejects_it_everywhere():
+    """The same instance under the opt-in strict-turn domain: no turn of 90 degrees or more.
+
+    The free optimum above makes 120-degree turns. With the rule, pricing, seeding and the
+    canonical claim gate share one domain: the loop is rejected on import, the priced and
+    seed columns have only straight or 60-degree interior turns, and the restricted optimum
+    cannot beat the free one.
+    """
+
+    corridor = 2
+    cfg = _cfg(max_ground_delay_s=16.0)
+    params = _params(max_air_overrun_hops=corridor)
+    request = _request(3, (0, 0), (2, 0), cfg)
+    free_graph = with_air_hops(build_flight_graph(request, cfg, (), params), 2 + 64)
+    graph = replace(free_graph, turn_below_90=True)
+    duals = {
+        RowKey.cell((3, 0), 0, 9): 100.0,
+        RowKey.cell((-1, 0), 0, 12): 100.0,
+    }
+    free_rc, free_column = price_flight(free_graph, duals, 0.0, cfg, params)
+    reduced_cost, column = price_flight(graph, duals, 0.0, cfg, params)
+
+    assert not path_turns_valid(free_column.cell_path)
+    assert column is not None and path_turns_valid(column.cell_path)
+    assert column.cell_path[0] == (0, 0) and column.cell_path[-1] == (2, 0)
+    assert reduced_cost <= free_rc + 1e-9
+    assert path_turns_valid(seed_column(graph, cfg).cell_path)
+    with pytest.raises(ValueError, match="90 degrees"):
+        column_claims(free_column, graph, cfg)
+    assert column_claims(free_column, free_graph, cfg) == free_column.claims
+    # An exactly reversed hop is a 180-degree turn even where the revisit window would
+    # otherwise be narrower; a straight continuation and a 60-degree turn stay legal.
+    assert not path_turns_valid(((0, 0), (1, 0), (0, 0)))
+    assert path_turns_valid(((0, 0), (1, 0), (2, 0), (2, 1)))
+    assert not path_turns_valid(((0, 0), (1, 0), (1, 1), (0, 1)))
 
 
 def test_master_lazy_lp_and_ip_rows_are_claim_feasible():

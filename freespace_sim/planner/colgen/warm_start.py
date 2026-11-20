@@ -47,6 +47,7 @@ import time
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from freespace_sim.planner import hexgrid as hg
+from freespace_sim.planner.turn_rule import path_turns_valid
 from freespace_sim.planner.colgen.network import column_claims
 from freespace_sim.planner.colgen.translate import Column, column_to_intent
 
@@ -211,6 +212,8 @@ def intent_to_column(intent, graph, cfg: "SimConfig", model=None):
         if hg.hex_distance(before, after) != 1:
             # Every cruise transition must be one adjacent-cell hop.
             return None, "path contains a non-neighbour hop"
+    if graph.turn_below_90 and not path_turns_valid(cells):
+        return None, "path turns by 90 degrees or more"
 
     column = Column(
         flight_id=intent.request.flight_id,

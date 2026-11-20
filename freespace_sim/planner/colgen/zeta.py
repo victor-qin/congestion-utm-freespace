@@ -28,6 +28,9 @@ class ZetaPricingResult:
     - equivalent_histories_merged (int): guarded equal-price histories represented by another prefix.
     - merge_error_bound (float): whole-route numerical allowance included in upper_bound.
     - shorter_histories_merged (int): subset of guarded merges comparing both lengths.
+    - turn_rejected (int): declared successors skipped by the opt-in turn rule.
+    - waypoint_states, heading_states (int): distinct waypoints and waypoint/heading pairs
+      among enqueued labels.
     """
 
     column: Column | None
@@ -69,6 +72,9 @@ class ZetaPricingResult:
     incumbent_setup_s: float = 0.0
     dp_waypoints: int = 0
     dp_peak_pending: int = 0
+    turn_rejected: int = 0
+    waypoint_states: int = 0
+    heading_states: int = 0
 
 
 

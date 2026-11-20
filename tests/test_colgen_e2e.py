@@ -25,6 +25,7 @@ from freespace_sim.scenario import scenario_from_requests
 from freespace_sim.scenarios import get_scenario, with_overrides
 from freespace_sim.scenarios.colgen import COLGEN_USS
 from freespace_sim.sim import _wall_aware, run
+from freespace_sim.planner.turn_rule import path_turns_valid
 from freespace_sim.types import DenialReason, FlightRequest, Terminal, vec
 
 
@@ -116,6 +117,54 @@ def test_real_crossing_batch_files_every_selected_column():
     assert verify.find_interflight_conflict(intents, cfg) is None
 
 
+def test_dp_turn_rule_batch_is_safe_and_worker_count_independent():
+    """Production DP with the opt-in strict-turn domain: every pooled column obeys it.
+
+    On this instance the free solve pools and selects a route turning 90 degrees or more,
+    so the rule binds. With it, serial and two-worker solves return the same schedule and
+    pool, and the schedule remains accepted and collision-free.
+    """
+    from freespace_sim.planner.colgen.solver import ColGenSolver
+    from freespace_sim.planner.colgen.translate import column_to_intent
+
+    cfg = SimConfig(
+        planner="colgen",
+        flight_levels_m=(100.0,),
+        airspace_ceiling_m=125.0,
+        region_size_m=(20_000.0, 20_000.0),
+        max_ground_delay_s=8.0,
+    )
+    requests = [
+        FlightRequest(index + 1, _point(origin, cfg), _point(dest, cfg), 0.0, 0.0)
+        for index, (origin, dest) in enumerate((((-3, 0), (3, 0)), ((0, -3), (0, 3)),
+                                                ((-3, 3), (3, -3)), ((3, 0), (-3, 0))))
+    ]
+    params = ColGenParams(solver="highs", max_air_overrun_hops=3, time_limit_s=30.0)
+    pools = []
+    free = ColGenSolver().solve(
+        requests, cfg, (), params,
+        on_iteration=lambda state: pools.append(state["master"]) if not pools else None,
+    )
+    assert any(not path_turns_valid(c.cell_path) for c in pools[0].columns)
+    outcomes = []
+    for workers in (0, 2):
+        masters = []
+        result = ColGenSolver().solve(
+            requests, cfg, (), replace(params, turn_below_90=True, n_pricing_workers=workers),
+            on_iteration=lambda state: masters.append(state["master"]) if not masters else None,
+        )
+        assert masters and all(path_turns_valid(c.cell_path) for c in masters[0].columns)
+        assert result.columns
+        by_id = {request.flight_id: request for request in requests}
+        intents = [column_to_intent(column, by_id[fid], cfg)
+                   for fid, column in result.columns.items()]
+        assert all(intent.accepted for intent in intents)
+        assert verify.find_interflight_conflict(intents, cfg) is None
+        outcomes.append((result.columns, tuple(masters[0].columns)))
+    assert outcomes[0] == outcomes[1]
+    assert free.columns
+
+
 def test_colgen_terminal_rows_enforce_pad_capacity():
     cfg = SimConfig(
         planner="colgen",
@@ -176,12 +225,16 @@ def test_colgen_terminal_rows_enforce_pad_capacity():
     ("compiled-indexed", True, 2, True, True, ()),
     ("compiled-merge240-indexed", True, 2, True, True, ()),
     ("compiled-merge12-forward-dp-indexed", True, 2, True, True, ()),
+    ("compiled-merge12-forward-dp-indexed-turn", True, 2, True, True, ()),
+    ("compiled-merge240-indexed-turn", True, 2, True, True, ()),
+    ("reference-turn", True, 0, True, True, ()),
 ], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy", "parallel",
         "parallel-pruned-snapped", "early-reference", "early-compiled", "early-parallel", "all-bounds-parallel", "all-bounds-reference",
         "long24-parallel", "merged-12-parallel", "merged-240-parallel",
         "forward-12-parallel", "forward-dp-parallel", "forward-240-parallel", "forward-full-parallel",
         "lattice-12-parallel", "lattice-240-parallel", "indexed-full-parallel",
-        "indexed-radius-parallel", "indexed-forward-dp-parallel"])
+        "indexed-radius-parallel", "indexed-forward-dp-parallel",
+        "turn-indexed-forward-dp-parallel", "turn-indexed-radius-parallel", "turn-reference"])
 def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
     shared_hub, backend, lazy, workers, prune_snap, early_return, completion_bounds,
 ):
@@ -191,6 +244,8 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
     from freespace_sim.planner.zeta.geometry import reservation_claims
     from freespace_sim.planner.colgen.zeta_solver import solve_zeta
 
+    turn = backend.endswith("-turn")
+    backend = backend.removesuffix("-turn")
     native_state_index = backend.endswith("-indexed")
     backend = backend.removesuffix("-indexed")
     forward_dp = backend.endswith("-dp")
@@ -235,7 +290,7 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
     params = ColGenParams(
         solver="highs", max_air_overrun_hops=0, time_limit_s=25.0,
         ip_time_limit_s=3.0, ip_reserve_s=4.0, iteration_ip_time_limit_s=0.0,
-        n_heuristic_tries=4, n_pricing_workers=workers,
+        n_heuristic_tries=4, n_pricing_workers=workers, turn_below_90=turn,
     )
     options = ZetaOptions(connection_radius_m=radius, max_expansions=1000, max_labels=10000,
                           backend=backend, lazy_successors=lazy, expire_history=prune_snap,
@@ -249,10 +304,16 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
                           lattice_distance_bound=lattice,
                           compiled_loop=merge_equivalent or native_state_index,
                           compiled_history=merge_equivalent,
-                          native_state_index=native_state_index)
+                          native_state_index=native_state_index, turn_below_90=turn)
     result = solve_zeta(
         requests, cfg, terms, params, options=options,
     )
+    assert result.stats["turn_below_90"] is turn
+    with pytest.raises(ValueError, match="must agree"):
+        solve_zeta(requests, cfg, terms, replace(params, turn_below_90=not turn), options=options)
+    if turn:
+        assert "turns strictly below 90 degrees" in result.stats["certificate_scope"]
+        assert all(path_turns_valid(column.cell_path) for column in result.master.columns)
     if forward:
         assert result.stats["forward_cruise"]
         assert result.stats["certificate_scope"].startswith("forward-only cruise;")

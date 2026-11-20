@@ -292,6 +292,8 @@ def main() -> None:
                         help="merge guarded histories no longer in both lengths; requires --strong-history-dominance")
     parser.add_argument("--forward-cruise", action="store_true",
                         help="require positive origin-to-destination progress on cruise waypoint links")
+    parser.add_argument("--turn-below-90", action="store_true",
+                        help="require every interior cruise waypoint to turn strictly below 90 degrees")
     parser.add_argument("--lattice-distance-bound", action="store_true",
                         help="use a guarded twelve-direction remaining-distance lower bound where supported")
     parser.add_argument("--route-coverage-cache", action="store_true",
@@ -323,7 +325,7 @@ def main() -> None:
     from freespace_sim.planner.colgen.params import ColGenParams
 
     params = ColGenParams(
-        solver=args.solver, max_air_overrun_hops=args.overrun,
+        solver=args.solver, max_air_overrun_hops=args.overrun, turn_below_90=args.turn_below_90,
         time_limit_s=args.seconds, ip_time_limit_s=args.ip_seconds,
         ip_reserve_s=min(args.ip_seconds + 1.0, args.seconds / 2),
         max_iterations=args.iterations, n_pricing_workers=args.workers,
@@ -354,7 +356,8 @@ def main() -> None:
                           traversal=args.traversal,
                           lattice_distance_bound=args.lattice_distance_bound,
                           route_coverage_cache=args.route_coverage_cache,
-                          compiled_route_coverage=args.compiled_route_coverage)
+                          compiled_route_coverage=args.compiled_route_coverage,
+                          turn_below_90=args.turn_below_90)
     arms = ("dp", "adjacent", "zeta") if args.arm == "all" else (args.arm,)
     source_root = Path(__file__).resolve().parents[2]
     planner_root = source_root / "freespace_sim" / "planner"

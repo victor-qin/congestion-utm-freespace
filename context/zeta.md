@@ -51,6 +51,51 @@ Current code reads only captures made with current code. Graph pickles from the
 prototype branch are not migrated; scripts that select frozen source keep running
 against that source, and anything reused against current code is recaptured.
 
+## Traversal for column generation
+
+Use `traversal="best_first"` for column generation. It expands partial routes in
+order of their completion-cost lower bound; this is **best-first**, not breadth-first
+search. It is already the default in `ZetaOptions` and
+`experiments.colgen_full_cohort`. To apply it to an existing sweep configuration,
+change only `traversal`: connection geometry, `forward_cruise`, turn rules and work
+caps remain independent choices. An options-file override is:
+
+```json
+{"zeta_options": {"traversal": "best_first"}}
+```
+
+The opt-in `forward_dp` traversal processes waypoints in forward topological order.
+It can spend its expansion budget on partial routes before reaching a destination.
+Keep it available for explicit comparisons; the CG measurements below do not
+establish which traversal is faster for standalone planning.
+
+### 100-flight forward-graph comparison (2026-11-20)
+
+The comparison used main `c28a30aa` plus the then-unmerged price-rounding and compiled
+arrival-bound patches. All arms used price snapping, arrival bounds, the same
+forward hex12 graph and seed pool, turns strictly below 90 degrees, 12 workers,
+50,000 expansions / 250,000 labels per call and a 300-second solve budget.
+`target_cutoff` is the dependency patch's option to prune at the pricing target.
+
+| Traversal | Target cutoff | Pricing seconds | Rounds | Expanded partial routes | Final capped calls | Reported gap |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Forward sweep | Off | 192.1 | 17 | 7,070,749 | 7 | 11.23% |
+| Forward sweep | On | 144.3–164.4 | 16 | 3,294,881 | 3 | 9.70% |
+| Best-first | On | 57.9–59.6 | 6 | 894,852 | 2 | 4.77% |
+
+The cutoff and best-first arms each ran twice in mirrored order and reproduced
+their work counts and outcomes exactly. Unrelated VM CPU load varied, so the
+timings are indicative; expansion counts provide the more reproducible comparison.
+All five solves served all 100 flights with no detected collision, capacity or turn
+violations. Gaps cover the restricted graph and supplied seed pool.
+
+On identical final-round inputs, best-first found an improving route for flight
+2278 in 5,398 expansions; both traversals still capped on flights 2386 and 3098.
+The sweep capped on all three. Thus best-first reduces capping but does not remove
+it. These capped calls had feasible routes available, but neither found an improving
+route nor proved that no improvement existed before the cap. A cap is not a denial
+of service for that flight.
+
 ## Standalone FCFS
 
 Use `get_planner("zeta", ZetaPlannerParams(...))`, or `sim.run` with
@@ -64,7 +109,7 @@ from freespace_sim.planner.zeta import ZetaOptions, ZetaPlannerParams
 
 planner = get_planner("zeta", ZetaPlannerParams(
     options=ZetaOptions(
-        connection_mode="hex12", forward_cruise=True, traversal="forward_dp",
+        connection_mode="hex12", forward_cruise=True, traversal="best_first",
         backend="compiled", compiled_loop=True, native_state_index=True,
         expire_history=True, history_dominance=True, strong_history_dominance=True,
         compiled_history=True, arrival_snap_s=1.0, speed_fraction=0.05,

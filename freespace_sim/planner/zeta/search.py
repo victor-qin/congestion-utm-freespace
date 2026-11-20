@@ -61,8 +61,9 @@ class ZetaOptions:
       twelve-direction step sets, with conservative numerical and endpoint guards.
     - merge_shorter_histories (bool): retain guarded equal-price prefixes no longer
       in either accumulated length, with the same whole-route numerical allowance.
-    - traversal (str): ``best_first`` or opt-in ``forward_dp`` waypoint sweep;
-      the latter requires the compiled backend and forward-only twelve-link graph.
+    - traversal (str): ``best_first`` (default, recommended for column-generation pricing)
+      orders partial routes by their completion-cost lower bound; opt-in ``forward_dp``
+      uses a waypoint sweep requiring the compiled backend and forward-only twelve-link graph.
     - native_state_index (bool): intern exact continuation keys in native numeric tables;
       available to every connection mode and traversal using the compiled loop.
     - turn_below_90 (bool): require every interior cruise waypoint to deflect strictly less

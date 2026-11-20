@@ -169,6 +169,33 @@ heading-aware seed search. Production DP needs no new state because its
 dominance key already contains the predecessor cell. Certificates cover only
 the restricted domain. GPU pricing refuses the option.
 
+## Optional price rounding and target pruning
+
+`ZetaOptions(price_snap=True)` searches on rounded prices: every positive price
+below the column-generation epsilon (1e-6) and every negative price is withheld
+from the search vector. Labels, floors, histories and the pruning cutoff all
+live in that rounded space, so solver noise no longer splits paid-row sets.
+Candidate routes are re-priced on the full prices; the reported column and any
+early return use full-price reduced costs. The certified bound adds back the
+withheld negative mass, rounded down; withheld positives need no correction. A
+complete search that cannot decide the target under the full prices reports
+`snap_uncertainty` (incomplete), as `merge_uncertainty` does. With nothing
+withheld the search is unchanged.
+
+`ZetaOptions(target_cutoff=True)` applies to early-return calls only. It prunes
+at `min(incumbent, cut)` with `cut = target - withheld negative mass + largest
+endpoint merge margin`, and exhausting below the cut finishes `no_improvement`.
+Soundness never depends on the cut, because the bound is re-derived when the
+search finishes; the two allowances only let that exhaustion certify. Without
+the merge-margin term, merge-guarded proofs became `merge_uncertainty`. Only
+`traversal="forward_dp"` changes; best-first already expands in floor order.
+
+Measured on actual100 with the turn limit on (2026-11-20): best-first radius240
+with rounding narrowed the certified gap from 11.6% to 8.5% with 44% fewer
+expansions; the forward sweep ran 17 rounds instead of 5, because Zeta stops
+only when a sweep finds nothing, and the cut halved its expansions. Production
+DP does not use price rounding (`context/HISTORY.md`).
+
 ## Comparing fleet policies
 
 ```sh

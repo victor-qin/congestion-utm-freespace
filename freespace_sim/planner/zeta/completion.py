@@ -8,6 +8,8 @@ import math
 import time
 from typing import Any, TYPE_CHECKING
 
+import numpy as np
+
 from ..route_domain import RowKey
 from ..route_cost import CostModel
 
@@ -23,7 +25,7 @@ class CompletionBounds:
     names: tuple[str, ...]
     build_s: float
     table_states: int
-    _rows: tuple[RowKey, ...] = ()
+    _rows: tuple[RowKey, ...] | None = None
 
     @classmethod
     def build(
@@ -63,7 +65,17 @@ class CompletionBounds:
                    sum(bound.table_states for bound in components))
 
     def bind(self, rows: tuple[RowKey, ...]) -> None:
-        """Let components with a compiled id path pack per-row data for one row table."""
+        """Pack per-row data for one row table so floor_ids can take table-row ids.
+
+        Parameters
+        ------------
+        - rows (tuple[RowKey, ...]): the compact search's row table; ids passed to floor_ids
+          must index this exact tuple.
+
+        Return
+        --------
+        - output (None): components with a compiled id path store their packed arrays.
+        """
         for bound in self.components:
             if hasattr(bound, "floor_ids"):
                 bound.bind(rows)
@@ -72,7 +84,7 @@ class CompletionBounds:
     def floor_ids(
         self, cell: Cell, goal: Cell, stamp: float, length: float,
         positive_paid: float, ground: float, negative: float, fold_m: float | None,
-        paid: Any, terminal: bool = False,
+        paid: np.ndarray, terminal: bool = False,
     ) -> float:
         """Same maximum as floor() for unique table-row ids from the row tuple given to bind().
 
@@ -87,6 +99,8 @@ class CompletionBounds:
         --------
         - output (float): safe full completion floor; negative infinity when none applies.
         """
+        if self._rows is None:
+            raise RuntimeError("CompletionBounds.bind() must run before floor_ids()")
         best = -math.inf
         keys = None
         for bound in self.components:

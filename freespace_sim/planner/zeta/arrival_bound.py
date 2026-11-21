@@ -81,15 +81,17 @@ def _arrival_floor_kernel(
     --------
     - output (float): the same floor as the interpreted method, or -inf.
     """
-    (_earliest, latest_static, minimum_ratio, maximum_ratio, time_error, length_error,
-     delta, first_bin_f, max_length, attachment, reference, distance_error, coefficient,
-     air_error, quantum, positive_error, negative_error, union_error, air_ceiling,
+    # Order must match ArrivalBound.bind's packing; change both together.
+    (latest_static, minimum_ratio, maximum_ratio, time_error, length_error, delta,
+     first_bin_f, max_length, attachment, reference, distance_error, coefficient, air_error,
+     quantum, positive_error, negative_error, union_error, air_ceiling,
      twice_abs) = (scalars[0], scalars[1], scalars[2], scalars[3], scalars[4], scalars[5],
                    scalars[6], scalars[7], scalars[8], scalars[9], scalars[10], scalars[11],
                    scalars[12], scalars[13], scalars[14], scalars[15], scalars[16],
-                   scalars[17], scalars[18], scalars[19])
+                   scalars[17], scalars[18])
     first_bin = int(first_bin_f)
-    # Landing window, per-bin charges and distance coupling: context/figures/zeta_arrival_bound.png
+    # Landing window, per-bin charges and distance coupling:
+    # context/figures/zeta_arrival_bound.png
     available = max(0.0, np.nextafter(np.nextafter(max_length + 1e-7 - length, np.inf)
                                       + length_error, np.inf))
     earliest = max(stamp, np.nextafter(np.nextafter(stamp + np.nextafter(
@@ -399,6 +401,9 @@ class ArrivalBound:
     def bind(self, rows: tuple[RowKey, ...]) -> None:
         """Pack static constants and each table row's charge slice for floor_ids.
 
+        Ids later passed to floor_ids must index this exact tuple: the compiled kernel does
+        not bounds-check them.
+
         Parameters
         ------------
         - rows (tuple[RowKey, ...]): the compact search's row table; ids index this tuple.
@@ -416,8 +421,9 @@ class ArrivalBound:
             if interval is not None:
                 begin[index], end[index], weight[index] = interval
         positive_error, negative_error, union_error = self._price_errors
+        # Order must match _arrival_floor_kernel's unpacking; change both together.
         scalars = np.asarray([
-            static.earliest, static.latest, static.minimum_ratio, static.maximum_ratio,
+            static.latest, static.minimum_ratio, static.maximum_ratio,
             static.time_error, static.length_error, static.delta, float(static.first_bin),
             self._graph.max_length, static.attachment, self._graph.reference,
             static.distance_error, self._coefficient, self._air_error, self._quantum,
@@ -444,6 +450,8 @@ class ArrivalBound:
         --------
         - output (float): identical to floor() on the same state.
         """
+        if self._packed is None:
+            raise RuntimeError("ArrivalBound.bind() must run before floor_ids()")
         rows, scalars, begin, end, weight, couple_terminal = self._packed
         static = self._geometry
         if terminal:
@@ -456,9 +464,9 @@ class ArrivalBound:
         remaining = static.remaining.get((cell, goal))
         if remaining is None:
             return -math.inf
-        return float(_arrival_floor_kernel(
+        return _arrival_floor_kernel(
             scalars, self._totals, static.starts, begin, end, weight, paid, stamp, length,
-            positive_paid, ground, negative, remaining, fold_m is not None and couple_terminal))
+            positive_paid, ground, negative, remaining, fold_m is not None and couple_terminal)
 
     def floor(
         self, cell: Cell, goal: Cell, stamp: float, length: float,
@@ -466,6 +474,10 @@ class ArrivalBound:
         paid: Iterable[RowKey], terminal: bool = False,
     ) -> float:
         """Lower-bound every canonical completion, discounting rows already paid once.
+
+        _arrival_floor_kernel mirrors the non-terminal branch operation for operation, so
+        an edit here must be made there too; the parity asserts in
+        tests/test_zeta_search.py (_check_anyangle_completion_bounds) compare both bit for bit.
 
         Parameters
         ------------
@@ -499,7 +511,8 @@ class ArrivalBound:
             charges = np.asarray([units * self._quantum])
             future = np.asarray([0.0])
         else:
-            # Landing window, per-bin charges and distance coupling: context/figures/zeta_arrival_bound.png
+            # Landing window, per-bin charges and distance coupling:
+            # context/figures/zeta_arrival_bound.png
             available = max(0.0, _up(_up(graph.max_length + 1e-7 - length)
                                       + static.length_error))
             earliest = max(stamp, _down(_down(stamp + _down(

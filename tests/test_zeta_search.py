@@ -433,6 +433,33 @@ def _check_anyangle_completion_bounds(
                     assert bound.floor_ids(cell, goal, stamp, length, positive, ground, negative,
                                            fold, extra_ids) == bound.floor(
                         cell, goal, stamp, length, positive, ground, negative, fold, extra)
+    # Random partial paid sets and clocks one ulp either side of a bin edge stress the
+    # compiled discount clipping and binning beyond the states real prefixes reach.
+    from freespace_sim.planner.zeta.arrival_bound import _ulp
+
+    rng = np.random.default_rng(7)
+    for bound in bounds.components:
+        if not hasattr(bound, "floor_ids"):
+            continue
+        static, destination = bound._geometry, sorted(bound._slices, key=repr)
+        for _ in range(200):
+            column = columns[int(rng.integers(len(columns)))]
+            cell = column.cell_path[int(rng.integers(max(1, len(column.cell_path) - 1)))]
+            edge = (static.first_bin + int(rng.integers(len(static.starts)))) * static.delta
+            stamp = float(np.nextafter(edge, -np.inf if rng.random() < 0.5 else np.inf))
+            subset = ({row for row in table_rows if rng.random() < 0.2}
+                      | {row for row in destination if rng.random() < 0.5})
+            ids = np.asarray(sorted(table_ids[row] for row in subset), dtype=np.int64)
+            state = (cell, column.cell_path[-1], stamp, float(rng.uniform(0.0, graph.max_length)),
+                     float(rng.uniform(0.0, 5.0)), float(rng.uniform(0.0, 3.0)), negative,
+                     graph.fold_length(column.origin_lane_idx, column.dest_lane_idx))
+            assert bound.floor_ids(*state, ids) == bound.floor(*state, subset), state
+    for value in (0.0, 5e-324, 2.2250738585072014e-308, 1.0, float(np.finfo(np.float64).max)):
+        assert _ulp(value) == math.ulp(value)
+    with pytest.raises(RuntimeError, match="bind"):
+        CompletionBounds.build(graph, prices, model).floor_ids(
+            graph.origins[0][1], columns[0].cell_path[-1], 0.0, 0.0, 0.0, 0.0, negative, None,
+            np.zeros(0, dtype=np.int64))
     expired = CompletionBounds.build(graph, prices, model, deadline=time.perf_counter() - 1.0)
     assert not expired.components
     return strongest

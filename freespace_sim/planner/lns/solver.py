@@ -93,6 +93,20 @@ class LNSConfig:
     # See context/sipp_lns_plan.md.
     repair_planner: str = "astar"
 
+    # Where the shortcut refiner runs inside a destroy/repair transaction.
+    #
+    # APPENDED, not inserted: `test_lns_config_preserves_the_legacy_positional_tail` pins the
+    # positional order, and callers construct this positionally.
+    #
+    # "none" is the historical behaviour (bare A* repairs; refine the final incumbent yourself if
+    # you want the geometry win).
+    # "interleaved" cuts each victim before it is committed, so the NEXT victim plans around the
+    # tightened corridor; "deferred" cuts all k after the PP loop but before the accept test;
+    # "post_accept" accepts on un-cut cost and polishes only the winner. Everything but "none"
+    # produces a refined incumbent, so the delay ruler must be refined too — see `shortcut_ruler`.
+    shortcut_arm: str = "none"          # none | interleaved | deferred | post_accept
+    shortcut_ruler: bool | None = None  # None -> True whenever shortcut_arm != "none"
+
 
 @dataclass
 class LNSResult:
@@ -295,6 +309,24 @@ def _validate_lns_config(lns: LNSConfig) -> LNSConfig:
         raise ValueError(
             f"LNSConfig.repair_planner {lns.repair_planner!r} is not a supported LNS repair planner "
             f"(want one of {LNS_REPAIR_PLANNERS})")
+    if lns.shortcut_arm not in ("none", "interleaved", "deferred", "post_accept"):
+        raise ValueError(
+            f"unknown LNSConfig.shortcut_arm {lns.shortcut_arm!r} (want 'none', 'interleaved', "
+            "'deferred' or 'post_accept')")
+    # Not covered by `LNSState`'s own version of this check: "interleaved" reaches it as
+    # shortcut_repair="none" plus a wrapper, so the state cannot see that the pipeline refines.
+    if lns.shortcut_arm != "none" and lns.shortcut_ruler is False:
+        raise ValueError(
+            f"shortcut_arm={lns.shortcut_arm!r} with shortcut_ruler=False: the repaired incumbent "
+            "would be measured against a bare-A* unimpeded plan, so every refined flight's delay "
+            "premium goes negative and clamps to a silent 0")
+    # The DROP workers build their own LNSState (parallel._worker_main) and do not carry the arm, so
+    # a parallel shortcut run would repair with bare A* in the workers while the coordinator believed
+    # otherwise. Refuse loudly rather than ship a half-wired arm.
+    if lns.shortcut_arm != "none" and _effective_search_workers(lns) > 1:
+        raise ValueError(
+            f"shortcut_arm={lns.shortcut_arm!r} is sequential-only: the DROP workers construct their "
+            "own LNSState and would repair with bare A*. Run with search_workers=1.")
 
     integer_minima = {
         "seed": 0,
@@ -528,12 +560,37 @@ def _build_lns_state(
         static_terms=ledger.static_terminals() if static_terms is None else static_terms,
         frozen_flight_ids=lns.frozen_flight_ids,
         movable_uss_ids=lns.movable_uss_ids,
+        repair_planner=_repair_planner_for(lns),
         incremental_release=lns.incremental_release,
         repair_planner_name=lns.repair_planner,
         unimpeded_workers=lns.unimpeded_workers,
         maintain_claim_index=maintain_claim_index,
         window_bytes=lns.window_bytes,
+        shortcut_repair="none" if lns.shortcut_arm == "interleaved" else lns.shortcut_arm,
+        shortcut_ruler=(lns.shortcut_arm != "none" if lns.shortcut_ruler is None
+                        else lns.shortcut_ruler),
     )
+
+
+def _repair_planner_for(lns: LNSConfig):
+    """The repair planner an arm needs, or None to let ``LNSState`` build the named default.
+
+    Only "interleaved" needs one: refining before the commit is exactly what ``ShortcutRefiner.plan``
+    does. The deferred arms keep the bare planner and cut afterwards inside the transaction, so they
+    take the default and cost nothing extra to construct.
+
+    Built by ``_new_repair_planner``, not assembled here, so the refiner lands BENEATH the itinerary
+    wrapper — the order ``get_planner`` uses. Wrapping the other way round hands the refiner a
+    composed round trip, which it refuses, leaving an arm that silently cuts nothing. Routing
+    through the one construction site also keeps the named search (``repair_planner="sipp"`` must
+    not silently repair with A*), ``evict_floor = 0.0`` and the ``window_bytes`` budget with their
+    single owner."""
+    if lns.shortcut_arm != "interleaved":
+        return None
+    from freespace_sim.planner.lns.state import _new_repair_planner
+
+    return _new_repair_planner(lns.repair_planner, incremental_release=lns.incremental_release,
+                               window_bytes=lns.window_bytes, shortcut=True)
 
 
 def _finalize_lns_result(

@@ -975,7 +975,7 @@ def test_astar_shortcut_deconflicts_from_committed_traffic_laterally(planner_nam
 def test_shortcut_reuses_the_inner_capacity_authority():
     """The refiner must find the pad-capacity authority its inner planner already bound to a ledger.
 
-    Regression pin for a SILENT failure mode. ``_terminal_capacity_for`` returning None does not
+    Regression pin for a SILENT failure mode. ``terminal_capacity_for`` returning None does not
     raise — it makes ``plan`` hand back the UNREFINED inner intent for every terminal flight, i.e.
     ``astar_shortcut`` quietly degrading to bare ``astar``. Nothing else in this file catches it:
     the ``Inner`` fakes supply their own authority, and
@@ -990,12 +990,30 @@ def test_shortcut_reuses_the_inner_capacity_authority():
     led = ReservationLedger(CFG)
     astar.plan(_req(), led, CFG)                       # binds the authority to THIS ledger
 
-    found = shortcut_mod._terminal_capacity_for(astar, led)
+    found = shortcut_mod.terminal_capacity_for(astar, led)
     assert isinstance(found, TerminalCapacity), "inner authority not found — refinement would no-op"
     assert found is astar._tcap, "found a DIFFERENT authority — the point is to reuse, not rebuild"
 
     # reachable through the wrapper chain, which is how ShortcutRefiner actually calls it
-    assert shortcut_mod._terminal_capacity_for(ShortcutRefiner(astar), led) is found
+    assert shortcut_mod.terminal_capacity_for(ShortcutRefiner(astar), led) is found
 
     # ...and correctly ABSENT for a ledger this planner never planned against
-    assert shortcut_mod._terminal_capacity_for(astar, ReservationLedger(CFG)) is None
+    assert shortcut_mod.terminal_capacity_for(astar, ReservationLedger(CFG)) is None
+
+
+def test_a_composed_round_trip_is_never_spliced():
+    """A round trip is ONE flight whose centerline runs origin -> dest -> origin around the delivery
+    dwell. The refiner splices interior knots and measures the result against an origin->dest
+    reference, so refining the composed intent could cut the delivery stop out of the middle.
+    Round trips are refined per LEG, beneath ItineraryPlanner — the order `get_planner` composes."""
+    led = ReservationLedger(CFG)
+    composed = get_planner("astar").plan(
+        FlightRequest(1, vec(0, 0, 0), vec(2400, 0, 0), 0.0, return_to_origin=True), led, CFG)
+    assert composed.accepted and composed.request.return_to_origin
+    assert len(composed.centerline) > 3          # long enough that the 3-point floor is not the refuser
+    assert not shortcut_mod.can_refine(composed)
+    assert shortcut_mod.refine_intent(composed, led, CFG, tcap=None) is composed
+
+    leg = get_planner("astar").plan(_req(), led, CFG)     # the one-way legs stay refinable
+    assert not leg.request.return_to_origin
+    assert shortcut_mod.can_refine(leg)

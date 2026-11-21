@@ -47,6 +47,37 @@ CG callers use `colgen.zeta.price_zeta`; direct search callers use `zeta.search`
 with `SearchSettings`, `Route` and `SearchResult`. The public CG adapter retains
 its CG arguments and result type.
 
+### CG runtime
+
+`solve_zeta` stops on convergence within the history-merge allowance, then on the DP's LP gap
+(`ColGenParams.lp_gap`, current LP against the certified Lagrangian bound), then on a
+capped sweep that proposed nothing (`pricing_limit`), or on its time limit. A search left
+open only by its history-merge allowance (`merge_uncertainty`) counts as settled; its
+widened bound still enters the Lagrangian bound. Any remaining price-rounding uncertainty
+stays incomplete even when the result also reports a merge allowance. Both cost and revenue gaps are recorded;
+`gap_metric` selects the same threshold scale as DP.
+
+Pricing workers keep flight graphs between sweeps, rebalance owners longest-first from the
+previous sweep's task times, receive only columns they lack, and may release least recently
+priced graphs past `zeta_worker_cache_bytes`. Workers never collect garbage automatically:
+they collect and freeze their heap once after setup and once after each sweep. The parent
+waits for cleanup under the sweep deadline before sending another batch. None of this
+changes pricing results.
+
+`zeta_search_memory_bytes` sizes a per-search label threshold:
+`bytes // zeta_pool.SEARCH_BYTES_PER_LABEL` labels (a tighter `ZetaOptions.max_labels`
+stands). `zeta_pool.search_memory_bytes` sizes it from a worker's share of the memory limit:
+`(0.8 * limit - parent_reserve) / workers - WORKER_BASE_BYTES - graphs`, where graphs is
+`ceil(flights / workers) * GRAPH_RESIDENT_BYTES`. Cache eviction does not increase the search
+budget because RSS changes cannot bound live object sizes. The
+constants are measured (`.agent/zeta-runtime-main-20261120/README.md`) and must be
+re-measured when label storage changes. `experiments.colgen_full_cohort` always applies it.
+Best-first search checks its threshold between successor batches and may exceed it by one
+batch (at most 12 labels for hex12 eager expansion, one for lazy expansion). This is an
+estimated memory budget with headroom, not an operating-system RSS limit.
+A capped search returns a valid incomplete bound and is counted per sweep
+(`capped_searches`, `max_search_generated`).
+
 Current code reads only captures made with current code. Graph pickles from the
 prototype branch are not migrated; scripts that select frozen source keep running
 against that source, and anything reused against current code is recaptured.

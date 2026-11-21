@@ -11,7 +11,7 @@ import os
 import time
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Hashable
 
 import numpy as np
@@ -23,9 +23,10 @@ from .master import BackendTimeout, RestrictedMaster
 from .network import FlightGraphInfeasible, RowIndex, RowKey, StaticTerminalCatalog, build_flight_graph
 from .objective import cost_model
 from .params import ColGenParams
+from .solver import _relative_cost_gap, _relative_revenue_gap
 from .translate import Column
-from .zeta import ZetaGraph, ZetaOptions, price_zeta
-from .zeta_pool import ZetaPricingPool, ZetaSeedResult, build_seed_columns
+from .zeta import ZetaGraph, ZetaOptions, ZetaPricingResult, price_zeta
+from .zeta_pool import ZetaPricingPool, ZetaSeedResult, build_seed_columns, search_label_cap
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,29 @@ def _keep_incumbent(
     return incumbent
 
 
+def _settled(result: ZetaPricingResult, epsilon: float) -> bool:
+    """Accept a completed search or a proof left open only by its merge allowance.
+
+    Price rounding can also widen a result labelled ``merge_uncertainty``. Subtracting the
+    merge allowance must close the remaining gap; otherwise the search stays incomplete.
+    The full widened bound always enters the Lagrangian bound.
+
+    Parameters
+    ------------
+    - result (ZetaPricingResult): returned column, status and certified pricing bound.
+    - epsilon (float): master's improvement tolerance.
+
+    Return
+    --------
+    - output (bool): whether only the explicit history-merge allowance remains unproven.
+    """
+    return bool(result.complete) or (
+        result.reason == "merge_uncertainty"
+        and result.upper_bound - result.merge_error_bound
+        <= max(epsilon, result.reduced_cost) + 1e-7
+    )
+
+
 def _spatial_key(column: Column) -> tuple[int, tuple[tuple[int, int], ...]]:
     """Ignore departure shifts and redundant forward-collinear waypoint knots."""
     corners: list[tuple[int, int]] = []
@@ -158,6 +182,12 @@ def solve_zeta(
     if reserve is None:
         reserve = min(5.0, 0.05 * params.time_limit_s)
     pricing_deadline = deadline - reserve
+    if params.zeta_search_memory_bytes is not None:
+        # The memory cap only ever tightens a caller's label limit; options travel with the
+        # graph definitions, so pool workers and serial pricing share the same cap.
+        label_cap = search_label_cap(params.zeta_search_memory_bytes)
+        if options.max_labels is None or options.max_labels > label_cap:
+            options = replace(options, max_labels=label_cap)
     model = cost_model(cfg, params)
     catalog = _terminal_catalog(ordered, static_terms, cfg)
     row_index = RowIndex()
@@ -194,7 +224,7 @@ def solve_zeta(
     pricing_bound_certified = False
     termination = "max_iterations"
     total_expanded = total_generated = capped_searches = 0
-    early_return_searches = no_improvement_searches = 0
+    early_return_searches = no_improvement_searches = merge_allowance_searches = 0
     edge_evaluations = successor_pops = 0
     history_pruned = history_expired_rows = history_comparisons = 0
     equivalent_histories_merged = 0
@@ -312,7 +342,8 @@ def solve_zeta(
                     flight_pricing.append({
                         "flight_id": flight_id, "worker": None, "pid": os.getpid(),
                         "task_s": time.monotonic() - task_started,
-                        "expanded": result.expanded, "complete": result.complete,
+                        "expanded": result.expanded, "generated": result.generated,
+                        "complete": result.complete, "reason": result.reason,
                         "history_pruned": result.history_pruned,
                         "history_expired_rows": result.history_expired_rows,
                         "history_comparisons": result.history_comparisons,
@@ -321,13 +352,16 @@ def solve_zeta(
                         "bound_lookups": result.bound_lookups,
                         "bound_pruned": result.bound_pruned,
                     })
+                    if result.reason == "deadline":
+                        sweep_failure = "deadline"
+                        break
                 results = tuple(serial_results)
             priced = len(results)
             for flight_id, result in results:
                 graph = graphs[flight_id]
                 bounds.append(float(result.upper_bound))
                 statuses[flight_id] = result.reason
-                sweep_complete = sweep_complete and result.complete
+                sweep_complete = sweep_complete and _settled(result, params.epsilon)
                 total_expanded += result.expanded
                 total_generated += result.generated
                 edge_evaluations += result.edge_evaluations
@@ -344,7 +378,8 @@ def solve_zeta(
                 bound_pruned += result.bound_pruned
                 early_return_searches += int(result.reason == "improving_column")
                 no_improvement_searches += int(result.reason == "no_improvement")
-                capped_searches += int(not result.complete and result.reason != "improving_column")
+                merge_allowance_searches += int(result.reason == "merge_uncertainty")
+                capped_searches += int(not _settled(result, params.epsilon) and result.reason != "improving_column")
                 if result.column is not None and result.reduced_cost > params.epsilon:
                     column = graph.canonical_column(result.column, model)
                     if column is None or not column.claims.isdisjoint(forbidden):
@@ -373,6 +408,14 @@ def solve_zeta(
                 pool_by_flight[column.flight_id].append(column)
             insertion_s += time.monotonic() - insert_started
             lp_current = not proposals
+            # Use the same scales and selected metric as DP, preserving incomplete-search bounds.
+            lp_gap_cost = lp_gap_revenue = math.inf
+            if pricing_bound_certified:
+                lp_cost = len(flight_ids) * params.M - lp_objective
+                lower_cost = len(flight_ids) * params.M - global_upper
+                lp_gap_cost = _relative_cost_gap(lp_cost, lower_cost)
+                lp_gap_revenue = _relative_revenue_gap(global_upper, lp_objective)
+            lp_gap = lp_gap_revenue if params.gap_metric == "revenue" else lp_gap_cost
             history.append({
                 "iteration": iteration,
                 "lp_cost": len(flight_ids) * params.M - lp_objective,
@@ -381,10 +424,19 @@ def solve_zeta(
                 "new_columns": len(proposals),
                 "max_reduced_cost_upper_bound": max(bounds, default=0.0),
                 "pricing_complete": sweep_complete,
+                "lp_gap": lp_gap,
+                "lp_gap_cost": lp_gap_cost,
+                "lp_gap_revenue": lp_gap_revenue,
+                "gap_metric": params.gap_metric,
                 "early_return_searches": sum(result.reason == "improving_column"
                                              for _, result in results),
                 "no_improvement_searches": sum(result.reason == "no_improvement"
                                                for _, result in results),
+                "merge_allowance_searches": sum(result.reason == "merge_uncertainty"
+                                                for _, result in results),
+                "capped_searches": sum(not _settled(result, params.epsilon) and result.reason != "improving_column"
+                                       for _, result in results),
+                "max_search_generated": max((result.generated for _, result in results), default=0),
                 "search_statuses": statuses,
                 "flight_pricing": flight_pricing,
                 "sweep_failure": sweep_failure,
@@ -399,18 +451,22 @@ def solve_zeta(
             if sweep_failure is not None:
                 termination = "pricing_" + sweep_failure
                 break
-            if not sweep_complete:
-                if not proposals:
-                    termination = "pricing_limit"
-                    break
-                # Useful incomplete proposals can change the duals, but cannot prove convergence.
-                continue
-            if not proposals:
-                if max(bounds, default=0.0) > params.epsilon + 1e-7:
+            if sweep_complete and not proposals:
+                # A settled search's bound may exceed epsilon only by its own merge allowance.
+                if max((float(result.upper_bound)
+                        - (result.merge_error_bound if result.reason == "merge_uncertainty" else 0.0)
+                        for _, result in results), default=0.0) > params.epsilon + 1e-7:
                     raise RuntimeError("complete pricing stalled with an improving upper bound")
                 complete = True
                 termination = "converged"
                 break
+            if lp_gap <= params.lp_gap:
+                termination = "lp_gap"
+                break
+            if not sweep_complete and not proposals:
+                termination = "pricing_limit"
+                break
+            # Useful incomplete proposals can change the duals, but cannot prove convergence.
     finally:
         if workers is not None:
             workers.close()
@@ -452,7 +508,13 @@ def solve_zeta(
         "pricing_bound_certified": pricing_bound_certified,
         "global_bound_valid": True,
         "global_cost_lower_bound": lower,
-        "global_integer_gap": max(0.0, cost - lower) / max(1.0, abs(cost)),
+        "global_integer_gap": (
+            _relative_revenue_gap(global_upper, master.objective_of(incumbent))
+            if params.gap_metric == "revenue" else _relative_cost_gap(cost, lower)
+        ),
+        "global_integer_gap_cost": _relative_cost_gap(cost, lower),
+        "global_integer_gap_revenue": _relative_revenue_gap(global_upper, master.objective_of(incumbent)),
+        "gap_metric": params.gap_metric,
         "lp_cost": None if lp_objective is None else len(flight_ids) * params.M - lp_objective,
         "objective_cost": cost,
         "served": len(incumbent),
@@ -479,6 +541,10 @@ def solve_zeta(
         "bound_lookups": bound_lookups,
         "bound_pruned": bound_pruned,
         "capped_searches": capped_searches,
+        "search_label_cap": options.max_labels,
+        "search_memory_bytes": params.zeta_search_memory_bytes,
+        "merge_allowance_searches": merge_allowance_searches,
+        "worker_graphs_released": 0 if workers is None else workers.graphs_released,
         "early_return_searches": early_return_searches,
         "no_improvement_searches": no_improvement_searches,
         "graph_infeasible": infeasible,

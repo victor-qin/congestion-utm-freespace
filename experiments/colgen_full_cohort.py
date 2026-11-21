@@ -21,10 +21,11 @@ file, ``--zeta-option``. Unknown names and values of the wrong type (checked aga
 field's annotation) stop the run before any work. ``zeta_options`` apply to the Zeta arm only;
 ``turn_below_90`` is a ``params`` field that the Zeta options follow.
 
-The arms share one ColGenParams, but not every field binds both solvers: DP stops on
-``lp_gap`` and runs its per-round integer heuristic, while a Zeta solver without an LP-gap
-stop ends only on convergence, a pricing limit or the time limit. Each report says whether
-its solve applied ``lp_gap`` (``lp_gap_applied``); compare arms with that in mind.
+Both arms apply ``lp_gap`` to their certified bounds. The Zeta arm also limits each search's
+stored labels from its share of the job's memory. A capped search keeps its valid bound and
+cannot claim exhaustive convergence. ``--memory-limit-gib`` can lower the detected allocation;
+``--parent-reserve-gib`` overrides the parent reserve (default max(8 GiB, 20 MiB per flight)).
+An explicit ``zeta_search_memory_bytes`` can tighten the automatically sized cap.
 
 Input and options files are read once: a multi-arm run freezes copies next to its outputs and
 every arm solves exactly the bytes whose sha256 it reports.
@@ -52,7 +53,7 @@ for _name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     os.environ.setdefault(_name, "1")
 
 # The measured Zeta configuration: twelve directions, best-first, both history merges and the
-# native index, with no work caps so no pricing call is cut off. Overridable per run.
+# native index, with no fixed work caps; the memory-derived label cap still applies.
 ZETA_DEFAULTS: dict[str, Any] = dict(
     connection_mode="hex12", forward_cruise=False, traversal="best_first",
     lattice_distance_bound=True, max_expansions=None, max_labels=None,
@@ -264,6 +265,108 @@ def load_input(raw_bytes: bytes, count: int | None) -> tuple[Any, list[Any], tup
     return cfg, ordered[:count] if count else ordered, terms, data["params"]
 
 
+def memory_limit() -> tuple[int, str]:
+    """Find the smallest memory allocation visible to this process.
+
+    Return
+    --------
+    - output (tuple[int, str]): bytes and source among physical RAM, Slurm allocation and
+      cgroup v1/v2 limits (including parent groups); unlimited groups are ignored.
+    """
+    found: list[tuple[int, str]] = []
+    try:
+        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        if physical > 0:
+            found.append((physical, "physical"))
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, path = parts
+        if controllers == "":
+            root, name = Path("/sys/fs/cgroup"), "memory.max"
+        elif "memory" in controllers.split(","):
+            root, name = Path("/sys/fs/cgroup/memory"), "memory.limit_in_bytes"
+        else:
+            continue
+        # In a cgroup namespace the visible mount itself may be the constrained group.
+        relative = Path(path.lstrip("/"))
+        group = root if ".." in relative.parts else root / relative
+        while True:
+            limit_file = group / name
+            try:
+                raw = limit_file.read_text().strip()
+            except OSError:
+                raw = ""
+            if raw.isdigit() and int(raw) < 2**60:
+                found.append((int(raw), str(limit_file)))
+            if group == root:
+                break
+            group = group.parent
+    per_node = os.environ.get("SLURM_MEM_PER_NODE", "")
+    per_cpu = os.environ.get("SLURM_MEM_PER_CPU", "")
+    cpus = os.environ.get("SLURM_CPUS_ON_NODE", "")
+    if per_node.isdigit() and int(per_node) > 0:
+        found.append((int(per_node) * 2**20, "SLURM_MEM_PER_NODE"))
+    elif per_cpu.isdigit() and cpus.isdigit() and int(per_cpu) > 0 and int(cpus) > 0:
+        found.append((int(per_cpu) * int(cpus) * 2**20, "SLURM_MEM_PER_CPU*SLURM_CPUS_ON_NODE"))
+    if not found:
+        raise ValueError("cannot determine a memory limit; pass --memory-limit-gib")
+    return min(found)
+
+
+def size_search_memory(
+    params: Any, n_flights: int, memory_limit_gib: float | None,
+    parent_reserve_gib: float | None,
+) -> tuple[Any, dict[str, Any]]:
+    """Apply the job-sized Zeta label budget, respecting any tighter caller budget.
+
+    Parameters
+    ------------
+    - params (ColGenParams): resolved runtime settings.
+    - n_flights (int): cohort size, which caps the useful worker count.
+    - memory_limit_gib (float | None): optional lower memory limit for this run.
+    - parent_reserve_gib (float | None): optional parent-process memory reserve.
+
+    Return
+    --------
+    - output (tuple): updated parameters and the sizing evidence written to the report.
+    """
+    from freespace_sim.planner.colgen.zeta_pool import search_label_cap, search_memory_bytes
+
+    for name, value in (("memory-limit-gib", memory_limit_gib),
+                        ("parent-reserve-gib", parent_reserve_gib)):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f"--{name} must be finite and positive")
+    try:
+        limit, source = memory_limit()
+    except ValueError:
+        if memory_limit_gib is None:
+            raise
+        limit, source = int(memory_limit_gib * 2**30), "--memory-limit-gib"
+    if memory_limit_gib is not None and int(memory_limit_gib * 2**30) < limit:
+        limit, source = int(memory_limit_gib * 2**30), "--memory-limit-gib"
+    reserve = int(parent_reserve_gib * 2**30 if parent_reserve_gib is not None
+                  else max(8 * 2**30, n_flights * 20 * 2**20))
+    workers = max(1, min(params.n_pricing_workers, n_flights))
+    budget = search_memory_bytes(limit, workers, n_flights, parent_reserve_bytes=reserve)
+    requested = params.zeta_search_memory_bytes
+    if requested is not None:
+        budget = min(budget, requested)
+    return replace(params, zeta_search_memory_bytes=budget), {
+        "memory_limit_bytes": limit, "memory_limit_source": source,
+        "parent_reserve_bytes": reserve, "effective_workers": workers,
+        "requested_search_memory_bytes": requested,
+        "search_memory_bytes": budget, "search_label_cap": search_label_cap(budget),
+    }
+
+
 def warm_case(cfg: Any, params: Any) -> tuple[Any, list[Any], Any]:
     """Two small crossing flights that absorb first-use compile and import cost untimed."""
     from freespace_sim.planner import hexgrid as hg
@@ -333,6 +436,10 @@ def run_sequence(args: argparse.Namespace, arms: list[str]) -> None:
         frozen_options = args.out.with_name(f"{args.out.stem}-options.json")
         write_new(frozen_options, args.options_file.read_bytes())
         shared += ["--options-file", str(frozen_options)]
+    for flag, value in (("--memory-limit-gib", args.memory_limit_gib),
+                        ("--parent-reserve-gib", args.parent_reserve_gib)):
+        if value is not None:
+            shared += [flag, str(value)]
     if args.count:
         shared += ["--count", str(args.count)]
     for pair in args.param:
@@ -369,6 +476,10 @@ def main(argv: list[str] | None = None) -> None:
                         help="keep per-flight pricing records in each round's history")
     parser.add_argument("--options-file", type=Path, default=None,
                         help='JSON {"params": {...}, "zeta_options": {...}} field overrides')
+    parser.add_argument("--memory-limit-gib", type=float, default=None,
+                        help="lower the detected memory allocation used to size the Zeta cap")
+    parser.add_argument("--parent-reserve-gib", type=float, default=None,
+                        help="parent peak set aside before splitting memory over workers")
     args = parser.parse_args(argv)
     arms = args.pricing.split(",")
     if not arms or any(arm not in ("dp", "zeta") for arm in arms):
@@ -403,6 +514,14 @@ def main(argv: list[str] | None = None) -> None:
     options = (ZetaOptions(**{**ZETA_DEFAULTS, **zeta_overrides,
                               "turn_below_90": params.turn_below_90})
                if args.pricing == "zeta" else None)
+    sizing = None
+    if args.pricing == "zeta":
+        try:
+            params, sizing = size_search_memory(
+                params, len(requests), args.memory_limit_gib, args.parent_reserve_gib,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     input_s = time.monotonic() - started
 
     if args.pricing == "zeta":
@@ -453,8 +572,18 @@ def main(argv: list[str] | None = None) -> None:
     conflict = find_interflight_conflict(list(intents.values()), cfg, terms)
     model = cost_model(cfg, params)
     physical = math.fsum(model.intent_cost(intent, cfg) for intent in intents.values())
+    ground_s = math.fsum(intent.ground_delay_s for intent in intents.values())
+    hold_s = math.fsum(intent.air_hold_s for intent in intents.values())
+    detour_s = math.fsum(intent.air_detour_m / cfg.nominal_speed_mps for intent in intents.values())
     audit = {"served": len(intents), "denied": len(requests) - len(intents),
              "objective_cost_recomputed": physical + (len(requests) - len(intents)) * params.M,
+             "cost_components": {
+                 "ground_delay_s": ground_s, "air_hold_s": hold_s, "air_detour_s": detour_s,
+                 "ground_cost": model.evaluate(ground_s=ground_s),
+                 "hold_cost": model.evaluate(ground_s=0.0, air_hold_s=hold_s),
+                 "detour_cost": model.evaluate(ground_s=0.0, air_detour_s=detour_s),
+                 "denial_cost": (len(requests) - len(intents)) * params.M,
+             },
              "collision_pair": conflict,
              "all_intents_accepted": all(intent.accepted for intent in intents.values()),
              "audit_s": time.monotonic() - audit_started}
@@ -471,6 +600,7 @@ def main(argv: list[str] | None = None) -> None:
         "zeta_options": None if options is None else asdict(options),
         "zeta_option_overrides": zeta_overrides if options is not None else None,
         "options_file": options_record,
+        "memory_sizing": sizing,
         "input_s": input_s, "warmup_s": warmup_s, "solve_s": solve_s,
         "termination_reason": stats.get("termination_reason"),
         "peak_rss_bytes": peak_rss_bytes(), "audit": audit,

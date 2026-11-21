@@ -610,9 +610,10 @@ def search_compact(
             spaces.extend(table.spaces[cell] for cell in part_cells if cell in table.spaces)
             offsets.append(len(spaces))
         # Preserve Python's sum semantics for the canonical length key, once per edge.
+        # Iterate lists, not arrays: ndarray iteration ends in a formatted IndexError.
         result = (durations, lengths, np.asarray(offsets, dtype=np.int64),
-                  np.asarray(spaces, dtype=np.int64), sum(float(value) for value in lengths),
-                  tuple(float(value) for value in durations) if persistent_timing else None)
+                  np.asarray(spaces, dtype=np.int64), sum(lengths.tolist()),
+                  tuple(durations.tolist()) if persistent_timing else None)
         edge_cache[key] = result
         return result
 
@@ -713,8 +714,9 @@ def search_compact(
             child_sequence = sequence_cache.get(sequence_key)
             if child_sequence is None:
                 child_sequence = sequence
-                for part_length in lengths:
-                    key = child_sequence, float(part_length)
+                # tolist(): same floats, without the IndexError that ends ndarray iteration.
+                for part_length in lengths.tolist():
+                    key = child_sequence, part_length
                     identifier = sequence_ids.get(key)
                     if identifier is None:
                         identifier = len(sequence_ids) + 1

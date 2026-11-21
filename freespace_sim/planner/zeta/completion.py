@@ -8,6 +8,8 @@ import math
 import time
 from typing import Any, TYPE_CHECKING
 
+import numpy as np
+
 from ..route_domain import RowKey
 from ..route_cost import CostModel
 
@@ -23,6 +25,7 @@ class CompletionBounds:
     names: tuple[str, ...]
     build_s: float
     table_states: int
+    _rows: tuple[RowKey, ...] | None = None
 
     @classmethod
     def build(
@@ -60,6 +63,57 @@ class CompletionBounds:
                 names.append(name)
         return cls(tuple(components), tuple(names), time.perf_counter() - started,
                    sum(bound.table_states for bound in components))
+
+    def bind(self, rows: tuple[RowKey, ...]) -> None:
+        """Pack per-row data for one row table so floor_ids can take table-row ids.
+
+        Parameters
+        ------------
+        - rows (tuple[RowKey, ...]): the compact search's row table; ids passed to floor_ids
+          must index this exact tuple.
+
+        Return
+        --------
+        - output (None): components with a compiled id path store their packed arrays.
+        """
+        for bound in self.components:
+            if hasattr(bound, "floor_ids"):
+                bound.bind(rows)
+        self._rows = rows
+
+    def floor_ids(
+        self, cell: Cell, goal: Cell, stamp: float, length: float,
+        positive_paid: float, ground: float, negative: float, fold_m: float | None,
+        paid: np.ndarray, terminal: bool = False,
+    ) -> float:
+        """Same maximum as floor() for unique table-row ids from the row tuple given to bind().
+
+        Parameters
+        ------------
+        - cell, goal, stamp, length, positive_paid, ground, negative, fold_m, terminal:
+          as floor().
+        - paid (np.ndarray): unique live paid ids; components without an id path receive
+          the matching row keys, converted once.
+
+        Return
+        --------
+        - output (float): safe full completion floor; negative infinity when none applies.
+        """
+        if self._rows is None:
+            raise RuntimeError("CompletionBounds.bind() must run before floor_ids()")
+        best = -math.inf
+        keys = None
+        for bound in self.components:
+            if hasattr(bound, "floor_ids"):
+                value = bound.floor_ids(cell, goal, stamp, length, positive_paid, ground,
+                                        negative, fold_m, paid, terminal)
+            else:
+                if keys is None:
+                    keys = tuple(self._rows[int(row)] for row in paid)
+                value = bound.floor(cell, goal, stamp, length, positive_paid, ground,
+                                    negative, fold_m, keys, terminal)
+            best = max(best, value)
+        return best
 
     def floor(
         self, cell: Cell, goal: Cell, stamp: float, length: float,

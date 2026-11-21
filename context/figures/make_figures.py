@@ -2764,6 +2764,93 @@ def fig_zeta_fcfs240(data_path: str) -> None:
             _save(fig, "zeta_fcfs240_20261118" + ("_mobile" if mobile else ""))
 
 
+def fig_zeta_arrival_bound(data_path: str) -> None:
+    """Show what the arrival completion bound adds to one label and what compiling it saves.
+
+    Parameters
+    ------------
+    - data_path (str): summary JSON with one captured label's per-slice landing charges and
+      air costs, and the mirrored saved-call wall times for each arm.
+
+    Return
+    --------
+    - output (None): writes ``zeta_arrival_bound.png`` beside the other figures.
+    """
+    import json
+    from pathlib import Path
+
+    data = json.loads(Path(data_path).read_text())
+    sample = data["sample"]
+    fig, (label_ax, wall_ax) = plt.subplots(
+        1, 2, figsize=(14.0, 5.6), gridspec_kw={"width_ratios": [1.45, 1.0]},
+        constrained_layout=True)
+
+    stamp, width = sample["stamp"], sample["delta"]
+    offsets = np.asarray(sample["starts"]) - stamp
+    gross, charge = np.asarray(sample["gross_charge"]), np.asarray(sample["charge"])
+    air = np.asarray(sample["air"])
+    total = charge + air
+    best = int(np.argmin(total))
+    label_ax.axvspan(sample["earliest"] - stamp, sample["latest"] - stamp, color=HEXGRID,
+                     alpha=.35, lw=0, label="Possible landing window")
+    if np.any(gross != charge):
+        label_ax.bar(offsets, gross, width=width, align="edge", color=RAW, alpha=.45,
+                     label="Destination prices (incl. rows already paid)")
+    label_ax.bar(offsets, charge, width=width, align="edge", color=ORANGE, alpha=.85,
+                 label="Destination prices still unpaid")
+    centres = offsets + width / 2
+    label_ax.plot(centres, air, color=BLUE, lw=2, label="Least air cost of landing then")
+    label_ax.plot(centres, total, color=INK, lw=1.2, marker=".", ms=4, label="Sum")
+    label_ax.plot(centres[best], total[best], "*", color=RED, ms=16, zorder=4,
+                  label=f"Cheapest landing: +{total[best]:.2f} added to the floor")
+    label_ax.set(xlabel="Landing time after the label's current clock (s)",
+                 ylabel="Cost still to pay (reduced-cost units)")
+    label_ax.set_title(f"One real label · flight {sample['flight_id']} · {sample['mode']} · "
+                       "turn rule on", loc="left", fontsize=12)
+    label_ax.legend(frameon=False, fontsize=9, loc="upper left")
+    label_ax.text(0.02, 0.73,
+                  f"Sunk cost (ground + paid prices + all credit): {sample['ordinary']:.2f}\n"
+                  f"Cheapest landing: air {air[best]:.2f} + destination {charge[best]:.2f}\n"
+                  f"Arrival floor: {sample['floor']:.2f}",
+                  transform=label_ax.transAxes, ha="left", va="top", fontsize=9.5, color=INK,
+                  bbox=dict(boxstyle="round,pad=0.4", fc="white", ec=GRID, lw=.6))
+
+    arms = (("none", "No completion bound", RAW),
+            ("arrival-main", "Arrival bound · Python floor", ORANGE),
+            ("arrival-branch", "Arrival bound · compiled floor", GREEN))
+    rows = [(mode, arm, name, color) for mode in data["modes"] for arm, name, color in arms]
+    for y, (mode, arm, name, color) in enumerate(rows):
+        group = data["modes"][mode][arm]
+        wall_ax.barh(y, group["wall_s"], color=color, height=.65)
+        wall_ax.plot(group["runs"], [y] * len(group["runs"]), "|", color=INK, ms=8)
+        capped = group["reasons"].get("search_cap", 0)
+        wall_ax.annotate(f"{group['wall_s']:.1f} s · {capped} capped",
+                         (max(group["runs"]), y), (5, 0), textcoords="offset points",
+                         va="center", fontsize=9)
+    wall_ax.set_yticks(np.arange(len(rows)), [f"{mode} · {name}" for mode, _a, name, _c in rows],
+                       fontsize=9)
+    wall_ax.invert_yaxis()
+    for split in range(1, len(data["modes"])):
+        wall_ax.axhline(split * len(arms) - .5, color=GRID, lw=.8)
+    wall_ax.set_xlim(right=wall_ax.get_xlim()[1] * 1.35)
+    wall_ax.set(xlabel="Search wall time, 10 saved hard calls (s)")
+    wall_ax.set_title("What the bound costs, and what compiling saves", loc="left",
+                      fontsize=12)
+    for ax in (label_ax, wall_ax):
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_axisbelow(True)
+    wall_ax.grid(axis="x", alpha=.18)
+    fig.text(.01, -.06,
+             "Left: every completion must reserve its destination at some landing time; landing "
+             "later needs a longer flight, so it costs more air time.\nThe bound adds the "
+             "cheapest (unpaid destination prices + air cost) over the window. Right: marks are "
+             "mirrored runs; bars their mean. The Python and compiled floors return bit-identical\n"
+             "values, so those two arms make the same search decisions; the search already has a "
+             "distance bound, so the new information is mainly the destination price.",
+             fontsize=9, color=INK)
+    _save(fig, "zeta_arrival_bound")
+
+
 FIGURES = (
     fig_enroute_rulers, fig_corridor_box_extension, fig_exit_radius, fig_segment_overlaps_column,
     fig_fold_corners, fig_altitude_ladder, fig_segment_frame, fig_hub_placement,

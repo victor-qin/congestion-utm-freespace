@@ -12,6 +12,12 @@ Durable record of mistakes likely to recur between PRs. Format follows the `CONT
   is unaffected: Zeta has no tie-break. Files: `freespace_sim/planner/colgen/solver.py`
   (`_emptiest_airspace_duals`), `freespace_sim/planner/zeta/price_floor.py`.
 
+- 2026-11-20T20:30Z [TOOL] Supplements the 2026-11-18 pickle entry below: an old capture's
+  `ZetaOptions` still LOADS on current code without any error, but with fields shifted
+  (`capture-fixed.pkl` read back `connection_mode=True`, `completion_bounds=True`). A harness
+  that reuses such a capture must rebuild `ZetaOptions` by name and never read the pickled one.
+  Files: `freespace_sim/planner/zeta/search.py` (`ZetaOptions`).
+
 - 2026-11-19T14:30Z [CODE/TOOL] A one-time build must not run inside a per-leg deadline. With the
   native Zeta loop as the default, a cold Cython build (~8 s) under a shorter `time_limit_s` was
   killed on every leg and cached nothing, so EVERY leg was denied as `deadline` (reproduced: 4/4

@@ -436,10 +436,9 @@ def search_compact(
                 paid = paid[~expired]
         if completion_bounds is not None:
             bound_lookups += 1
-            floor = max(floor, completion_bounds.floor(
+            floor = max(floor, completion_bounds.floor_ids(
                 cells[node], contexts[context][3], stamp, length, positive,
-                contexts[context][4], negative, contexts[context][5],
-                (table.rows[int(row)] for row in paid), terminal,
+                contexts[context][4], negative, contexts[context][5], paid, terminal,
             ))
             if floor >= limit:
                 bound_pruned += 1
@@ -766,6 +765,8 @@ def search_compact(
             bound_build_s += completion_bounds.build_s
             if not completion_bounds.components:
                 completion_bounds = None
+            else:
+                completion_bounds.bind(table.rows)
         for dep in range(fg.base_step, fg.latest_departure_step + 1):
             if deadline is not None and time.perf_counter() >= deadline:
                 return finish(False, "deadline", global_floor)

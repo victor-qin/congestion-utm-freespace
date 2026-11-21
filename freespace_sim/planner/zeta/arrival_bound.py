@@ -10,6 +10,7 @@ from fractions import Fraction
 from typing import TYPE_CHECKING
 
 import numpy as np
+from numba import njit
 
 from ..route_domain import RowKey
 from ..reservation_windows import terminal_claim_steps
@@ -31,6 +32,117 @@ def _down(value: float) -> float:
 def _up(value: float) -> float:
     """Round a single floating operation outward toward an upper bound."""
     return math.nextafter(value, math.inf)
+
+
+@njit(cache=True, nogil=True)
+def _bin_index_kernel(stamp: float, delta: float) -> int:
+    """Mirror bound._bin_index: multiplied boundaries classify exact contact identically."""
+    index = int(np.floor(stamp / delta))
+    while (index + 1) * delta <= stamp:
+        index += 1
+    while index * delta > stamp:
+        index -= 1
+    return index
+
+
+@njit(cache=True, nogil=True)
+def _ulp(value: float) -> float:
+    """math.ulp for finite doubles, including subnormals and the largest finite value."""
+    magnitude = abs(value)
+    if magnitude == 0.0:
+        return 5e-324
+    _mantissa, exponent = math.frexp(magnitude)
+    return math.ldexp(1.0, max(exponent - 53, -1074))
+
+
+@njit(cache=True, nogil=True)
+def _arrival_floor_kernel(
+    scalars: np.ndarray, totals: np.ndarray, starts: np.ndarray, row_begin: np.ndarray,
+    row_end: np.ndarray, row_weight: np.ndarray, paid: np.ndarray, stamp: float, length: float,
+    positive_paid: float, ground: float, negative: float, remaining: float, couple: bool,
+) -> float:
+    """Non-terminal ArrivalBound.floor over packed table-id arrays.
+
+    Every operation and its directed rounding match ArrivalBound.floor exactly; the parity
+    test compares both bit for bit. No fast-math: each step rounds once, then moves outward.
+
+    Parameters
+    ------------
+    - scalars (np.ndarray): packed static and price constants, see ArrivalBound.bind.
+    - totals, starts (np.ndarray): per-bin destination units and bin start clocks.
+    - row_begin, row_end, row_weight (np.ndarray): each table row's bin slice and units;
+      weight 0 marks rows with no destination charge.
+    - paid (np.ndarray): unique live paid table-row ids.
+    - stamp, length, positive_paid, ground, negative (float): the label's state.
+    - remaining (float): static remaining distance for this waypoint and goal.
+    - couple (bool): whether destination distance coupling applies.
+
+    Return
+    --------
+    - output (float): the same floor as the interpreted method, or -inf.
+    """
+    # Order must match ArrivalBound.bind's packing; change both together.
+    (latest_static, minimum_ratio, maximum_ratio, time_error, length_error, delta,
+     first_bin_f, max_length, attachment, reference, distance_error, coefficient, air_error,
+     quantum, positive_error, negative_error, union_error, air_ceiling,
+     twice_abs) = (scalars[0], scalars[1], scalars[2], scalars[3], scalars[4], scalars[5],
+                   scalars[6], scalars[7], scalars[8], scalars[9], scalars[10], scalars[11],
+                   scalars[12], scalars[13], scalars[14], scalars[15], scalars[16],
+                   scalars[17], scalars[18])
+    first_bin = int(first_bin_f)
+    # Landing window, per-bin charges and distance coupling:
+    # context/figures/zeta_arrival_bound.png
+    available = max(0.0, np.nextafter(np.nextafter(max_length + 1e-7 - length, np.inf)
+                                      + length_error, np.inf))
+    earliest = max(stamp, np.nextafter(np.nextafter(stamp + np.nextafter(
+        remaining * minimum_ratio, -np.inf), -np.inf) - time_error, -np.inf))
+    latest = min(latest_static, np.nextafter(np.nextafter(stamp + np.nextafter(
+        available * maximum_ratio, np.inf), np.inf) + time_error, np.inf))
+    if earliest > latest:
+        return -np.inf
+    first = max(0, _bin_index_kernel(earliest, delta) - first_bin)
+    stop = min(totals.shape[0], _bin_index_kernel(latest, delta) - first_bin + 1)
+    if first >= stop:
+        return -np.inf
+    units = totals[first:stop].copy()
+    for index in range(paid.shape[0]):
+        row = paid[index]
+        weight = row_weight[row]
+        if weight != 0:
+            begin = max(first, row_begin[row])
+            end = min(stop, row_end[row])
+            for position in range(begin, end):
+                units[position - first] -= weight
+    joint = np.inf
+    for position in range(stop - first):
+        charge = float(units[position]) * quantum
+        if couple:
+            arrival = max(starts[first + position], earliest)
+            elapsed = np.nextafter(arrival - stamp, -np.inf)
+            elapsed = np.nextafter(elapsed - time_error, -np.inf)
+            future = max(remaining, np.nextafter(elapsed / maximum_ratio, -np.inf))
+            distance = np.nextafter(length + future, -np.inf)
+            distance = np.nextafter(distance + attachment, -np.inf)
+            distance = np.nextafter(distance - reference, -np.inf)
+            distance = np.nextafter(distance - distance_error, -np.inf)
+            air = np.nextafter(coefficient * max(0.0, distance), -np.inf)
+            air = max(0.0, np.nextafter(air - air_error, -np.inf))
+            value = np.nextafter(charge + air, -np.inf)
+        else:
+            value = charge
+        joint = min(joint, value)
+    prefix = np.nextafter(np.nextafter(np.nextafter(positive_paid - positive_error, -np.inf)
+                                       + negative, -np.inf) - negative_error, -np.inf)
+    cost_ceiling = np.nextafter(ground + air_ceiling, np.inf)
+    final_scale = np.nextafter(cost_ceiling + twice_abs, np.inf)
+    if not (np.isfinite(joint) and np.isfinite(prefix) and np.isfinite(cost_ceiling)
+            and np.isfinite(final_scale)):
+        return -np.inf
+    result = np.nextafter(np.nextafter(ground + prefix, -np.inf) + joint, -np.inf)
+    result = np.nextafter(np.nextafter(result - _ulp(cost_ceiling), -np.inf) - union_error,
+                          -np.inf)
+    result = np.nextafter(result - _ulp(final_scale), -np.inf)
+    return result if np.isfinite(result) else -np.inf
 
 
 @dataclass(slots=True)
@@ -206,6 +318,7 @@ class ArrivalBound:
     _air_error: float
     _air_ceiling: float
     _twice_abs_prices: float
+    _packed: tuple | None = None
 
     @classmethod
     def build(
@@ -285,12 +398,86 @@ class ArrivalBound:
                    quantum, _fraction_down(coefficient), price_errors, air_error, air_ceiling,
                    twice_absolute)
 
+    def bind(self, rows: tuple[RowKey, ...]) -> None:
+        """Pack static constants and each table row's charge slice for floor_ids.
+
+        Ids later passed to floor_ids must index this exact tuple: the compiled kernel does
+        not bounds-check them.
+
+        Parameters
+        ------------
+        - rows (tuple[RowKey, ...]): the compact search's row table; ids index this tuple.
+
+        Return
+        --------
+        - output (None): stores arrays used only with this exact row tuple.
+        """
+        static = self._geometry
+        begin = np.zeros(len(rows), dtype=np.int64)
+        end = np.zeros(len(rows), dtype=np.int64)
+        weight = np.zeros(len(rows), dtype=np.int64)
+        for index, row in enumerate(rows):
+            interval = self._slices.get(row)
+            if interval is not None:
+                begin[index], end[index], weight[index] = interval
+        positive_error, negative_error, union_error = self._price_errors
+        # Order must match _arrival_floor_kernel's unpacking; change both together.
+        scalars = np.asarray([
+            static.latest, static.minimum_ratio, static.maximum_ratio,
+            static.time_error, static.length_error, static.delta, float(static.first_bin),
+            self._graph.max_length, static.attachment, self._graph.reference,
+            static.distance_error, self._coefficient, self._air_error, self._quantum,
+            positive_error, negative_error, union_error, self._air_ceiling,
+            self._twice_abs_prices,
+        ], dtype=np.float64)
+        couple_terminal = self._graph.fg.dest_terminal is None and self._graph.reference > 1e-9
+        self._packed = rows, scalars, begin, end, weight, couple_terminal
+
+    def floor_ids(
+        self, cell: Cell, goal: Cell, stamp: float, length: float,
+        positive_paid: float, ground: float, negative: float, fold_m: float | None,
+        paid: np.ndarray, terminal: bool = False,
+    ) -> float:
+        """Same value as floor() for unique table-row ids, compiled for non-terminal labels.
+
+        Parameters
+        ------------
+        - cell, goal, stamp, length, positive_paid, ground, negative, fold_m: as floor().
+        - paid (np.ndarray): unique live paid ids into the tuple given to bind().
+        - terminal (bool): terminal labels keep the interpreted endpoint-geometry path.
+
+        Return
+        --------
+        - output (float): identical to floor() on the same state.
+        """
+        if self._packed is None:
+            raise RuntimeError("ArrivalBound.bind() must run before floor_ids()")
+        rows, scalars, begin, end, weight, couple_terminal = self._packed
+        static = self._geometry
+        if terminal:
+            return self.floor(cell, goal, stamp, length, positive_paid, ground, negative,
+                              fold_m, (rows[int(row)] for row in paid), terminal)
+        if (not all(math.isfinite(value) for value in
+                    (stamp, length, positive_paid, ground, negative))
+                or stamp < static.earliest or stamp > static.latest):
+            return -math.inf
+        remaining = static.remaining.get((cell, goal))
+        if remaining is None:
+            return -math.inf
+        return _arrival_floor_kernel(
+            scalars, self._totals, static.starts, begin, end, weight, paid, stamp, length,
+            positive_paid, ground, negative, remaining, fold_m is not None and couple_terminal)
+
     def floor(
         self, cell: Cell, goal: Cell, stamp: float, length: float,
         positive_paid: float, ground: float, negative: float, fold_m: float | None,
         paid: Iterable[RowKey], terminal: bool = False,
     ) -> float:
         """Lower-bound every canonical completion, discounting rows already paid once.
+
+        _arrival_floor_kernel mirrors the non-terminal branch operation for operation, so
+        an edit here must be made there too; the parity asserts in
+        tests/test_zeta_search.py (_check_anyangle_completion_bounds) compare both bit for bit.
 
         Parameters
         ------------
@@ -324,6 +511,8 @@ class ArrivalBound:
             charges = np.asarray([units * self._quantum])
             future = np.asarray([0.0])
         else:
+            # Landing window, per-bin charges and distance coupling:
+            # context/figures/zeta_arrival_bound.png
             available = max(0.0, _up(_up(graph.max_length + 1e-7 - length)
                                       + static.length_error))
             earliest = max(stamp, _down(_down(stamp + _down(

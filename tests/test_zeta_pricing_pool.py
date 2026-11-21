@@ -345,33 +345,181 @@ def test_zeta_persistent_workers_match_serial_with_changed_prices_and_claims(
     assert proved_no_improvement is (early_return and not capped)
 
 
-@pytest.mark.parametrize("started,compiled_loop", [
-    (False, False), (True, False), (False, True), (True, True),
-], ids=["before-start", "after-start", "compiled-before-start", "compiled-after-start"])
+@pytest.mark.parametrize("cache_bytes", [None, 0], ids=["keep-graphs", "release-graphs"])
+def test_zeta_rebalanced_owners_and_column_deltas_keep_serial_results(cache_bytes, monkeypatch):
+    """Moving a flight between workers and shipping only new columns never changes results.
+
+    After shipping columns to the real initial owners, flights 3 and 12 are assigned high
+    measured costs. One moves from worker 0 to worker 1. A later sweep appends a column
+    (delta shipping) and then replaces the known list outright (full resend). Every sweep
+    must match serial pricing exactly. With a zero graph budget every worker releases each
+    graph once priced and rebuilds it cold from a resent definition the next sweep, which
+    must not change results either.
+    """
+    pytest.importorskip("numba")
+    from freespace_sim.planner.colgen.zeta_pool import ZetaPricingPool
+
+    graphs, params = _zeta_pool_case()
+    original = graphs[3]
+    third = replace(original.fg, request=replace(original.fg.request, flight_id=12))
+    graphs[12] = ZetaGraph(third, original.cfg, original.row_index, original.options)
+    params = replace(params, zeta_worker_cache_bytes=cache_bytes)
+    seeds = {fid: tuple(graph.seed_columns(params)) for fid, graph in graphs.items()}
+    rows = sorted({row for columns in seeds.values() for column in columns for row in column.claims})
+    prices = {row: (0.5, 3.0, -0.25)[index % 3] for index, row in enumerate(rows)}
+    flight_duals = {3: 7.25, 9: 19.5, 12: 11.0}
+    timers = {"wall_s", "bound_build_s", "topology_setup_s", "incumbent_setup_s"}
+
+    def untimed(results):
+        """Zero elapsed-time and cache-traffic fields, which legitimately differ by process."""
+        return tuple((fid, replace(result, **{
+            field.name: 0 for field in fields(result)
+            if field.name in timers or field.name.startswith(
+                ("shared_leg_cache_", "shared_footprint_cache_", "persistent_timing_cache_"))
+        })) for fid, result in results)
+
+    known = {fid: list(columns[:1]) for fid, columns in seeds.items()}
+    with ZetaPricingPool(graphs, params) as pool:
+        pool.run_seed_sweep({})
+        assert pool.worker_of == {3: 0, 9: 1, 12: 0}
+        sent_tasks = {}
+        for channel in pool._channels:
+            original_send = channel.conn.send
+
+            def record_send(message, *, send=original_send):
+                """Observe actual task payloads without changing pipe delivery."""
+                if message[0] == "sweep":
+                    sent_tasks.update({task[0]: task[2:] for task in message[3]})
+                return send(message)
+
+            monkeypatch.setattr(channel.conn, "send", record_send)
+        for step in range(5):
+            # Both expensive flights really lived on worker 0 in the first sweep.
+            pool._cost = ({3: 1.0, 9: 2.0, 12: 1.0} if step == 0
+                          else {3: 10.0, 9: 1.0, 12: 10.0})
+            if step == 4:
+                pool._cost = {3: 1.0, 9: 10.0, 12: 10.0}
+            if step == 1:
+                for fid in known:
+                    known[fid].append(seeds[fid][-1])
+            if step == 3:
+                known = {fid: list(columns[:1]) for fid, columns in known.items()}
+            expected = tuple(
+                (fid, price_zeta(graphs[fid], prices, flight_duals[fid], params,
+                                 known_columns=known[fid]))
+                for fid in sorted(graphs)
+            )
+            sweep = pool.run_sweep(prices, flight_duals, known)
+            assert sweep.complete and sweep.failure is None
+            assert untimed(sweep.results) == untimed(expected)
+            expected_owners = {3: 0, 9: 1, 12: 0 if step in (0, 4) else 1}
+            if step == 1:
+                assert sent_tasks[3] == ((known[3][-1],), True)
+                assert sent_tasks[12] == (tuple(known[12]), False)
+            if step == 2:
+                assert all(payload == ((), True) for payload in sent_tasks.values())
+            if step == 3:
+                assert all(not extend for _, extend in sent_tasks.values())
+            if step == 4:
+                assert sent_tasks[12] == (tuple(known[12]), False)
+            assert pool.worker_of == expected_owners
+            assert {r["flight_id"]: r["worker"] for r in sweep.flight_records} == expected_owners
+            assert pool._shipped[expected_owners[12]][12] == tuple(known[12])
+        assert pool.graphs_released == (0 if cache_bytes is None else 18)
+
+
+def test_search_memory_share_pays_worker_footprint_and_refuses_starved_shares():
+    """Each search gets an even worker share of the memory limit after fixed costs.
+
+    More workers or a larger parent reserve shrink every search's budget; all shares plus the
+    reserve fit within the limit; a share too small for a useful search is refused rather
+    than silently capping every search.
+    """
+    from freespace_sim.planner.colgen.zeta_pool import (
+        SEARCH_BYTES_PER_LABEL, search_label_cap, search_memory_bytes,
+    )
+
+    gib = 2**30
+    base = search_memory_bytes(128 * gib, 12, 400, parent_reserve_bytes=8 * gib)
+    assert search_memory_bytes(128 * gib, 24, 400, parent_reserve_bytes=8 * gib) < base
+    assert search_memory_bytes(128 * gib, 12, 400, parent_reserve_bytes=16 * gib) < base
+    assert 12 * base + 8 * gib < 128 * gib
+    assert 0 < search_label_cap(base) * SEARCH_BYTES_PER_LABEL <= base
+    with pytest.raises(ValueError, match="fewer workers"):
+        search_memory_bytes(8 * gib, 64, 400, parent_reserve_bytes=4 * gib)
+
+
+def test_graph_budget_preserves_queued_graphs_and_releases_oldest_first():
+    """A positive cache budget protects pending work and evicts cold graphs first."""
+    from freespace_sim.planner.colgen.zeta_pool import _GraphBudget
+
+    budget = _GraphBudget(100)
+    budget.charge(3, 60)
+    budget.charge(9, 60)
+    assert budget.victims({3, 9}) == ()
+    assert budget.victims({3}) == (9,)
+    budget.charge(12, 60)
+    budget.charge(3, -10)  # A falling RSS never subtracts an existing charge.
+    assert budget.victims(set()) == (12,)
+    budget.forget(3)
+    budget.charge(9, 100)
+    assert budget.victims(set()) == ()
+
+
+def _stop_during_heap_cleanup(*args):
+    """Simulate a worker stuck in cleanup after returning all its flight results."""
+    from freespace_sim.planner.colgen import zeta_pool
+
+    settle = zeta_pool._settle_worker_heap
+    calls = 0
+
+    def stop_after_startup(full):
+        """Let startup finish, then wait for the parent's deadline teardown."""
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            os.kill(os.getpid(), signal.SIGSTOP)
+        settle(full)
+
+    zeta_pool._settle_worker_heap = stop_after_startup
+    zeta_pool._worker_main(*args)
+
+
+@pytest.mark.parametrize("started", ["before-start", "during-work", "after-results"])
+@pytest.mark.parametrize("compiled_loop", [False, True], ids=["interpreted-loop", "compiled-loop"])
 @pytest.mark.parametrize("phase", ["seed", "price"])
-def test_zeta_expired_sweep_cannot_certify_or_leave_workers_running(started, compiled_loop, phase):
+def test_zeta_expired_sweep_cannot_certify_or_leave_workers_running(
+    started, compiled_loop, phase, monkeypatch,
+):
     """Deadlines preserve received results without certifying or abandoning missing work."""
     from freespace_sim.planner.colgen.zeta_pool import ZetaPricingPool, build_seed_columns
 
     if compiled_loop:
         pytest.importorskip("Cython")
     graphs, params = _zeta_pool_case(compiled_loop=compiled_loop)
+    if started == "after-results":
+        monkeypatch.setattr("freespace_sim.planner.colgen.zeta_pool._worker_main",
+                            _stop_during_heap_cleanup)
     with ZetaPricingPool(graphs, params) as pool:
-        if started:
+        if started != "before-start":
             pool.start()
         processes = [channel.proc for channel in pool._channels or ()]
         expected = ()
-        if started:
+        if started == "during-work":
             # Stop one live worker so the other returns before the in-flight deadline.
             # Process teardown must also reap a child that cannot read its stop message.
             os.kill(processes[0].pid, signal.SIGSTOP)
             fid = next(fid for fid, owner in pool.worker_of.items() if owner == 1)
             expected = ((fid, build_seed_columns(graphs[fid], params) if phase == "seed"
                          else price_zeta(graphs[fid], {}, 0.0, params)),)
-        deadline = time.monotonic() + (3.0 if started else -1.0)
+        if started == "after-results":
+            expected = tuple((fid, build_seed_columns(graphs[fid], params) if phase == "seed"
+                              else price_zeta(graphs[fid], {}, 0.0, params)) for fid in sorted(graphs))
+        deadline = time.monotonic() + (-1.0 if started == "before-start" else 3.0)
         expired = (pool.run_seed_sweep({}, deadline=deadline) if phase == "seed" else
                    pool.run_sweep({}, {3: 0.0, 9: 0.0}, {}, deadline=deadline))
-        assert not expired.complete and expired.failure == "deadline"
+        assert expired.complete is (started == "after-results")
+        assert expired.failure == "deadline"
         if phase == "seed":
             assert expired.results == expected
         else:

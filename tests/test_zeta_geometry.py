@@ -430,7 +430,9 @@ def test_strict_turn_rule_controls_successors_seeds_and_column_admission(
     value = replace(params, turn_below_90=True)
     assert pickle.loads(pickle.dumps(value)) == value
     older = object.__new__(type(value))
-    older.__setstate__(value.__getstate__()[:-1])
+    # An archive from before the flag also lacks every field appended after it.
+    cut = [item.name for item in fields(value)].index("turn_below_90")
+    older.__setstate__(value.__getstate__()[:cut])
     assert older == replace(value, turn_below_90=False)
 
 

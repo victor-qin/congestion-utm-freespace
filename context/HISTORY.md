@@ -2,6 +2,18 @@
 
 Durable record of mistakes likely to recur between PRs. Format follows the `CONTINUITY.md` rules in `AGENTS.md`.
 
+- 2026-11-21T18:19Z [CODE/TOOL] A worker's final result is not permission to send the next batch if
+  cleanup still runs afterward: a large blocking pipe send can wait beyond the next deadline.
+  Keep a separate cleanup/readiness acknowledgement under the parent's deadline. Tests stop
+  spawned workers after all results and verify deadline teardown preserves those results.
+  Files: `freespace_sim/planner/colgen/zeta_pool.py`, `tests/test_zeta_pricing_pool.py`.
+
+- 2026-11-21T18:19Z [CODE/TOOL] The reason `merge_uncertainty` does not imply that history merging
+  is the only remaining pricing uncertainty: price snapping can widen the same bound. Only
+  settle when subtracting the explicit merge allowance closes the remaining gap; always keep
+  the full allowance in the global bound. Files: `freespace_sim/planner/colgen/zeta_solver.py`,
+  `tests/test_colgen_e2e.py`, `freespace_sim/planner/zeta/price_floor.py`.
+
 - 2026-11-20T23:00Z [TOOL] Rounding production-DP pricing prices is a net loss at scale. The CPU
   default emptiest-airspace tie-break prices ~52k rows below epsilon; rounding the LP duals alone
   changes nothing, and rounding the pricing vector strips the tie-break. That cut DP labels 75–90%

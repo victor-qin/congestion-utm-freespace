@@ -277,6 +277,16 @@ class ColGenParams:
     # free. CPU DP only; it changes the priced route set, so certificates cover this domain.
     turn_below_90: bool = False
 
+    # Zeta pricing pool only: resident bytes each worker may charge to cached flight graphs
+    # before it releases the least recently priced ones (rebuilt cold on next use, which
+    # prices identically). None keeps every graph; 0 keeps none beyond the current sweep.
+    zeta_worker_cache_bytes: int | None = None
+    # Zeta pricing only: bytes one search may spend on stored labels. The solve caps every
+    # search's ZetaOptions.max_labels at this budget divided by the measured per-label peak
+    # (zeta_pool.SEARCH_BYTES_PER_LABEL); a capped search returns a valid but incomplete
+    # bound. None leaves the caller's caps; size it with zeta_pool.search_memory_bytes.
+    zeta_search_memory_bytes: int | None = None
+
     def __setstate__(self, state: list[object]) -> None:
         """Restore positional slot state; fields appended after archiving take defaults.
 
@@ -435,6 +445,14 @@ class ColGenParams:
                      "turn_below_90"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a boolean")
+        budget = self.zeta_worker_cache_bytes
+        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int)
+                                   or budget < 0):
+            raise ValueError("zeta_worker_cache_bytes must be None or a non-negative integer")
+        budget = self.zeta_search_memory_bytes
+        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int)
+                                   or budget <= 0):
+            raise ValueError("zeta_search_memory_bytes must be None or a positive integer")
         if self.emptiest_airspace_tiebreak is not None and not isinstance(
                 self.emptiest_airspace_tiebreak, bool):
             raise TypeError("emptiest_airspace_tiebreak must be a boolean or None")

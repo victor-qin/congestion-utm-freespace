@@ -383,15 +383,25 @@ def test_zeta_prototype_files_full_volume_claims_and_respects_terminal_capacity(
         assert _max_concurrent(dwells) <= terminal.capacity
 
 
+@pytest.mark.parametrize("stop", ["cap", "merge", "merge-snap"])
+@pytest.mark.parametrize("gap_metric", ["cost", "revenue"])
+@pytest.mark.parametrize("excess", [1.0, 1e-6], ids=["loose-bound", "within-lp-gap"])
 @pytest.mark.parametrize("continue_after_improvement", [False, True])
 @pytest.mark.parametrize("early_return", [False, True])
 @pytest.mark.parametrize("backend,lazy", [
     ("reference", False), ("reference", True), ("compiled", False), ("compiled", True),
 ], ids=["reference-eager", "reference-lazy", "compiled-eager", "compiled-lazy"])
 def test_zeta_prototype_keeps_incumbent_without_claiming_capped_convergence(
-    monkeypatch, continue_after_improvement, early_return, backend, lazy,
+    monkeypatch, continue_after_improvement, early_return, backend, lazy, excess, stop, gap_metric,
 ):
-    """A capped pricing sweep may improve the pool but cannot claim exhaustive convergence."""
+    """A capped pricing sweep may improve the pool but cannot claim exhaustive convergence.
+
+    A capped sweep whose certified bounds already put the LP within ``lp_gap`` of the
+    Lagrangian bound stops on that gap, still without claiming exhaustive convergence.
+    A search left open only by its merge allowance (``stop="merge"``) is settled: the
+    solve converges, and the widened bound still enters the global lower bound.
+    Separate price-rounding uncertainty cannot be absorbed into that merge allowance.
+    """
     from freespace_sim.planner.colgen import zeta_solver
     from freespace_sim.planner.colgen.zeta import ZetaOptions
     from freespace_sim.planner.colgen.translate import Column
@@ -406,17 +416,36 @@ def test_zeta_prototype_keeps_incumbent_without_claiming_capped_convergence(
     params = ColGenParams(
         solver="highs", max_air_overrun_hops=0, time_limit_s=10.0,
         ip_time_limit_s=1.0, ip_reserve_s=2.0, iteration_ip_time_limit_s=0.0,
+        gap_metric=gap_metric, lp_gap=2e-4,
     )
+    options = ZetaOptions(backend=backend, lazy_successors=lazy, early_return=early_return)
+    fixed: tuple[frozenset, ...] = ()
+    if not continue_after_improvement:
+        # Hold the middle cell while the zero-delay route needs it, so the optimum departs
+        # later and pays ground delay; otherwise the trivial cost >= 0 bound alone puts the LP
+        # within lp_gap whatever the pricing bounds say.
+        cfg = replace(cfg, max_ground_delay_s=16.0)
+        free = zeta_solver.solve_zeta(requests, cfg, (), params, options=options)
+        fixed = (frozenset(row for row in free.columns[1].claims if row[1:3] == (1, 0)),)
     real_price = zeta_solver.price_zeta
     calls = 0
+    unwidened_bounds = []
 
     def capped(*args, **kwargs):
         nonlocal calls
         calls += 1
         result = real_price(*args, **kwargs)
+        unwidened_bounds.append(result.upper_bound)
         if continue_after_improvement and calls > 1:
             return result
-        return replace(result, complete=False, reason="test_work_cap", upper_bound=result.upper_bound + 1.0)
+        if stop.startswith("merge"):
+            # A merged snapped search can keep this reason even when rounding leaves a
+            # separate full-price gap. Only the explicit merge allowance may be settled.
+            extra = 1.0 if stop == "merge-snap" else 0.0
+            return replace(result, complete=False, reason="merge_uncertainty",
+                           upper_bound=result.upper_bound + excess + extra, merge_error_bound=excess)
+        return replace(result, complete=False, reason="test_work_cap",
+                       upper_bound=result.upper_bound + excess)
 
     monkeypatch.setattr(zeta_solver, "price_zeta", capped)
     supplied = None
@@ -424,24 +453,79 @@ def test_zeta_prototype_keeps_incumbent_without_claiming_capped_convergence(
         params = replace(params, seed_nominal_routes=False, seed_ladder_steps=0)
         supplied = {1: [Column(1, 1, 0, None, None, ((0, 0), (2, 0)), 4.0)]}
     result = zeta_solver.solve_zeta(
-        requests, cfg, (), params,
-        options=ZetaOptions(backend=backend, lazy_successors=lazy, early_return=early_return),
-        seed_columns=supplied,
+        requests, cfg, (), params, options=options, fixed_claims=fixed, seed_columns=supplied,
     )
     assert len(result.columns) == 1
-    assert result.stats["termination_reason"] == ("converged" if continue_after_improvement else "pricing_limit")
-    assert result.stats["pricing_search_complete"] is continue_after_improvement
+    assert continue_after_improvement or result.stats["objective_cost"] > 0.0
+    settled = continue_after_improvement or stop == "merge"
+    within_gap = excess < 1e-3 or gap_metric == "revenue"
+    if stop == "merge-snap":
+        # The extra full-price gap leaves 1 or 2 seconds unproven. The 2-second case
+        # exceeds this fixture's revenue-gap threshold as well as its cost threshold.
+        within_gap = gap_metric == "revenue" and excess < 1e-3
+    expected_stop = "converged" if settled else "lp_gap" if within_gap else "pricing_limit"
+    assert result.stats["termination_reason"] == expected_stop
+    assert all(row["lp_gap"] == row[f"lp_gap_{gap_metric}"] for row in result.stats["history"])
+    assert result.stats["pricing_search_complete"] is settled
     assert result.stats["pricing_bound_certified"] is True
-    assert result.stats["capped_searches"] == 1
+    assert result.stats["capped_searches"] == (stop != "merge")
+    assert result.stats["merge_allowance_searches"] == stop.startswith("merge")
     assert result.stats["global_cost_lower_bound"] <= result.stats["objective_cost"] + 1e-6
+    if stop == "merge" and not continue_after_improvement:
+        assert result.stats["global_cost_lower_bound"] == pytest.approx(
+            max(0.0, result.stats["history"][0]["lp_cost"] - max(0.0, unwidened_bounds[0] + excess)),
+            abs=1e-8,
+        )
     if continue_after_improvement:
         assert calls >= 2 and result.columns[1].departure_step == 0
 
 
-@pytest.mark.parametrize("failure", ["worker_lost", "deadline"])
-@pytest.mark.parametrize("phase", ["seed", "price"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "pool"])
+@pytest.mark.parametrize("caller_labels", [None, 1], ids=["memory-cap", "tighter-caller-cap"])
+def test_zeta_memory_cap_limits_real_searches_and_stops_honestly(workers, caller_labels):
+    """The per-search memory cap tightens every search's label limit and never loosens one.
+
+    A budget worth one label caps every real search, in the parent and in pool workers: each
+    returns an incomplete but valid bound, so the solve stops on its pricing limit without
+    claiming convergence, the global bound stays below the selected cost, and each sweep
+    reports its capped searches. A caller's tighter label limit survives a larger budget.
+    """
+    pytest.importorskip("numba")
+    from freespace_sim.planner.colgen import zeta_solver
+    from freespace_sim.planner.colgen.zeta import ZetaOptions
+    from freespace_sim.planner.colgen.zeta_pool import SEARCH_BYTES_PER_LABEL
+
+    cfg = SimConfig(planner="colgen", flight_levels_m=(100.0,), airspace_ceiling_m=125.0,
+                    max_ground_delay_s=16.0)
+    requests = [FlightRequest(1, _point((0, 0), cfg), _point((2, 0), cfg), 0.0, 0.0)]
+    params = ColGenParams(solver="highs", max_air_overrun_hops=0, time_limit_s=20.0,
+                          ip_time_limit_s=1.0, ip_reserve_s=2.0, iteration_ip_time_limit_s=0.0)
+    options = ZetaOptions(backend="compiled", lazy_successors=True)
+    free = zeta_solver.solve_zeta(requests, cfg, (), params, options=options)
+    # Block the free optimum's middle cell so every search has a route left to look for.
+    fixed = (frozenset(row for row in free.columns[1].claims if row[1:3] == (1, 0)),)
+    budget = SEARCH_BYTES_PER_LABEL * (1 if caller_labels is None else 1_000)
+    result = zeta_solver.solve_zeta(
+        requests, cfg, (),
+        replace(params, n_pricing_workers=workers, zeta_search_memory_bytes=budget),
+        options=replace(options, max_labels=caller_labels), fixed_claims=fixed,
+    )
+    stats = result.stats
+    assert stats["search_label_cap"] == 1
+    assert stats["termination_reason"] == "pricing_limit"
+    assert not stats["pricing_search_complete"] and stats["pricing_bound_certified"]
+    assert all(set(row["search_statuses"].values()) == {"search_cap"} for row in stats["history"])
+    assert stats["capped_searches"] == sum(row["capped_searches"] for row in stats["history"]) > 0
+    assert stats["global_cost_lower_bound"] <= stats["objective_cost"] + 1e-6
+    assert len(result.columns) == 1
+
+
+@pytest.mark.parametrize("phase,failure", [
+    ("seed", "worker_lost"), ("seed", "deadline"),
+    ("price", "worker_lost"), ("price", "deadline"), ("serial-price", "deadline"),
+])
 def test_zeta_solver_does_not_certify_a_partial_parallel_sweep(monkeypatch, failure, phase):
-    """Partial seeds or prices retain feasible routes without certifying missing flights."""
+    """Partial sweeps keep feasible routes; a last serial deadline also wins over the gap stop."""
     from freespace_sim.planner.colgen import zeta_solver
     from freespace_sim.planner.colgen.zeta import ZetaPricingResult
     from freespace_sim.planner.colgen.zeta_pool import (
@@ -473,21 +557,29 @@ def test_zeta_solver_does_not_certify_a_partial_parallel_sweep(monkeypatch, fail
             run_seed_sweep=lambda *_args, **_kwargs: seed_sweep,
             run_sweep=lambda *_args, **_kwargs: sweep,
             close=lambda: closed.append(True), setup_s=0.0, close_s=0.0,
-            worker_peak_rss_bytes={},
+            worker_peak_rss_bytes={}, graphs_released=0,
         )
 
     monkeypatch.setattr(zeta_solver, "ZetaPricingPool", make_pool)
+    if phase == "serial-price":
+        params = replace(params, n_pricing_workers=0)
+        requests = requests[:1]
+        monkeypatch.setattr(zeta_solver, "price_zeta", lambda *args, **kwargs: replace(
+            received, complete=False, reason="deadline",
+        ))
     result = zeta_solver.solve_zeta(requests, cfg, (), params)
-    assert closed
+    assert bool(closed) is (phase != "serial-price")
     assert len(result.columns) == (1 if phase == "seed" else len(requests))
     assert result.stats["termination_reason"] == ("seed_" if phase == "seed" else "pricing_") + failure
     assert not result.stats["pricing_search_complete"]
-    assert not result.stats["pricing_bound_certified"]
+    assert result.stats["pricing_bound_certified"] is (phase == "serial-price")
     assert result.stats["global_cost_lower_bound"] == 0.0
     if phase == "seed":
         assert result.stats["history"] == []
     else:
-        assert result.stats["history"][0]["search_statuses"] == {1: "optimal"}
+        assert result.stats["history"][0]["search_statuses"] == {
+            1: "deadline" if phase == "serial-price" else "optimal",
+        }
 
 
 def test_budget_denial_is_not_logged_as_a_covering_bug(caplog):
